@@ -52,9 +52,12 @@ from prime_service.primes import (
     _compute,
     _estimate_compute_ms,
     _is_prime_6k,
+    _is_prime_with_known,
+    _segmented_sieve,
     _sieve_eratosthenes,
     _slice_known,
     _trial_division_6k,
+    _trial_division_with_known,
     _validate,
     primes_in_range,
 )
@@ -822,3 +825,263 @@ class TestPrimesInRangeFuzz:
             end = start + rng.randint(1, 200)
             assert primes_in_range(start, end) == sympy_primes(start, end)
         assert primes._known_max == before_max
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# _segmented_sieve — cache-leveraging segmented sieve (ADR-0021)
+# ───────────────────────────────────────────────────────────────────────────
+
+class TestSegmentedSieve:
+    """Direct tests for ``_segmented_sieve(low, high, small_primes)``.
+
+    Precondition: ``small_primes`` contains every prime <= ``sqrt(high)``.
+    The autouse fixture re-prewarms the cache up to ``_INITIAL_PREWARM_BOUND``
+    (= 10⁵) before every test, so ``primes._known_primes`` covers
+    ``sqrt(high)`` for any ``high <= 10¹⁰`` — comfortably above
+    ``_RANGE_CEILING = 10⁷``. Tests therefore pass ``primes._known_primes``
+    directly as the ``small_primes`` argument.
+
+    Note: the function does NOT require ``_cache_lock`` when ``_known_primes``
+    is read in a single-threaded test (no concurrent extension is in flight).
+    """
+
+    def test_minimum_segment_low_2_high_2(self) -> None:
+        # Segment of one element where 2 itself is the candidate.
+        assert _segmented_sieve(2, 2, primes._known_primes) == [2]
+
+    def test_low_below_2_clamped(self) -> None:
+        # low=0 should be treated as low=2 (the function clamps internally).
+        result = _segmented_sieve(0, 50, primes._known_primes)
+        assert result == sympy_primes(2, 50)
+
+    def test_low_greater_than_high_returns_empty(self) -> None:
+        assert _segmented_sieve(10, 5, primes._known_primes) == []
+
+    # BVA at _INITIAL_PREWARM_BOUND — segments crossing the cache boundary.
+    # The cache boundary is irrelevant to ``_segmented_sieve`` itself
+    # (it only cares about ``sqrt(high)`` coverage), but BVA at this
+    # threshold guards against future regressions if the function ever
+    # starts taking shortcuts based on cache state.
+    def test_low_one_below_prewarm_bound(self) -> None:
+        low = _INITIAL_PREWARM_BOUND - 1
+        high = _INITIAL_PREWARM_BOUND + 100
+        result = _segmented_sieve(low, high, primes._known_primes)
+        assert result == sympy_primes(low, high)
+
+    def test_low_at_prewarm_bound(self) -> None:
+        low = _INITIAL_PREWARM_BOUND
+        high = _INITIAL_PREWARM_BOUND + 100
+        result = _segmented_sieve(low, high, primes._known_primes)
+        assert result == sympy_primes(low, high)
+
+    def test_low_one_above_prewarm_bound(self) -> None:
+        low = _INITIAL_PREWARM_BOUND + 1
+        high = _INITIAL_PREWARM_BOUND + 100
+        result = _segmented_sieve(low, high, primes._known_primes)
+        assert result == sympy_primes(low, high)
+
+    # BVA at _SIEVE_THRESHOLD — high=B-1, B, B+1. Function should keep
+    # working above the threshold as long as ``small_primes`` covers
+    # ``sqrt(high)`` (which the prewarm does for all bounds we test).
+    def test_high_one_below_sieve_threshold(self) -> None:
+        low = _SIEVE_THRESHOLD - 200
+        high = _SIEVE_THRESHOLD - 1
+        result = _segmented_sieve(low, high, primes._known_primes)
+        assert result == sympy_primes(low, high)
+
+    def test_high_at_sieve_threshold(self) -> None:
+        low = _SIEVE_THRESHOLD - 200
+        high = _SIEVE_THRESHOLD
+        result = _segmented_sieve(low, high, primes._known_primes)
+        assert result == sympy_primes(low, high)
+
+    def test_high_one_above_sieve_threshold(self) -> None:
+        low = _SIEVE_THRESHOLD - 200
+        high = _SIEVE_THRESHOLD + 1
+        result = _segmented_sieve(low, high, primes._known_primes)
+        assert result == sympy_primes(low, high)
+
+    def test_segment_strictly_above_known_max(self) -> None:
+        # Segment entirely above the pre-warmed cache. ``_known_primes``
+        # still covers sqrt(200_000) ≈ 448, well within the prewarm.
+        low = 110_000
+        high = 200_000
+        result = _segmented_sieve(low, high, primes._known_primes)
+        assert result == sympy_primes(low, high)
+
+    @pytest.mark.parametrize(
+        ("low", "high"),
+        [
+            (2, 100),                    # tiny segment, includes 2
+            (1000, 2000),                # mid-range, fully inside prewarm
+            (50_000, 60_000),            # straddles upper prewarm interior
+            (99_000, 100_500),           # straddles the prewarm boundary
+            (500_000, 500_500),          # Layer-2 territory (sieve-threshold)
+            (999_900, 1_000_100),        # straddles _SIEVE_THRESHOLD
+        ],
+    )
+    def test_differential_against_sympy(self, low: int, high: int) -> None:
+        result = _segmented_sieve(low, high, primes._known_primes)
+        assert result == sympy_primes(low, high)
+
+    @pytest.mark.parametrize(
+        ("low", "high"),
+        [
+            (2, 1000),                   # tiny — fully inside prewarm
+            (90_000, 110_000),           # straddles _INITIAL_PREWARM_BOUND
+            (200_000, 250_000),          # mid-range, far above prewarm
+            (500_000, 600_000),          # Layer-2 sieve range
+            (999_000, 1_001_000),        # straddles _SIEVE_THRESHOLD
+        ],
+    )
+    def test_cross_validation_against_legacy_sieve(self, low: int, high: int) -> None:
+        # THE key property: new path must produce identical output to the
+        # legacy reference implementation for the same input range.
+        new_path = _segmented_sieve(low, high, primes._known_primes)
+        legacy = list(_sieve_eratosthenes(high, low))
+        assert new_path == legacy
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# _is_prime_with_known — single-number primality via known small primes
+# ───────────────────────────────────────────────────────────────────────────
+
+class TestIsPrimeWithKnown:
+    """Direct tests for ``_is_prime_with_known(n, small_primes)``.
+
+    Precondition: ``small_primes`` contains every prime <= ``sqrt(n)``. We
+    do NOT test the case where this precondition is violated — the function's
+    contract assumes the caller honours it (in production, ``_compute`` only
+    ever passes ``_known_primes`` while holding ``_cache_lock``, and the
+    pre-warm guarantees coverage up to sqrt(_RANGE_CEILING)).
+    """
+
+    @pytest.mark.parametrize("n", [-1, 0, 1, 2, 3, 4, 5])
+    def test_bva_at_2(self, n: int) -> None:
+        assert _is_prime_with_known(n, primes._known_primes) == sympy_isprime(n)
+
+    @pytest.mark.parametrize("n", [5, 7, 11, 13, 17, 19, 23, 29, 31, 97])
+    def test_known_small_primes(self, n: int) -> None:
+        assert _is_prime_with_known(n, primes._known_primes) is True
+
+    @pytest.mark.parametrize("n", [25, 49, 121, 169])
+    def test_perfect_squares_composite(self, n: int) -> None:
+        assert _is_prime_with_known(n, primes._known_primes) is False
+
+    def test_differential_against_is_prime_6k_small_range(self) -> None:
+        # Both paths must agree on every n in [0, 1000].
+        for n in range(0, 1000):
+            assert _is_prime_with_known(n, primes._known_primes) == _is_prime_6k(n), (
+                f"disagreement with _is_prime_6k at n={n}"
+            )
+
+    def test_differential_against_sympy_small_range(self) -> None:
+        for n in range(0, 1000):
+            assert _is_prime_with_known(n, primes._known_primes) == sympy_isprime(n), (
+                f"disagreement with sympy at n={n}"
+            )
+
+    def test_smallest_prime_above_million(self) -> None:
+        assert _is_prime_with_known(1_000_003, primes._known_primes) is True
+
+    def test_million_itself_composite(self) -> None:
+        assert _is_prime_with_known(1_000_000, primes._known_primes) is False
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# _trial_division_with_known — range trial division via known small primes
+# ───────────────────────────────────────────────────────────────────────────
+
+class TestTrialDivisionWithKnown:
+    """Direct tests for ``_trial_division_with_known(start, end, small_primes)``.
+
+    Same precondition as ``_is_prime_with_known``: ``small_primes`` covers
+    ``sqrt(end)``. Honoured by passing ``primes._known_primes``.
+    """
+
+    def test_first_ten_primes(self) -> None:
+        result = _trial_division_with_known(2, 30, primes._known_primes)
+        assert result == [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+
+    def test_smallest_prime_above_million_in_window(self) -> None:
+        result = _trial_division_with_known(1_000_001, 1_000_005, primes._known_primes)
+        assert 1_000_003 in result
+
+    @pytest.mark.parametrize(
+        ("start", "end"),
+        [
+            (2, 100),                    # smallest range, includes 2
+            (1000, 2000),                # mid prewarm
+            (99_900, 100_100),           # straddles _INITIAL_PREWARM_BOUND
+            (999_900, 1_000_100),        # straddles _SIEVE_THRESHOLD
+            (5_000_000, 5_000_500),      # deep Layer-3 territory
+        ],
+    )
+    def test_differential_against_sympy(self, start: int, end: int) -> None:
+        result = _trial_division_with_known(start, end, primes._known_primes)
+        assert result == sympy_primes(start, end)
+
+    @pytest.mark.parametrize(
+        ("start", "end"),
+        [
+            (2, 100),                    # cache-only range
+            (10_000, 11_000),            # mid prewarm
+            (95_000, 105_000),           # straddles prewarm boundary
+            (500_000, 500_500),          # Layer-2 territory
+            (999_900, 1_000_100),        # straddles _SIEVE_THRESHOLD
+            (4_999_900, 5_000_100),      # Layer-3 territory
+        ],
+    )
+    def test_cross_validation_against_legacy_trial(self, start: int, end: int) -> None:
+        # New path vs legacy 6k±1 generator — must agree pointwise.
+        new_path = _trial_division_with_known(start, end, primes._known_primes)
+        legacy = list(_trial_division_6k(start, end))
+        assert new_path == legacy
+
+    @pytest.mark.parametrize(
+        ("start", "end"),
+        [
+            (2, 100),                    # tiny
+            (1000, 5000),                # mid prewarm
+            (50_000, 60_000),            # mid prewarm, larger
+            (99_000, 100_500),           # straddles prewarm boundary
+            (500_000, 500_500),          # Layer-2 territory, below _SIEVE_THRESHOLD
+        ],
+    )
+    def test_cross_validation_against_segmented_sieve(self, start: int, end: int) -> None:
+        # Both compute paths must agree for ranges where both are valid.
+        # We restrict to ranges below _SIEVE_THRESHOLD because those are the
+        # ranges where ``_compute`` could legitimately dispatch to either
+        # path; above that, only trial-division is used by the dispatcher.
+        trial = _trial_division_with_known(start, end, primes._known_primes)
+        sieve = _segmented_sieve(start, end, primes._known_primes)
+        assert trial == sieve
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# _compute integration — verify dispatcher picks the right algorithm and
+# returns oracle-correct output. Caller must hold ``_cache_lock``.
+# ───────────────────────────────────────────────────────────────────────────
+
+class TestComputeIntegration:
+    """High-level dispatcher tests for ``_compute(start, end)``.
+
+    ``_compute`` reads ``_known_primes`` directly, so the lock contract
+    applies. These tests acquire ``_cache_lock`` themselves.
+    """
+
+    def test_below_threshold_matches_segmented_sieve(self) -> None:
+        start, end = 110_000, 150_000
+        with primes._cache_lock:
+            result = _compute(start, end)
+            sieve = _segmented_sieve(start, end, primes._known_primes)
+        assert result == sieve
+        assert result == sympy_primes(start, end)
+
+    def test_above_threshold_matches_trial_with_known(self) -> None:
+        start, end = _SIEVE_THRESHOLD + 1, _SIEVE_THRESHOLD + 500
+        with primes._cache_lock:
+            result = _compute(start, end)
+            trial = _trial_division_with_known(start, end, primes._known_primes)
+        assert result == trial
+        assert result == sympy_primes(start, end)
