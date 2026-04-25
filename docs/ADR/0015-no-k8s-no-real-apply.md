@@ -44,9 +44,10 @@ The Phase-1 stance above remains in force for the **case-study deliverable cycle
 
 | Phase-2 unblock | ADR | Artefact |
 |---|---|---|
-| Auto-scaling configuration | ADR-0023 | HCL ready to paste into `module.ecs.services.app` |
+| Auto-scaling configuration | ADR-0023 | HCL ready to paste into `module.ecs.services.app`; commented-out scaffold in `terraform/main.tf` |
 | VPN server + client root certs | ADR-0024 | `scripts/bootstrap-vpn-certs.sh` + ACM imports |
 | State backend (S3 + DynamoDB lock) | ADR-0025 | `terraform/bootstrap/` separately bootstrapped |
+| PR-time `terraform plan` via OIDC (Phase 2.5) | ADR-0026 | `.github/workflows/terraform-plan.yml` + GHA OIDC role bundled into bootstrap module |
 
 The order of operations is documented in ADR-0023 § Future direction: bootstrap state backend → import certs → first apply → connect via VPN → verify drain semantics (ADR-0022) end-to-end.
 
@@ -58,4 +59,4 @@ The order of operations is documented in ADR-0023 § Future direction: bootstrap
 - ADR-0012 (migration runbook is the architectural differentiator, not the apply)
 - ADR-0016 (community Terraform modules — the code that doesn't get applied)
 - ADR-0018 (managed-default tool selection — ECS Fargate is the managed-default for the compute-orchestration domain)
-- ADR-0023 / 0024 / 0025 — Phase-2 supersession trio (auto-scaling, certs, state backend)
+- ADR-0023 / 0024 / 0025 / 0026 — Phase-2 supersession quartet (auto-scaling, certs, state backend, PR plan)

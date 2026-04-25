@@ -18,6 +18,20 @@ terraform {
       version = "~> 5.50"
     }
   }
+
+  # ─── Phase-2 state backend (commented out; see ADR-0025) ──────────────
+  # Uncomment and fill in `bucket` + `dynamodb_table` from the outputs of
+  # `terraform/bootstrap/` after running it once. Phase-1 deliverable runs
+  # `terraform plan -backend=false`, so this stays commented for the
+  # case-study cycle.
+  #
+  # backend "s3" {
+  #   bucket         = "aegis-enclave-tfstate-xxxxxxxx"   # bootstrap output
+  #   key            = "main/terraform.tfstate"
+  #   region         = "eu-central-1"
+  #   encrypt        = true
+  #   dynamodb_table = "aegis-enclave-tflock"             # bootstrap output
+  # }
 }
 
 provider "aws" {
@@ -341,6 +355,38 @@ module "ecs" {
     }
   }
 }
+
+# ─── Phase-2 auto-scaling (commented out; see ADR-0023) ──────────────────
+# Uncomment when promoting from case-study (desired_count = 1) to a real
+# deployment. min_capacity = 2 spreads tasks across the two private
+# subnets declared in module.vpc — single-AZ failure no longer takes the
+# workload offline. target_value = 60 % CPU leaves 40 % headroom for the
+# ~30s Fargate cold start before a scale-out task is healthy.
+#
+# resource "aws_appautoscaling_target" "app" {
+#   max_capacity       = 10
+#   min_capacity       = 2
+#   resource_id        = "service/${module.ecs.cluster_name}/${module.ecs.services["app"].name}"
+#   scalable_dimension = "ecs:service:DesiredCount"
+#   service_namespace  = "ecs"
+# }
+#
+# resource "aws_appautoscaling_policy" "cpu" {
+#   name               = "cpu-target-tracking"
+#   policy_type        = "TargetTrackingScaling"
+#   resource_id        = aws_appautoscaling_target.app.resource_id
+#   scalable_dimension = aws_appautoscaling_target.app.scalable_dimension
+#   service_namespace  = aws_appautoscaling_target.app.service_namespace
+#
+#   target_tracking_scaling_policy_configuration {
+#     predefined_metric_specification {
+#       predefined_metric_type = "ECSServiceAverageCPUUtilization"
+#     }
+#     target_value       = 60
+#     scale_in_cooldown  = 300   # 5 min — be conservative scaling down
+#     scale_out_cooldown = 60    # 1 min — be aggressive scaling up
+#   }
+# }
 
 # ─── VPN (ADR-0006: AWS Client VPN endpoint primary, NetBird alternative) ──
 resource "aws_ec2_client_vpn_endpoint" "main" {

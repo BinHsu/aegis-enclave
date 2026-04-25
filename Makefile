@@ -118,6 +118,14 @@ tf-apply: ## OPERATOR USE ONLY — apply Terraform via scripts/ts_apply.sh (see 
 tf-destroy: ## OPERATOR USE ONLY — destroy Terraform via scripts/ts_teardown.sh (irreversible)
 	@./scripts/ts_teardown.sh
 
+.PHONY: tf-bootstrap
+tf-bootstrap: ## OPERATOR USE ONLY — provision Phase-2 prerequisites (state backend + GHA OIDC role)
+	@cd terraform/bootstrap && terraform init && terraform apply
+
+.PHONY: ts-bootstrap-certs
+ts-bootstrap-certs: ## OPERATOR USE ONLY — generate Client VPN PKI + import to ACM (ADR-0024)
+	@./scripts/bootstrap-vpn-certs.sh $(if $(OPERATOR),--operator $(OPERATOR),)
+
 .PHONY: tf-apply-plan-only
 tf-apply-plan-only: ## OPERATOR USE — run all pre-flight checks then plan; no apply
 	@./scripts/ts_apply.sh --plan-only
