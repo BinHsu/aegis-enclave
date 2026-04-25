@@ -2,7 +2,7 @@
 
 ## Scope and calibration
 
-`aegis-enclave` is calibrated as **production-shape engineering at PoC scale** (ADR-0003). The deliverable answers a case-study brief that mixes "small application" framing with "long-term, multiple developers" hygiene language; the calibration resolves that tension by holding hygiene at production grade while letting feature surface stay deliberately small. The build is hard-capped at 15 hours (ADR-0002) and every cut taken to fit that budget is recorded as its own ADR rather than silently omitted.
+`aegis-enclave` is calibrated as **production-shape engineering at PoC scale** (ADR-0003). The deliverable answers a case-study brief that mixes "small application" framing with "long-term, multiple developers" hygiene language; the calibration resolves that tension by holding hygiene at production grade while letting feature surface stay deliberately small. The build is hard-capped at 22 hours (originally 15h per ADR-0002, revised to 22h per ADR-0028 to accommodate HTTPS at the internal ALB, the Phase 2.3 cloud-acceptance window, async L1-L3 implementation, and distributed cache implementation) and every cut taken to fit that budget is recorded as its own ADR rather than silently omitted.
 
 The following operations layers are **intentionally absent**, named so the reviewer reads deliberate deferral rather than oversight:
 
@@ -23,7 +23,7 @@ The cloud composition is deployed to a single AWS region (`eu-central-1`, Frankf
 2. Globally distributed clients requiring locally-terminated network paths for latency or jurisdiction reasons
 3. Regulatory requirements explicitly demanding geographic redundancy
 
-A senior practitioner's honest estimate for full multi-region active-active in Phase 1 — Aurora Global Database, cross-region peering, per-region ECS / ALB / Client VPN endpoints, Route 53 failover, cross-region IAM and KMS replication, plus a failover drill — lands at 10-14 hours. That consumes the entire 15h budget for a capability the brief does not ask for. The reviewer reads "I have a Phase 2 plan" rather than "I forgot about scaling."
+A senior practitioner's honest estimate for full multi-region active-active in Phase 1 — Aurora Global Database, cross-region peering, per-region ECS / ALB / Client VPN endpoints, Route 53 failover, cross-region IAM and KMS replication, plus a failover drill — lands at 10-14 hours. That consumes the bulk of the 22h budget for a capability the brief does not ask for. The reviewer reads "I have a Phase 2 plan" rather than "I forgot about scaling."
 
 Multi-AZ inside a single region is a different shape entirely. `multi_az = true` on the RDS module and multi-subnet target groups on ECS are one-line Terraform toggles. **It's free architectural credit; declining it would require its own ADR explanation.** The internal ALB spans both AZs, the ECS service can place tasks in either subnet, and the database has a synchronous hot standby in the second AZ. None of this costs additional design complexity beyond a few module arguments.
 

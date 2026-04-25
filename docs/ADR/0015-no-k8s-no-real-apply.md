@@ -30,7 +30,7 @@ Use **Docker Compose only** for orchestration — no Kubernetes manifests. Provi
 | EKS instead of ECS Fargate in Terraform | $73/mo control plane fee + complexity; ECS Fargate is the appropriate-complexity managed primitive for case-study scope; EKS is a Phase 2 conversation if the buyer's actual workload demands it. |
 
 ## Consequences
-- Phase 1 budget stays within 15h (saves ~3-4h vs the maximalist version that ships K8s + a real apply).
+- Phase 1 budget stays within 22h (per ADR-0028; saves ~3-4h vs the maximalist version that ships K8s + a real apply).
 - Cloud account exposure minimised — no real state to clean up, no leaked identifiers in committed history.
 - The runbook (ADR-0012) carries the architectural differentiator, not the apply screenshot.
 - If a reviewer reads the absence of a real apply as "couldn't actually deploy", the cover note + the plan output + the runbook collectively answer that — and the answer is more senior than a screenshot would be: "we deliver code + verifiable plan, not real cloud state, because the brief asks for instructions."
@@ -54,7 +54,7 @@ The order of operations is documented in ADR-0023 § Future direction: bootstrap
 **The case-study artefact still does not include screenshots, deployed URLs, or any output of a real apply.** Personal Phase-2 deployment is for the operator's own validation and demo capability, not for the buyer's review surface. Anything the operator captures from a real deployment is kept out of the repo (per the same "no AWS account exposure" hygiene that motivated the original Phase-1 decision).
 
 ## Related ADRs
-- ADR-0002 (15h time budget — the constraint this decision protects)
+- ADR-0002 (15h time budget — superseded by ADR-0028 raising cap to 22h; the constraint this decision protects)
 - ADR-0003 (PoC-scope, production-hygiene calibration)
 - ADR-0012 (migration runbook is the architectural differentiator, not the apply)
 - ADR-0016 (community Terraform modules — the code that doesn't get applied)
