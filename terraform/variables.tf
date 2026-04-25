@@ -38,3 +38,9 @@ variable "server_cert_arn" {
   type        = string
   default     = "" # Phase 1 fills in via separate ACM provisioning step
 }
+
+variable "client_cert_arn" {
+  description = "ACM certificate ARN for the Client VPN root CA (mutual-TLS authentication)"
+  type        = string
+  default     = ""
+}

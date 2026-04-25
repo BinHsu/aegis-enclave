@@ -214,13 +214,13 @@ The deliverable is staged into numbered phases (decimals allowed for sub-progres
 | **0.0** | ✅ done | Repo init, remote bound | `.git/`, `README.md` (placeholder) |
 | **0.1** | ✅ done | ADRs + docs scaffolding | `CLAUDE.md`, 16 `docs/ADR/*.md`, gitignored `strategy.md` + `*_steps.md` |
 | **0.2** | ✅ done | Hygiene additions (GitOps × DevSecOps × FinOps) | `Makefile`, `.pre-commit-config.yaml`, `.github/dependabot.yml`, `SECURITY.md`, `terraform/` stub with `default_tags` |
-| **1.1** | ⏳ next | Service foundation | `src/prime_service/`, `tests/`, `pyproject.toml`, `db/init.sql` |
-| **1.2** | ⏳ pending | Container + VPN demo | `Dockerfile`, `docker-compose.yml`, `wireguard/`, smoke-test runner |
-| **1.3** | ⏳ pending | Cloud Terraform code (plan-only) | `terraform/main.tf` (modules uncommented), `terraform/variables.tf` filled, `terraform plan` output |
-| **1.4** | ⏳ pending | Phase 1 docs | `docs/design_doc.md`, `docs/deployment_guide.md` (with Mermaid architecture diagram) |
-| **1.5** | ⏳ pending | Phase 1 smoke test passes | Verified `docker compose up && smoke 5/5 pass + negative test`; Initial Acceptance achieved |
-| **2.1** | ⏳ pending | Cross-cloud migration runbook | `docs/migration_runbook.md` — agent-executable spec, two tracks |
-| **2.2** | ⏳ pending | Multi-region scaling runbook | `docs/scaling_runbook.md` — same format, axis-of-extension demo |
+| **1.1** | ✅ done | Service foundation | `src/prime_service/`, `tests/`, `pyproject.toml`, `db/init.sql`, `.env.example` |
+| **1.2** | ✅ done | Container + VPN demo | `Dockerfile`, `docker-compose.yml`, `wireguard/`, `test-client/smoke.sh` |
+| **1.3** | ✅ done | Cloud Terraform code (plan-only) | `terraform/main.tf` filled with community modules + Client VPN endpoint, `terraform/variables.tf`, `terraform/outputs.tf`, `terraform/terraform.tfvars.example` |
+| **1.4** | ✅ done | Phase 1 docs | `docs/design_doc.md`, `docs/deployment_guide.md` (with Mermaid cloud architecture diagram) |
+| **1.5** | ⏳ next | Phase 1 smoke test passes | Verified `docker compose up && make smoke 5/5 pass + negative test`; Initial Acceptance achieved |
+| **2.1** | ✅ done | Cross-cloud migration runbook | `docs/migration_runbook.md` — agent-executable spec, two tracks (Application + VPN modernisation) |
+| **2.2** | ✅ done | Multi-region scaling runbook | `docs/scaling_runbook.md` — same format, single-region → multi-region axis |
 | **3.0** | ⏳ pending | Polish + cover note | Final README pass, `cover_note.md` (gitignored) drafted |
 | **3.1** | ⏳ pending | Repo published to private remote | Pre-push leak guard clean, repo invitation sent to recipient |
 | **3.2** | ⏳ pending | Submission email sent | End of cycle |

@@ -1,0 +1,16 @@
+# Copy to terraform.tfvars (gitignored) before running `make tf-plan`.
+# These are PLAN-ONLY example values; real ARNs would come from a separate
+# ACM certificate provisioning step (out of case-study scope).
+
+region      = "eu-central-1"
+environment = "case-study"
+cost_center = "engineering"
+owner       = "bin.hsu"
+vpc_cidr    = "10.0.0.0/16"
+
+# Placeholder ARNs — real values would come from a separate ACM
+# (AWS Certificate Manager) provisioning step. These satisfy the type
+# constraint for `terraform plan` but the resulting plan will fail to
+# apply without real ACM certs.
+server_cert_arn = "arn:aws:acm:eu-central-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
+client_cert_arn = "arn:aws:acm:eu-central-1:000000000000:certificate/11111111-1111-1111-1111-111111111111"
