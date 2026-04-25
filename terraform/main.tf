@@ -253,6 +253,14 @@ module "alb" {
       protocol    = "HTTP"
       port        = 8000
       target_type = "ip"
+
+      # ADR-0022 — Drain semantics. Default 300s drains existing connections
+      # for 5 minutes after deregister, which is wildly long for a case-study
+      # PoC (and means rolling deploys block on the slowest in-flight request
+      # for 5 minutes). 60s matches the longest legitimate compute path
+      # (30s prime budget + 10s audit + slack).
+      deregistration_delay = 60
+
       health_check = {
         path                = "/health"
         healthy_threshold   = 2
@@ -307,6 +315,14 @@ module "ecs" {
           secrets = [
             { name = "POSTGRES_PASSWORD", valueFrom = module.rds.db_instance_master_user_secret_arn },
           ]
+
+          # ADR-0022 — Drain semantics. ECS sends SIGTERM, waits stop_timeout,
+          # then SIGKILL. Set to 60s so it strictly exceeds uvicorn's
+          # `--timeout-graceful-shutdown 45` (Dockerfile) — a request that
+          # started just before SIGTERM still has 45s to finish before
+          # uvicorn drops it, and ECS waits another 15s before SIGKILL.
+          stop_timeout = 60
+
           readonly_root_filesystem = false # FastAPI/uvicorn writes to tmpdir
           essential                = true
         }

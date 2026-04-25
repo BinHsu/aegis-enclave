@@ -48,4 +48,13 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl --fail --silent http://localhost:8000/health || exit 1
 
-CMD ["uvicorn", "prime_service.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --timeout-graceful-shutdown 45 — uvicorn lets in-flight requests finish on
+# SIGTERM up to 45s before force-killing. Aligned with the four-tier drain
+# semantics in ADR-0022:
+#   uvicorn 45s  ≤  ECS stop_timeout 60s  <  ALB idle 45s budget+15s
+# The 45s ceiling matches the longest legitimate compute (30s prime budget +
+# 10s audit + 5s slack) so an in-flight `/primes` call always gets to finish.
+CMD ["uvicorn", "prime_service.main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--timeout-graceful-shutdown", "45"]
