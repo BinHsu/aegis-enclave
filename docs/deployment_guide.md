@@ -172,12 +172,21 @@ Full `terraform output` after `make tf-apply` completes. Includes ALB DNS, RDS e
 
 ### Per-endpoint round-trips
 
-Three manual `curl` invocations against the live VPN-only endpoint, each capturing request and full response. The `execution_id` from the `POST /primes` response feeds the third call.
+Three manual `curl` invocations against the live VPN-only endpoint, each capturing request and full response. Pre-flight plumbing per ADR-0027 (HTTPS on internal ALB via self-signed ACM-imported cert):
+
+```bash
+$ ALB_DNS=$(terraform -chdir=terraform output -raw alb_dns_name)
+$ ALB_IP=$(dig +short $ALB_DNS | head -1)
+$ terraform -chdir=terraform output -raw alb_self_signed_ca_pem > /tmp/alb-ca.pem
+$ CURL="curl --cacert /tmp/alb-ca.pem --resolve api.enclave.internal:443:${ALB_IP}"
+```
+
+The `execution_id` from the `POST /primes` response feeds the third call.
 
 #### `GET /health`
 
 ```bash
-$ curl https://api.enclave.internal/health
+$ $CURL https://api.enclave.internal/health
 ```
 ```json
 <TBD: response — expected {"status":"ok","db":"reachable","version":"0.1.0"}>
@@ -186,7 +195,7 @@ $ curl https://api.enclave.internal/health
 #### `POST /primes`
 
 ```bash
-$ curl https://api.enclave.internal/primes \
+$ $CURL https://api.enclave.internal/primes \
     -X POST -H 'Content-Type: application/json' \
     -d '{"start":2,"end":100}'
 ```
@@ -199,7 +208,7 @@ Captured `execution_id`: `<TBD>`
 #### `GET /executions/{execution_id}`
 
 ```bash
-$ curl https://api.enclave.internal/executions/<TBD-execution_id>
+$ $CURL https://api.enclave.internal/executions/<TBD-execution_id>
 ```
 ```json
 <TBD: audit row — expected start=2, end=100, primes_count=25, created_at>
@@ -209,7 +218,7 @@ $ curl https://api.enclave.internal/executions/<TBD-execution_id>
 
 ```bash
 $ # disconnect VPN from Tunnelblick / openvpn3
-$ curl --max-time 5 https://api.enclave.internal/health
+$ $CURL --max-time 5 https://api.enclave.internal/health
 ```
 ```
 <TBD: expected timeout / connection refused — proves private-only routing per ADR-0019>

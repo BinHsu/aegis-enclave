@@ -17,6 +17,10 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.50"
     }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
   }
 
   # ─── Phase-2 state backend (commented out; see ADR-0025) ──────────────
@@ -135,7 +139,7 @@ module "alb_sg" {
   vpc_id      = module.vpc.vpc_id
 
   ingress_cidr_blocks = [var.vpc_cidr]
-  ingress_rules       = ["http-80-tcp"]
+  ingress_rules       = ["https-443-tcp"] # ADR-0027 — HTTPS-only listener; HTTP not exposed.
   egress_rules        = ["all-all"]
 }
 
@@ -232,6 +236,47 @@ module "ecr" {
   })
 }
 
+# ─── Internal ALB self-signed TLS certificate (ADR-0027) ──────────────────
+# The internal ALB terminates TLS so the operator's curl uses https:// — same
+# protocol as a production deployment, even though the encrypted boundary at
+# this scope is the Client VPN tunnel and the ALB is private-only. Self-signed
+# (not ACM-issued from a public CA) because the hostname `api.enclave.internal`
+# is internal-only and not in any public DNS zone we own; ACM Private CA is
+# $400/mo overkill for a 3-hour acceptance window. Imported into ACM as a
+# regular ACM certificate — no charge for imports, only for ACM Private CA.
+resource "tls_private_key" "alb" {
+  algorithm = "RSA"
+  rsa_bits  = 2048
+}
+
+resource "tls_self_signed_cert" "alb" {
+  private_key_pem = tls_private_key.alb.private_key_pem
+
+  subject {
+    common_name  = var.alb_internal_hostname
+    organization = "aegis-enclave"
+  }
+
+  validity_period_hours = 8760 # one year — far past any realistic acceptance window
+
+  allowed_uses = [
+    "digital_signature",
+    "key_encipherment",
+    "server_auth",
+  ]
+
+  dns_names = [var.alb_internal_hostname]
+}
+
+resource "aws_acm_certificate" "alb" {
+  private_key      = tls_private_key.alb.private_key_pem
+  certificate_body = tls_self_signed_cert.alb.cert_pem
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
 # ─── Internal load balancer (private, behind Client VPN endpoint) ──────────
 module "alb" {
   source  = "terraform-aws-modules/alb/aws"
@@ -251,10 +296,13 @@ module "alb" {
 
   security_groups = [module.alb_sg.security_group_id]
 
+  # ADR-0027 — HTTPS-only listener, self-signed cert imported to ACM.
   listeners = {
-    http = {
-      port     = 80
-      protocol = "HTTP"
+    https = {
+      port            = 443
+      protocol        = "HTTPS"
+      ssl_policy      = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+      certificate_arn = aws_acm_certificate.alb.arn
       forward = {
         target_group_key = "app"
       }

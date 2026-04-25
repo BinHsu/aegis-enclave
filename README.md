@@ -253,8 +253,14 @@ make tf-apply
 # 4. Import the operator .ovpn package into Tunnelblick (or `openvpn3 session-start`)
 #    and connect.
 
-# 5. From macOS, with the VPN tunnel active:
-curl --resolve api.enclave.internal:443:<alb-private-ip> \
+# 5. From macOS, with the VPN tunnel active — pre-flight curl plumbing per ADR-0027
+#    (HTTPS on internal ALB via self-signed ACM-imported cert):
+ALB_DNS=$(terraform -chdir=terraform output -raw alb_dns_name)
+ALB_IP=$(dig +short $ALB_DNS | head -1)
+terraform -chdir=terraform output -raw alb_self_signed_ca_pem > /tmp/alb-ca.pem
+
+curl --cacert /tmp/alb-ca.pem \
+     --resolve api.enclave.internal:443:${ALB_IP} \
      https://api.enclave.internal/primes \
      -X POST -H 'Content-Type: application/json' \
      -d '{"start":2,"end":100}'

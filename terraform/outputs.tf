@@ -30,6 +30,16 @@ output "alb_dns_name" {
   value       = module.alb.dns_name
 }
 
+output "alb_cert_arn" {
+  description = "ACM ARN of the internal ALB's self-signed TLS certificate (ADR-0027)"
+  value       = aws_acm_certificate.alb.arn
+}
+
+output "alb_self_signed_ca_pem" {
+  description = "Self-signed CA cert PEM for the internal ALB. Save to a file and pass via `curl --cacert <file>` so the operator avoids `-k` and the cert chain is explicit. Public material — not sensitive."
+  value       = tls_self_signed_cert.alb.cert_pem
+}
+
 output "ecr_repository_url" {
   description = "ECR repository URL for application images"
   value       = module.ecr.repository_url
