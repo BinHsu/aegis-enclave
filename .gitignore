@@ -33,15 +33,24 @@ wireguard/keys/
 wireguard/config/
 !wireguard/wg0.conf.template
 
-# Terraform state + plan output (state holds secrets, plan is per-machine)
-terraform/.terraform/
-terraform/.terraform.lock.hcl
+# Terraform state + plan output (state holds secrets, plan is per-machine).
+# Use **/ patterns so nested modules (e.g. terraform/bootstrap/) are also
+# covered — provider binaries can hit 700+MB and would blow GitHub's
+# per-file 100MB limit.
+**/.terraform/
+**/.terraform.lock.hcl
 terraform/*.tfstate
 terraform/*.tfstate.*
+terraform/**/*.tfstate
+terraform/**/*.tfstate.*
 terraform/*.tfplan
+terraform/**/*.tfplan
 terraform/*.tfvars
+terraform/**/*.tfvars
 !terraform/*.tfvars.example
+!terraform/**/*.tfvars.example
 terraform/crash.log
+terraform/**/crash.log
 
 # Cloud screenshots (may contain account IDs, IPs, ARNs)
 screenshots/
