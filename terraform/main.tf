@@ -36,65 +36,270 @@ provider "aws" {
 }
 
 # ─── Network (ADR-0007: single-region eu-central-1, multi-AZ) ──────────────
-# module "vpc" {
-#   source  = "terraform-aws-modules/vpc/aws"
-#   version = "~> 5.8"
-#
-#   name = "aegis-enclave-vpc"
-#   cidr = var.vpc_cidr
-#
-#   azs              = ["${var.region}a", "${var.region}b"]
-#   private_subnets  = ["10.0.1.0/24", "10.0.2.0/24"]
-#   public_subnets   = ["10.0.101.0/24", "10.0.102.0/24"]
-#   database_subnets = ["10.0.201.0/24", "10.0.202.0/24"]
-#
-#   enable_nat_gateway   = true
-#   single_nat_gateway   = true # Phase 1 cost discipline; multi-NAT is a Phase 2 toggle
-#   enable_dns_hostnames = true
-# }
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.8"
+
+  name = "aegis-enclave-vpc"
+  cidr = var.vpc_cidr
+
+  azs              = ["${var.region}a", "${var.region}b"]
+  private_subnets  = ["10.0.1.0/24", "10.0.2.0/24"]
+  public_subnets   = ["10.0.101.0/24", "10.0.102.0/24"]
+  database_subnets = ["10.0.201.0/24", "10.0.202.0/24"]
+
+  enable_nat_gateway   = true
+  single_nat_gateway   = true # Phase 1 cost discipline
+  enable_dns_hostnames = true
+
+  create_database_subnet_group = true
+}
+
+# ─── Security groups (ALB → app → RDS chain) ───────────────────────────────
+module "alb_sg" {
+  source  = "terraform-aws-modules/security-group/aws"
+  version = "~> 5.2"
+
+  name        = "aegis-enclave-alb-sg"
+  description = "Internal ALB — reachable only from VPC (Client VPN clients arrive via VPC routes)"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress_cidr_blocks = [var.vpc_cidr]
+  ingress_rules       = ["http-80-tcp"]
+  egress_rules        = ["all-all"]
+}
+
+module "app_sg" {
+  source  = "terraform-aws-modules/security-group/aws"
+  version = "~> 5.2"
+
+  name        = "aegis-enclave-app-sg"
+  description = "Application service — accept traffic only from internal ALB"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress_with_source_security_group_id = [{
+    from_port                = 8000
+    to_port                  = 8000
+    protocol                 = "tcp"
+    description              = "App port from ALB"
+    source_security_group_id = module.alb_sg.security_group_id
+  }]
+  egress_rules = ["all-all"]
+}
+
+module "rds_sg" {
+  source  = "terraform-aws-modules/security-group/aws"
+  version = "~> 5.2"
+
+  name        = "aegis-enclave-rds-sg"
+  description = "PostgreSQL — accept traffic only from app service"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress_with_source_security_group_id = [{
+    from_port                = 5432
+    to_port                  = 5432
+    protocol                 = "tcp"
+    description              = "PostgreSQL from app"
+    source_security_group_id = module.app_sg.security_group_id
+  }]
+  egress_rules = ["all-all"]
+}
 
 # ─── Database (ADR-0009: RDS PostgreSQL, multi_az = true) ──────────────────
-# module "rds" {
-#   source  = "terraform-aws-modules/rds/aws"
-#   version = "~> 6.7"
-#
-#   identifier     = "aegis-enclave-pg"
-#   engine         = "postgres"
-#   engine_version = "16.3"
-#   instance_class = "db.t4g.micro"
-#
-#   multi_az = true # ADR-0009: free architectural credit, supports RPO target in ADR-0008
-#
-#   db_name                     = "primes"
-#   username                    = "primes_app"
-#   manage_master_user_password = true # Secrets Manager integration
-#
-#   db_subnet_group_name = module.vpc.database_subnet_group_name
-# }
+module "rds" {
+  source  = "terraform-aws-modules/rds/aws"
+  version = "~> 6.7"
 
-# ─── Compute (ADR-0015: ECS Fargate over EKS — no K8s control-plane fee) ───
-# module "ecs" {
-#   source  = "terraform-aws-modules/ecs/aws"
-#   version = "~> 5.11"
-#   # cluster definition + Fargate capacity provider
-#   # task definition referencing ECR image
-# }
+  identifier = "aegis-enclave-pg"
+
+  engine               = "postgres"
+  engine_version       = "16.3"
+  family               = "postgres16"
+  major_engine_version = "16"
+
+  instance_class        = "db.t4g.micro"
+  allocated_storage     = 20
+  max_allocated_storage = 100
+
+  multi_az = true # ADR-0009 — free architectural credit, supports RPO target in ADR-0008
+
+  db_name                     = "primes"
+  username                    = "primes_app"
+  port                        = 5432
+  manage_master_user_password = true # Secrets Manager integration; no plaintext password in code
+
+  db_subnet_group_name   = module.vpc.database_subnet_group_name
+  vpc_security_group_ids = [module.rds_sg.security_group_id]
+
+  backup_retention_period = 7
+  skip_final_snapshot     = true  # case-study scope
+  deletion_protection     = false # case-study scope
+
+  performance_insights_enabled = false
+  monitoring_interval          = 0
+}
+
+# ─── Container registry (ECR with scan-on-push + immutable tags) ───────────
+module "ecr" {
+  source  = "terraform-aws-modules/ecr/aws"
+  version = "~> 2.3"
+
+  repository_name                 = "aegis-enclave"
+  repository_image_tag_mutability = "IMMUTABLE"
+  repository_image_scan_on_push   = true # DevSecOps signal — scan on push
+
+  repository_lifecycle_policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Retain last 10 images; expire older"
+      selection = {
+        tagStatus   = "any"
+        countType   = "imageCountMoreThan"
+        countNumber = 10
+      }
+      action = { type = "expire" }
+    }]
+  })
+}
 
 # ─── Internal load balancer (private, behind Client VPN endpoint) ──────────
-# module "alb" {
-#   source  = "terraform-aws-modules/alb/aws"
-#   version = "~> 9.9"
-#   # internal = true; only reachable through Client VPN
-# }
+module "alb" {
+  source  = "terraform-aws-modules/alb/aws"
+  version = "~> 9.9"
+
+  name    = "aegis-enclave-alb"
+  vpc_id  = module.vpc.vpc_id
+  subnets = module.vpc.private_subnets
+
+  internal           = true # not internet-facing — only VPN-reachable
+  load_balancer_type = "application"
+
+  security_groups = [module.alb_sg.security_group_id]
+
+  listeners = {
+    http = {
+      port     = 80
+      protocol = "HTTP"
+      forward = {
+        target_group_key = "app"
+      }
+    }
+  }
+
+  target_groups = {
+    app = {
+      name_prefix = "app-"
+      protocol    = "HTTP"
+      port        = 8000
+      target_type = "ip"
+      health_check = {
+        path                = "/health"
+        healthy_threshold   = 2
+        unhealthy_threshold = 3
+        interval            = 30
+        timeout             = 5
+      }
+    }
+  }
+}
+
+# ─── Compute (ADR-0015: ECS Fargate over EKS — no K8s control-plane fee) ───
+module "ecs" {
+  source  = "terraform-aws-modules/ecs/aws"
+  version = "~> 5.11"
+
+  cluster_name = "aegis-enclave"
+
+  cluster_configuration = {
+    execute_command_configuration = {
+      logging = "DEFAULT"
+    }
+  }
+
+  fargate_capacity_providers = {
+    FARGATE = {
+      default_capacity_provider_strategy = {
+        weight = 100
+        base   = 1
+      }
+    }
+  }
+
+  services = {
+    app = {
+      cpu    = 256
+      memory = 512
+
+      container_definitions = {
+        app = {
+          image = "${module.ecr.repository_url}:latest"
+          port_mappings = [{
+            containerPort = 8000
+            protocol      = "tcp"
+          }]
+          environment = [
+            { name = "POSTGRES_HOST", value = module.rds.db_instance_address },
+            { name = "POSTGRES_PORT", value = "5432" },
+            { name = "POSTGRES_USER", value = "primes_app" },
+            { name = "POSTGRES_DB", value = "primes" },
+          ]
+          secrets = [
+            { name = "POSTGRES_PASSWORD", valueFrom = module.rds.db_instance_master_user_secret_arn },
+          ]
+          readonly_root_filesystem = false # FastAPI/uvicorn writes to tmpdir
+          essential                = true
+        }
+      }
+
+      load_balancer = {
+        service = {
+          target_group_arn = module.alb.target_groups["app"].arn
+          container_name   = "app"
+          container_port   = 8000
+        }
+      }
+
+      subnet_ids         = module.vpc.private_subnets
+      security_group_ids = [module.app_sg.security_group_id]
+    }
+  }
+}
 
 # ─── VPN (ADR-0006: AWS Client VPN endpoint primary, NetBird alternative) ──
-# resource "aws_ec2_client_vpn_endpoint" "main" {
-#   description            = "aegis-enclave Client VPN"
-#   server_certificate_arn = var.server_cert_arn
-#   client_cidr_block      = "10.20.0.0/16"
-#   # mutual TLS auth; subnet associations for HA
-# }
+resource "aws_ec2_client_vpn_endpoint" "main" {
+  description            = "aegis-enclave Client VPN — operator + ground-station access"
+  server_certificate_arn = var.server_cert_arn
+  client_cidr_block      = "10.20.0.0/16" # avoid VPC CIDR overlap
 
-# ─── Secrets and registry ──────────────────────────────────────────────────
-# resource "aws_secretsmanager_secret" "db_password" { ... }
-# resource "aws_ecr_repository" "app" { ... }
+  authentication_options {
+    type                       = "certificate-authentication"
+    root_certificate_chain_arn = var.client_cert_arn
+  }
+
+  connection_log_options {
+    enabled = false # case-study scope; production logs to CloudWatch
+  }
+
+  vpc_id             = module.vpc.vpc_id
+  security_group_ids = [module.alb_sg.security_group_id] # initial association
+
+  split_tunnel = true
+  dns_servers  = []
+}
+
+resource "aws_ec2_client_vpn_network_association" "primary_az" {
+  client_vpn_endpoint_id = aws_ec2_client_vpn_endpoint.main.id
+  subnet_id              = module.vpc.private_subnets[0]
+}
+
+resource "aws_ec2_client_vpn_network_association" "secondary_az" {
+  client_vpn_endpoint_id = aws_ec2_client_vpn_endpoint.main.id
+  subnet_id              = module.vpc.private_subnets[1]
+}
+
+resource "aws_ec2_client_vpn_authorization_rule" "vpc_access" {
+  client_vpn_endpoint_id = aws_ec2_client_vpn_endpoint.main.id
+  target_network_cidr    = var.vpc_cidr
+  authorize_all_groups   = true
+  description            = "Authorize VPN clients to reach VPC services"
+}

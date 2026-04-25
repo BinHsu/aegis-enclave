@@ -1,0 +1,19 @@
+# Template — copy to wg0.conf and substitute placeholders before use.
+# This file documents the SERVER side of the hub-and-spoke topology
+# (per ADR-0011). Real keys MUST be generated locally and must NOT be
+# committed (.gitignore covers `wireguard/*.conf` and `wireguard/keys/`).
+
+[Interface]
+# Server private key — generate with `wg genkey`.
+PrivateKey = <SERVER_PRIVATE_KEY>
+# Server tunnel address inside the WG subnet.
+Address = 10.13.13.1/24
+# UDP listen port — exposed to the host in docker-compose.yml.
+ListenPort = 51820
+
+# ─── Peer 1: operator / test client ─────────────────────────────────────────
+[Peer]
+# Peer public key — output of `wg pubkey < client_priv.key`.
+PublicKey = <PEER_1_PUBLIC_KEY>
+# Allowed source addresses — single IP for hub-and-spoke (no peer-to-peer).
+AllowedIPs = 10.13.13.2/32

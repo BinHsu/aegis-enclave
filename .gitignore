@@ -30,6 +30,7 @@ cover_note_*.md
 # WireGuard keys / configs with material
 wireguard/*.conf
 wireguard/keys/
+wireguard/config/
 !wireguard/wg0.conf.template
 
 # Terraform state + plan output (state holds secrets, plan is per-machine)

@@ -1,0 +1,116 @@
+# Phase 1.2 demo stack — VPN-gated cloud microservice template.
+#
+# Services:
+#   app           — FastAPI prime service (no host port published)
+#   db            — PostgreSQL 16, init.sql mounted (no host port published)
+#   wg-gateway    — WireGuard server (UDP/51820 published to host)
+#   test-client   — Verification harness with curl + wireguard-tools
+#
+# Verification (per ADR-0013): smoke test runs from test-client container.
+# Negative test (per ADR-0014): host-side curl to localhost:8000 must FAIL
+# because port 8000 is NOT published.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: enclave-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-primes_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_local_dev_only}
+      POSTGRES_DB: ${POSTGRES_DB:-primes}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-primes_app} -d ${POSTGRES_DB:-primes}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - enclave-net
+    # Intentionally NOT publishing port 5432 — DB is reachable only inside the
+    # Docker network, satisfying the "no direct access" property of the brief.
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: enclave-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-primes_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_local_dev_only}
+      POSTGRES_DB: ${POSTGRES_DB:-primes}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    networks:
+      - enclave-net
+    # Intentionally NOT publishing port 8000 — the API is reachable only
+    # through the VPN gateway (or, for verification, from the test-client
+    # container which is on the internal network).
+
+  wg-gateway:
+    image: linuxserver/wireguard:latest
+    container_name: enclave-wg
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "Etc/UTC"
+      SERVERURL: "auto"
+      SERVERPORT: "51820"
+      PEERS: "1"
+      PEERDNS: "auto"
+      INTERNAL_SUBNET: "10.13.13.0"
+      ALLOWEDIPS: "0.0.0.0/0"
+    volumes:
+      - ./wireguard/config:/config
+      - /lib/modules:/lib/modules:ro
+    ports:
+      - "51820:51820/udp"
+    healthcheck:
+      test: ["CMD-SHELL", "wg show wg0 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - enclave-net
+
+  test-client:
+    image: alpine:3.20
+    container_name: enclave-test-client
+    depends_on:
+      app:
+        condition: service_healthy
+    volumes:
+      - ./test-client:/work:ro
+    working_dir: /work
+    networks:
+      - enclave-net
+    # Stays running so `docker compose run --rm test-client ./smoke.sh` can
+    # exec inside; on first start it installs verification tools.
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        apk add --no-cache curl jq wireguard-tools >/dev/null 2>&1 || true
+        exec sleep infinity
+
+networks:
+  enclave-net:
+    driver: bridge
+    # Internal only — no NAT to internet from this network is required for
+    # the demo. The only externally-reachable surface is wg-gateway:51820/udp.
+
+volumes:
+  db-data:
