@@ -36,9 +36,26 @@ Use **Docker Compose only** for orchestration — no Kubernetes manifests. Provi
 - If a reviewer reads the absence of a real apply as "couldn't actually deploy", the cover note + the plan output + the runbook collectively answer that — and the answer is more senior than a screenshot would be: "we deliver code + verifiable plan, not real cloud state, because the brief asks for instructions."
 - Trade-off accepted: candidates who run a real apply may produce flashier deliverables. The compensating gain is that the artifact stays scope-honest, time-budget-honest, and account-hygiene-honest.
 
+## Phase 2 supersession — personal-AWS deployment (2026-04-25)
+
+The Phase-1 stance above remains in force for the **case-study deliverable cycle**: nothing the buyer reviews is the product of a real `terraform apply`. That stays correct.
+
+**For post-Phase-1 personal use** — the operator's own AWS account, deployed for hands-on verification rather than buyer review — the plan-only constraint is **superseded** by ADR-0023 (auto-scaling), ADR-0024 (cert provisioning), and ADR-0025 (state backend), which together specify everything required to make `terraform apply` succeed end-to-end:
+
+| Phase-2 unblock | ADR | Artefact |
+|---|---|---|
+| Auto-scaling configuration | ADR-0023 | HCL ready to paste into `module.ecs.services.app` |
+| VPN server + client root certs | ADR-0024 | `scripts/bootstrap-vpn-certs.sh` + ACM imports |
+| State backend (S3 + DynamoDB lock) | ADR-0025 | `terraform/bootstrap/` separately bootstrapped |
+
+The order of operations is documented in ADR-0023 § Future direction: bootstrap state backend → import certs → first apply → connect via VPN → verify drain semantics (ADR-0022) end-to-end.
+
+**The case-study artefact still does not include screenshots, deployed URLs, or any output of a real apply.** Personal Phase-2 deployment is for the operator's own validation and demo capability, not for the buyer's review surface. Anything the operator captures from a real deployment is kept out of the repo (per the same "no AWS account exposure" hygiene that motivated the original Phase-1 decision).
+
 ## Related ADRs
 - ADR-0002 (15h time budget — the constraint this decision protects)
 - ADR-0003 (PoC-scope, production-hygiene calibration)
 - ADR-0012 (migration runbook is the architectural differentiator, not the apply)
 - ADR-0016 (community Terraform modules — the code that doesn't get applied)
 - ADR-0018 (managed-default tool selection — ECS Fargate is the managed-default for the compute-orchestration domain)
+- ADR-0023 / 0024 / 0025 — Phase-2 supersession trio (auto-scaling, certs, state backend)
