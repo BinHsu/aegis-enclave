@@ -63,7 +63,8 @@ aegis-enclave/
 │   ├── design_doc.md                  # Reliability + VPN Architecture (long form, written in Phase 1)
 │   ├── deployment_guide.md            # Cloud deploy walkthrough + architecture diagram (Phase 1)
 │   ├── migration_runbook.md           # Phase 2 — agent-executable cross-cloud migration spec
-│   └── scaling_runbook.md             # Phase 2 — agent-executable single→multi-region spec
+│   ├── scaling_runbook.md             # Phase 2 — agent-executable single→multi-region spec
+│   └── production_adoption.md         # operator's "how to plug this into our AWS" guide
 ├── .gitignore                         # see CLAUDE.md § 2 for what's hidden
 └── case_study/                        # gitignored — copyrighted source briefs
 ```
@@ -249,15 +250,19 @@ See [ADR-0012](docs/ADR/0012-migration-runbook-agent-executable.md) for the agen
 
 The cloud target is a Terraform composition built entirely from `terraform-aws-modules/*` community modules:
 
-- VPC across two AZs (multi-AZ HA, single region)
-- ECS Fargate behind internal ALB
-- RDS PostgreSQL (single-AZ for case-study scale, Multi-AZ noted as the production toggle)
-- AWS Client VPN endpoint with mutual-TLS authentication
-- Secrets Manager + ECR + CloudWatch Logs
+- **Private-only VPC** across two AZs (per [ADR-0019](docs/ADR/0019-private-only-vpc-architecture.md)) — no IGW, no NAT, no public subnets; egress to AWS APIs via 8 interface VPC Endpoints + 1 S3 gateway endpoint
+- ECS Fargate behind **internal** ALB (private subnets only)
+- RDS PostgreSQL Multi-AZ standby
+- AWS Client VPN endpoint with mutual-TLS authentication (ingress)
+- Secrets Manager + ECR + CloudWatch Logs (all reached via PrivateLink)
 
 **The Terraform code in this repo is `plan`-only.** The brief explicitly accepts a deployment guide as sufficient (Task 3 of the source brief — gitignored under `case_study/`), and applying real AWS infrastructure is not the deliverable. See [ADR-0015](docs/ADR/0015-no-k8s-no-real-apply.md).
 
-For the full walkthrough including step-by-step `terraform plan` output and the architecture diagram, see [`docs/deployment_guide.md`](docs/deployment_guide.md).
+For the full architectural walkthrough (Mermaid diagram, component table, network flow, plan walkthrough) see [`docs/deployment_guide.md`](docs/deployment_guide.md).
+
+### Adopting in your AWS environment
+
+If the operator wants to take this composition to a real account — what they need to provide (ACM certs, state backend, VPC CIDR coordination, cross-account ECR, tags, IAM bootstrap), what the repo already provides, and the adoption checklist — see [`docs/production_adoption.md`](docs/production_adoption.md).
 
 ---
 
@@ -293,11 +298,13 @@ See [ADR-0004](docs/ADR/0004-reusability-90-10-split.md).
 
 ## Where to read next
 
-- **Why each design choice was made** → [`docs/ADR/`](docs/ADR/) (read in numerical order)
+- **Why each design choice was made** → [`docs/ADR/`](docs/ADR/) (read in numerical order, 1–19)
 - **How to run / extend the system** → [`CLAUDE.md`](CLAUDE.md)
 - **Long-form design rationale** → [`docs/design_doc.md`](docs/design_doc.md)
 - **Cloud deployment walkthrough** → [`docs/deployment_guide.md`](docs/deployment_guide.md)
-- **Cross-cloud migration spec** → [`docs/migration_runbook.md`](docs/migration_runbook.md)
+- **Adopting in your AWS environment** → [`docs/production_adoption.md`](docs/production_adoption.md)
+- **Cross-cloud migration spec (Phase 2)** → [`docs/migration_runbook.md`](docs/migration_runbook.md) (3 tracks: app + VPN + ECS→EKS)
+- **Multi-region scaling spec (Phase 2)** → [`docs/scaling_runbook.md`](docs/scaling_runbook.md)
 
 ---
 

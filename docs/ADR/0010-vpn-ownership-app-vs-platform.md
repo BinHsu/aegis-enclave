@@ -48,3 +48,4 @@ This distinction is recorded in:
 ## Related ADRs
 - ADR-0006 (VPN three-tier story — WireGuard demo / managed cloud / self-hosted NetBird)
 - ADR-0012 (migration runbook two-track structure)
+- ADR-0019 (private-only VPC — egress decision; the application's network surface is fully private on both directions)

@@ -92,6 +92,16 @@ In production at typical company scale, VPN is centralised platform infrastructu
 
 The Phase 1 demo bundles the VPN container per the brief's wording. The production architecture decouples the VPN from the application service. The Terraform module structure makes this distinction operational: `module "vpn"` (and its underlying `aws_ec2_client_vpn_endpoint` resource) is a separable unit. In a production deployment it is replaced by a `data` source pointing at the existing corporate VPN endpoint, with the application module unchanged. The migration runbook (ADR-0012) splits into two tracks for the same reason: the application track and the VPN-modernisation track have different owners, different cadence, different blast radius.
 
+### 2.5 Network egress posture
+
+Ingress is gated (§ 2.1–2.4 above). Egress is **also** off the public internet (ADR-0019). The VPC has no Internet Gateway, no NAT, and no public subnets — every AWS API call from the workload (ECR image pull, Secrets Manager fetch, CloudWatch Logs ship, IRSA / STS, ECS agent telemetry) is routed through VPC Endpoints (PrivateLink). The data plane never leaves the AWS backbone.
+
+The reasoning is the same shape as the K8s decision in ADR-0015 and the VPN decision in ADR-0006: **don't provision capability that isn't needed**. The application makes no third-party API calls, fetches no public packages at runtime, sends no outbound webhooks. NAT + IGW + public subnets would be infrastructure for a need that does not exist. Removing them tightens the security posture without breaking any brief requirement.
+
+**Build vs runtime is a deliberate boundary**, not a workaround. Image construction (`docker build`, `pip install` from PyPI) happens outside this VPC — typically in a separate build account / VPC / CI runner with public internet — and the built image is pushed to ECR. The runtime VPC pulls from ECR via PrivateLink. Cross-account ECR access is an IAM concern, not a networking one. CI/CD evolution does not affect the runtime VPC's private-only posture.
+
+The principle is captured in ADR-0018 (managed-default tool selection) — pick the simplest primitive that meets the requirement, upgrade only when scale, sovereignty, or capability gaps demand it. NAT was the wrong default for this workload because the workload has no public-internet egress requirement.
+
 ## 3. Where to read next
 
 - **Smoke test** — [`README.md` § Initial Acceptance](../README.md#initial-acceptance-smoke-test). Five paste-and-run commands, two minutes, pass/fail visible without the candidate present.

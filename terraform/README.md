@@ -17,6 +17,7 @@ This directory holds the AWS deployment as Terraform code. **It is `plan`-only f
 2. **Community-module discipline (ADR-0016)** — `terraform-aws-modules/*` for VPC, RDS, ECS, ALB, ECR, security groups. Hand-rolled HCL only for `aws_ec2_client_vpn_endpoint` (no mature community module yet).
 3. **Single-region multi-AZ posture (ADR-0007 + ADR-0009)** — two AZs in `eu-central-1`; RDS `multi_az = true` is the free architectural credit that supports the RPO target in ADR-0008.
 4. **DevSecOps**: ECR scan on push, IMMUTABLE image tags, RDS managed master password (Secrets Manager — no plaintext), private-only ALB.
+5. **Private-only VPC (ADR-0019)** — no public subnets, no IGW, no NAT. AWS API egress is replaced with VPC Endpoints (PrivateLink): one S3 gateway endpoint plus eight interface endpoints (`ecr.api`, `ecr.dkr`, `secretsmanager`, `logs`, `ecs`, `ecs-agent`, `ecs-telemetry`, `sts`). Combined with the Client VPN endpoint (ingress, ADR-0006), both ingress and egress are off the public internet.
 
 ## How to plan (no apply)
 

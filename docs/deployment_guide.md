@@ -12,10 +12,14 @@ The local Docker Compose layout is documented in [`README.md` § Architecture](.
 graph TB
     Op[Operator / Authorised Client]
 
+    subgraph BUILD[Build environment — separate VPC / account / dev machine, has public internet]
+        CB[CodeBuild / CI runner / Bin's laptop<br/>docker build, pip install from PyPI]
+    end
+
     subgraph AWS[AWS — eu-central-1]
         CVPN[Client VPN Endpoint<br/>10.20.0.0/16 client CIDR]
 
-        subgraph VPC[VPC 10.0.0.0/16]
+        subgraph VPC[VPC 10.0.0.0/16 — private only · no IGW · no NAT]
             subgraph AZ1[AZ eu-central-1a]
                 Pri1[Private subnet<br/>10.0.1.0/24]
                 Db1[Database subnet<br/>10.0.201.0/24]
@@ -28,17 +32,31 @@ graph TB
             ALB[Internal ALB<br/>HTTP :80]
             ECS[ECS Fargate<br/>app service :8000]
             RDS[(RDS PostgreSQL<br/>Multi-AZ standby)]
-            SM[Secrets Manager<br/>RDS master password]
-            ECR[ECR<br/>aegis-enclave repo]
+
+            subgraph VPCE[VPC Endpoints — PrivateLink]
+                VEP[Interface endpoints<br/>ecr.api · ecr.dkr · secretsmanager<br/>logs · ecs · ecs-agent · ecs-telemetry · sts]
+                S3GW[S3 Gateway Endpoint<br/>ECR layer storage]
+            end
+        end
+
+        subgraph BACKBONE[AWS Backbone — never on public internet]
+            ECR[ECR registry]
+            SM[Secrets Manager]
+            CWL[CloudWatch Logs]
         end
     end
+
+    CB ==>|push image, IAM-authorised| ECR
 
     Op -. mTLS tunnel .-> CVPN
     CVPN --> ALB
     ALB --> ECS
     ECS --> RDS
-    ECS -.reads secret.-> SM
-    ECS -.pulls image.-> ECR
+    ECS -.via PrivateLink.-> VEP
+    VEP --> SM
+    VEP --> ECR
+    VEP --> CWL
+    ECS -.layer pull.-> S3GW
     Pri1 -.failover.-> Pri2
     Db1 -.sync replication.-> Db2
 
@@ -46,15 +64,24 @@ graph TB
     style ALB fill:#fff3e0,color:#000
     style ECS fill:#e8f5e9,color:#000
     style RDS fill:#fff3e0,color:#000
-    style SM fill:#fce4ec,color:#000
-    style ECR fill:#fce4ec,color:#000
+    style VEP fill:#fce4ec,color:#000
+    style S3GW fill:#fce4ec,color:#000
+    style ECR fill:#f5f5f5,color:#000
+    style SM fill:#f5f5f5,color:#000
+    style CWL fill:#f5f5f5,color:#000
+    style CB fill:#fff9c4,color:#000
 ```
+
+**Network privacy posture (per ADR-0019)**: this VPC has **no Internet Gateway, no NAT, no public subnets**. Ingress is gated by AWS Client VPN endpoint (per ADR-0006); runtime egress to AWS APIs goes via VPC Endpoints (PrivateLink). The data plane never touches the public internet.
+
+**Build vs runtime separation**: image construction (`docker build`, `pip install` from PyPI) happens in a separate build environment with public-internet access — never inside this VPC. Cross-account ECR access is an IAM concern, not a networking one. The runtime VPC stays fully private regardless of how CI/CD evolves.
 
 ## Components
 
 | Component | Purpose | Module / resource | ADR |
 |---|---|---|---|
-| VPC + subnets + NAT + IGW | Two-AZ network with private / public / database tiers | `terraform-aws-modules/vpc/aws ~> 5.8` | ADR-0007, ADR-0016 |
+| VPC + private subnets only(no NAT,no IGW) | Two-AZ private network — runtime egress via PrivateLink | `terraform-aws-modules/vpc/aws ~> 5.8` | ADR-0007, ADR-0016, ADR-0019 |
+| VPC Endpoints — 8 interface(`ecr.api`/`ecr.dkr`/`secretsmanager`/`logs`/`ecs`/`ecs-agent`/`ecs-telemetry`/`sts`) + 1 S3 gateway | PrivateLink routes for AWS API egress;data plane never on public internet | `aws_vpc_endpoint` (direct provider) + `terraform-aws-modules/security-group/aws ~> 5.2` for endpoint SG | ADR-0019, ADR-0018 |
 | Internal ALB | Private HTTP load balancer; not internet-facing | `terraform-aws-modules/alb/aws ~> 9.9` | ADR-0011, ADR-0016 |
 | ECS Fargate service | App compute; managed, no control-plane fee | `terraform-aws-modules/ecs/aws ~> 5.11` | ADR-0015, ADR-0016 |
 | RDS PostgreSQL Multi-AZ | Audit-table store with synchronous standby | `terraform-aws-modules/rds/aws ~> 6.7` | ADR-0009, ADR-0008 |

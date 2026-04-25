@@ -1,16 +1,59 @@
-# Copy to terraform.tfvars (gitignored) before running `make tf-plan`.
-# These are PLAN-ONLY example values; real ARNs would come from a separate
-# ACM certificate provisioning step (out of case-study scope).
+# Copy this file to `terraform.tfvars` (gitignored) before running `make tf-plan`.
+# Each block below documents what an operator should override when adopting
+# this composition into their own AWS environment. See
+# `docs/production_adoption.md` for the full adoption workflow.
 
-region      = "eu-central-1"
+# ─── Region ─────────────────────────────────────────────────────────────────
+# AWS region the workload deploys into. Must be a region where:
+#   - The ACM certificates referenced below exist
+#   - All eight VPC interface endpoints (ecr.api / ecr.dkr / secretsmanager /
+#     logs / ecs / ecs-agent / ecs-telemetry / sts) are available — they are
+#     in every commercial region as of 2026, but verify for newer regions.
+region = "eu-central-1"
+
+# ─── Environment + cost / ownership tags(default_tags on the provider)──────
+# `environment` flows into resource tags and (in some shops) IAM scoping
+# conditions. Use the operator's environment taxonomy: dev / staging / prod.
 environment = "case-study"
-cost_center = "engineering"
-owner       = "bin.hsu"
-vpc_cidr    = "10.0.0.0/16"
 
-# Placeholder ARNs — real values would come from a separate ACM
-# (AWS Certificate Manager) provisioning step. These satisfy the type
-# constraint for `terraform plan` but the resulting plan will fail to
-# apply without real ACM certs.
+# Cost-attribution tag. Replace with the operator's cost-centre code so cost
+# reports route to the right team. See ADR-0018 (FinOps default_tags).
+cost_center = "engineering"
+
+# Resource owner — typically a team or distribution list, not an individual.
+# Used for ops contact + on-call routing in some org conventions.
+owner = "bin.hsu"
+
+# ─── VPC CIDR ────────────────────────────────────────────────────────────────
+# Must NOT overlap with any existing VPC the operator might peer or attach
+# via Transit Gateway. Subnet ranges are derived automatically from this
+# CIDR (private 10.0.1.0/24 + 10.0.2.0/24, database 10.0.201.0/24 + 10.0.202.0/24).
+# See `docs/production_adoption.md § 5` for IPAM coordination guidance.
+vpc_cidr = "10.0.0.0/16"
+
+# ─── ACM certificates for AWS Client VPN endpoint ───────────────────────────
+# Mutual-TLS authentication. The operator must pre-provision two ACM-imported
+# (or ACM-issued via Private CA) certificates:
+#
+#   `server_cert_arn` — server-side certificate the Client VPN endpoint
+#                       presents to connecting clients
+#   `client_cert_arn` — root CA certificate that signs client-side certs
+#
+# These ARNs are PLAN-ONLY placeholders that satisfy the Terraform type
+# system but would fail at `terraform apply` without real ACM resources.
+# See `docs/production_adoption.md § 3` for the certificate-provisioning paths
+# (AWS Private CA / self-signed via OpenSSL / third-party CA / corporate VPN).
+#
+# If the operator's organisation already runs a corporate VPN (Cisco AnyConnect,
+# Palo Alto GlobalProtect, etc.), the recommended path is to remove the
+# Client VPN endpoint resources from `main.tf` entirely and let the application
+# consume the existing corp VPN — see ADR-0010.
 server_cert_arn = "arn:aws:acm:eu-central-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
 client_cert_arn = "arn:aws:acm:eu-central-1:000000000000:certificate/11111111-1111-1111-1111-111111111111"
+
+# ─── (Future) Cross-account ECR ─────────────────────────────────────────────
+# If the operator follows a shared-services-account pattern (build artifacts
+# in a central account, runtime in a per-environment account), uncomment the
+# following and remove `module "ecr"` from `main.tf`. See `docs/production_adoption.md § 4`.
+#
+# ecr_repository_url = "<shared-account-id>.dkr.ecr.eu-central-1.amazonaws.com/aegis-enclave"

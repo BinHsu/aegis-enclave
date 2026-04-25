@@ -55,3 +55,4 @@ None of these triggers are met at case-study scope. The reviewer reads "I have a
 - ADR-0008 (reliability targets — the SLO/RTO/RPO numbers this topology supports)
 - ADR-0009 (DB topology — Multi-AZ standby specifics)
 - ADR-0012 (runbook format — same spec shape as the scaling runbook)
+- ADR-0019 (private-only VPC — single-region multi-AZ is realised through the same VPC with private subnets only)

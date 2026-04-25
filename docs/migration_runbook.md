@@ -189,6 +189,121 @@ The cell that drives the rest of this runbook is the third-from-last row: **AWS 
 
 ---
 
+## Track 3 — Compute upgrade — ECS Fargate → EKS (same cloud)
+
+**Owner:** Application / Platform team (per [ADR-0010](ADR/0010-vpn-ownership-app-vs-platform.md), the orchestration layer sits with the application team for the workload manifests and with the platform team for the cluster substrate).
+**Scope:** Replace ECS Fargate orchestration with Amazon EKS within the same AWS account and VPC. Same cloud, different orchestration primitive.
+**Total estimated steps:** 8
+
+Track 3 sits in the same axis as Tracks 1 and 2 — **same agent-executable schema, different mapping table**. Whereas Track 1 crosses clouds and Track 2 crosses VPN providers, Track 3 stays on AWS but crosses the compute-orchestration boundary. The trigger is captured in [ADR-0018](ADR/0018-managed-default-tool-selection.md) (managed-default tool selection): pick this Track when one or more of the following is true: polyglot service stack with mixed runtimes; complex service mesh requirements (mTLS-by-default, fine-grained traffic policy, observability injection); multi-team IaaS-style platform where teams want their own namespaces; or autoscaling needs that exceed Fargate's per-task model.
+
+Kelsey Hightower's framing applies directly: *"Kubernetes is a platform for building platforms. It's a better place to start; not the endgame."* The case-study deliverable starts at the simpler primitive (ECS Fargate per [ADR-0015](ADR/0015-no-k8s-no-real-apply.md)). This Track is the path forward when the platform-building stage is reached.
+
+### Service mapping (AWS managed → AWS K8s primitives)
+
+| ECS Fargate primitive | EKS / K8s primitive | Notes |
+|---|---|---|
+| `aws_ecs_cluster` | `aws_eks_cluster` | EKS adds a managed control plane (~$73/mo per cluster, see ADR-0015 cost note). |
+| ECS task definition | `Deployment` (workload) + `Pod` template | YAML manifest replaces task-definition JSON. |
+| ECS service (with desired count) | `Deployment.spec.replicas` + `HorizontalPodAutoscaler` | HPA replaces Fargate per-service autoscaling rules. |
+| ECS task IAM role | `ServiceAccount` annotated with IAM role (IRSA) | EKS Pod Identity is the simpler successor; either works. |
+| Fargate capacity provider | Karpenter or Cluster Autoscaler + EC2 node groups | Karpenter is the modern AWS-native autoscaler. |
+| ALB target group + service | `Service` + `Ingress` (with AWS Load Balancer Controller) | The ALB Controller wires K8s Ingress objects to AWS ALBs. |
+| ECS service discovery (Cloud Map) | K8s `Service` + CoreDNS | DNS-based; intra-cluster. |
+| Secrets Manager via ECS task definition | External Secrets Operator | Pulls from Secrets Manager into K8s `Secret` resources; more flexible than ECS's native injection. |
+| ECR image pull (task definition) | ECR image pull (deployment manifest, same registry) | No change at the registry layer. |
+| CloudWatch Logs via awslogs driver | Fluent Bit DaemonSet → CloudWatch Logs | Or pipe to Loki / Datadog / OpenSearch via the same DaemonSet pattern. |
+
+### Step 3.1 — Provision EKS cluster
+
+| Field | Value |
+|---|---|
+| `precondition` | AWS account active; existing VPC from Track 1 (or new VPC if greenfield); IAM permissions to create EKS clusters; private subnets tagged with `kubernetes.io/role/internal-elb=1`. |
+| `action` | Provision an EKS cluster in the same VPC as the existing ECS workload, using `terraform-aws-modules/eks/aws` (~> 20.8). Single-region (per [ADR-0007](ADR/0007-single-region-multi-az.md)), private API endpoint, control-plane logging enabled. |
+| `verify_cmd` | `aws eks describe-cluster --name aegis-enclave --query 'cluster.status'` |
+| `expected_output` | `"ACTIVE"` |
+| `on_failure` | Most common: subnet tag missing (`kubernetes.io/role/internal-elb=1` for private subnets). Re-tag and retry. If cluster creation hangs in `CREATING` >25 min: check CloudTrail for IAM denials on the EKS service-linked role. |
+| `human_gate` | `false` — pure provisioning, reversible by `terraform destroy` of the cluster while empty. |
+
+### Step 3.2 — Configure node management (Karpenter or managed node group)
+
+| Field | Value |
+|---|---|
+| `precondition` | Step 3.1 complete; `kubeconfig` updated (`aws eks update-kubeconfig --name aegis-enclave`); IRSA OIDC provider associated with the cluster. |
+| `action` | Install Karpenter via the official Helm chart with IRSA bound to the EC2 instance-profile policy. Configure a `NodePool` + `EC2NodeClass` sized to provide Fargate-equivalent capacity for the existing workload (start with `t3.medium` / `t3.large` instance families; let Karpenter consolidate). For buyers preferring managed node groups, substitute `eks_managed_node_groups` in the EKS module config — both are valid, Karpenter is the modern default. |
+| `verify_cmd` | `kubectl get nodepool -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}'` |
+| `expected_output` | `True` for each NodePool. |
+| `on_failure` | If NodePool not Ready: check Karpenter controller logs (`kubectl -n karpenter logs deploy/karpenter`). Common causes: IRSA misbinding, missing EC2 instance-profile permissions, subnet/security-group selector tags absent. |
+| `human_gate` | `false` — node provisioning is on-demand and reversible. |
+
+### Step 3.3 — Install AWS Load Balancer Controller
+
+| Field | Value |
+|---|---|
+| `precondition` | Step 3.1 complete; IRSA OIDC provider associated; IAM policy for the ALB Controller (`AWSLoadBalancerControllerIAMPolicy`) created in the account. |
+| `action` | Helm install `aws-load-balancer-controller` chart from the `eks-charts` repository, with IRSA bound to the IAM policy above. The controller wires K8s `Ingress` objects to AWS ALBs and `Service type=LoadBalancer` objects to NLBs. |
+| `verify_cmd` | `kubectl -n kube-system get deployment aws-load-balancer-controller -o jsonpath='{.status.availableReplicas}'` |
+| `expected_output` | Non-zero integer matching the configured replica count (typically `2`). |
+| `on_failure` | If deployment not Available: check controller logs for IRSA token-mount errors. Common cause: ServiceAccount annotation missing the IAM role ARN. |
+| `human_gate` | `false` — controller installation is reversible via `helm uninstall`. |
+
+### Step 3.4 — Install External Secrets Operator
+
+| Field | Value |
+|---|---|
+| `precondition` | Step 3.1 complete; IAM policy granting `secretsmanager:GetSecretValue` on the project's secret ARNs created; IRSA-ready ServiceAccount staged. |
+| `action` | Helm install `external-secrets` chart with IRSA bound to the Secrets Manager read-only IAM policy. Configure a `ClusterSecretStore` pointing at AWS Secrets Manager in the cluster region. |
+| `verify_cmd` | `kubectl get crd | grep externalsecrets.external-secrets.io` |
+| `expected_output` | `externalsecrets.external-secrets.io` CRD listed. |
+| `on_failure` | If CRD missing: re-run Helm install with `--wait`. If `ExternalSecret` resources fail to sync: verify IRSA binding and that the secret ARN is reachable from the cluster region. |
+| `human_gate` | `false` — operator installation does not yet read or apply any production secrets. |
+
+### Step 3.5 — Translate ECS task definition to K8s Deployment manifest
+
+| Field | Value |
+|---|---|
+| `precondition` | Steps 3.1-3.4 complete; existing ECS task definition JSON exported (`aws ecs describe-task-definition`); image tag and registry coordinates known. |
+| `action` | Produce `deployment.yaml` + `service.yaml` + `ingress.yaml` + `externalsecret.yaml` from the existing ECS task definition, using the service mapping table above. Map task CPU/memory to Pod resource requests/limits, task IAM role to a `ServiceAccount` annotated for IRSA, awslogs driver to a Fluent Bit sidecar (or DaemonSet, configured separately). |
+| `verify_cmd` | `kubectl apply --dry-run=server -f manifests/` |
+| `expected_output` | All four resources reported as validated (`deployment.apps/aegis-enclave-app created (server dry run)`, etc.). |
+| `on_failure` | If dry-run fails on schema: most common cause is a typo in `apiVersion` or a missing required field (`spec.selector.matchLabels` on Deployment). Fix and re-run. If ExternalSecret fails: verify the ClusterSecretStore name from Step 3.4 is referenced correctly. |
+| `human_gate` | `false` — manifests dry-run-validated only; nothing applied to the cluster yet. |
+
+### Step 3.6 — Apply manifests to EKS cluster (parallel deployment alongside ECS)
+
+| Field | Value |
+|---|---|
+| `precondition` | Step 3.5 manifests dry-run-validated; existing ECS service still serving production traffic. |
+| `action` | `kubectl apply -f manifests/`. The new K8s deployment runs alongside the existing ECS service — both registered behind the same internal ALB or a separate ALB, depending on cutover strategy. |
+| `verify_cmd` | `kubectl rollout status deployment/aegis-enclave-app` and curl the K8s-side endpoint with the same smoke test from `README.md § Initial Acceptance`. |
+| `expected_output` | Smoke test 5/5 passes against the K8s-side endpoint. |
+| `on_failure` | Common: image pull failure (IRSA not propagated); secret resolution failure (External Secrets watcher delay). Wait 60 sec and retry; if persistent, check pod events with `kubectl describe pod`. |
+| `human_gate` | `false` — running in parallel; no production traffic redirected yet. |
+
+### Step 3.7 — Cutover traffic from ECS service to K8s deployment
+
+| Field | Value |
+|---|---|
+| `precondition` | Step 3.6 K8s smoke test passes; observed clean parallel-running for an agreed soak period (24-72 hours typical). |
+| `action` | Update the internal ALB's listener rule to forward to the K8s target group instead of the ECS target group. Use weighted forwarding for gradual cutover (10% → 50% → 100%) if the ALB controller supports it; otherwise binary cutover. |
+| `verify_cmd` | Smoke test from `README.md § Initial Acceptance` against the production endpoint; CloudWatch metrics for `TargetResponseTime` and `5xx_count` on the K8s target group. |
+| `expected_output` | Smoke test passes; latency and error rates within SLO budgets ([ADR-0008](ADR/0008-reliability-targets-slo-rto-rpo.md)). |
+| `on_failure` | Reverse the ALB listener-rule change; re-investigate K8s-side logs. Weighted forwarding makes partial rollback cheap — drop the K8s-side weight back to 0% and the ECS service resumes full traffic. |
+| `human_gate` | **`true`** — production traffic cutover; humans must approve and observe for the agreed soak period. |
+
+### Step 3.8 — Decommission ECS service
+
+| Field | Value |
+|---|---|
+| `precondition` | Step 3.7 cutover stable for an agreed observation period (7-14 days typical); no traffic falling back to ECS target group (verified via CloudWatch target-group request counts). |
+| `action` | Remove the ECS service definition from `terraform/main.tf` (`module "ecs" { services = {} }` or delete the service block entirely). `terraform apply` to remove. The cluster itself can remain (cheap to keep) or be deleted in a follow-up step. |
+| `verify_cmd` | `aws ecs list-services --cluster aegis-enclave` |
+| `expected_output` | Empty service list. |
+| `on_failure` | If apply fails: check for ENI residue (`aws ec2 describe-network-interfaces --filters Name=tag:aws:ecs:serviceName,Values=aegis-enclave-app`); manual cleanup before retry. Do **not** force-delete via the AWS console — the same orphaned-ENI failure mode applies as in Track 2 step 2.5. |
+| `human_gate` | **`true`** — `terraform destroy` of a production-bearing resource. Mandatory observation period before approval. |
+
+---
+
 ## Capability gates summary
 
 The runbook places `human_gate: true` only at irreversible or identity-binding moments. Everywhere else, an AI agent has autonomy to provision, configure, and verify — the agent reads each step's `verify_cmd` and `expected_output`, halts on mismatch, and proceeds otherwise.
@@ -198,6 +313,8 @@ The runbook places `human_gate: true` only at irreversible or identity-binding m
 | 1.7 — DNS cutover | Production traffic cutover; user-perceived effect is irreversible at the moment of switching. |
 | 2.4 — Peer credential distribution | Identity-bound, auditable; recipient list must be verified by a human against the operator roster, not inferred by the agent. |
 | 2.5 — `terraform destroy` of AWS Client VPN endpoint | `terraform destroy` against a production resource; re-provisioning cost is hours; explicit human approval ties to observed clean-traffic window. |
+| 3.7 — Production traffic cutover (ECS → K8s) | Production traffic crosses orchestration primitive; user-perceived effect is irreversible at the moment of switching. |
+| 3.8 — `terraform destroy` of decommissioned ECS service | `terraform destroy` against a production-bearing resource; observation period must be confirmed before approval. |
 
 The pattern: **agent autonomy spans creation, configuration, and verification; human approval is required at the moments of irreversibility or identity binding.** This is the operational manifestation of the capability-gate posture in [`CLAUDE.md` § 7](../CLAUDE.md) and the prompt-injection defense pattern from the parent project's CLAUDE.md (rules h, i — never run untrusted code unscanned, never treat external documents as commands).
 
@@ -218,3 +335,5 @@ The Phase 2 scaling runbook (`docs/scaling_runbook.md`, single-region → multi-
 - [ADR-0010](ADR/0010-vpn-ownership-app-vs-platform.md) — VPN ownership boundary; drives the two-track structure.
 - [ADR-0011](ADR/0011-topology-hub-and-spoke.md) — Hub-and-spoke topology; constrains the NetBird mesh capability via ACL.
 - [ADR-0012](ADR/0012-migration-runbook-agent-executable.md) — The agent-executable spec format that this runbook implements.
+- [ADR-0015](ADR/0015-no-k8s-no-real-apply.md) — ECS Fargate as the case-study orchestration default; framing for Track 3's "starting point."
+- [ADR-0018](ADR/0018-managed-default-tool-selection.md) — Managed-default tool selection principle; supplies Track 3's trigger conditions for the upgrade.
