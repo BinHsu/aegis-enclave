@@ -1,0 +1,39 @@
+# Run `pre-commit install` once. Pre-commit framework: https://pre-commit.com/
+# — secret scan, lint, format, terraform fmt
+#
+# Version pins are current as of 2026-04 — bump on next dependency review.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.0
+    hooks:
+      - id: gitleaks
+        # Scans staged files for committed secrets / API keys / private keys.
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.10
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.92.0
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_validate
+        # Lightweight validation — full plan happens via `make tf-plan`.
+
+# After modifying this file, run: pre-commit run --all-files

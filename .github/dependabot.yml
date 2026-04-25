@@ -1,0 +1,78 @@
+# Dependabot v2 — automated dependency updates per ecosystem.
+#
+# Four ecosystems tracked: pip, terraform, docker, github-actions.
+# Schedules are staggered across Monday morning to avoid PR pile-up.
+
+version: 2
+
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(py)"
+    labels:
+      - "dependencies"
+      - "pip"
+    assignees:
+      - "BinHsu"
+    ignore:
+      - dependency-name: "fastapi"
+        update-types: ["version-update:semver-patch"]
+      - dependency-name: "pydantic"
+        update-types: ["version-update:semver-patch"]
+      - dependency-name: "sqlalchemy"
+        update-types: ["version-update:semver-patch"]
+
+  - package-ecosystem: "terraform"
+    directory: "/terraform"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(tf)"
+    labels:
+      - "dependencies"
+      - "terraform"
+    assignees:
+      - "BinHsu"
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "10:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(docker)"
+    labels:
+      - "dependencies"
+      - "docker"
+    assignees:
+      - "BinHsu"
+
+  - package-ecosystem: "github-actions"
+    directory: "/.github"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "11:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(actions)"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    assignees:
+      - "BinHsu"

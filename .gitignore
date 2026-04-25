@@ -1,0 +1,85 @@
+# ─────────────────────────────────────────────────────────────────
+# Confidential — never commit
+# ─────────────────────────────────────────────────────────────────
+# Strategy + execution notes (specific to current case-study cycle)
+strategy.md
+
+# Buyer-specific top-layer framing (per-cycle, never committed)
+*_steps.md
+*_instructions.md
+
+# Source case-study briefs (copyrighted, do not redistribute)
+case_study/
+*.pdf
+
+# Cover note drafts addressed to a specific recipient
+cover_note.md
+cover_note_*.md
+
+# Leak-guard pattern file (one regex per line of buyer-specific tokens)
+.leakguard
+
+# ─────────────────────────────────────────────────────────────────
+# Local environment
+# ─────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.local
+
+# WireGuard keys / configs with material
+wireguard/*.conf
+wireguard/keys/
+!wireguard/wg0.conf.template
+
+# Terraform state + plan output (state holds secrets, plan is per-machine)
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfplan
+terraform/*.tfvars
+!terraform/*.tfvars.example
+terraform/crash.log
+
+# Cloud screenshots (may contain account IDs, IPs, ARNs)
+screenshots/
+*.screenshot.png
+
+# ─────────────────────────────────────────────────────────────────
+# Language / tool defaults
+# ─────────────────────────────────────────────────────────────────
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# Node (if any tooling)
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+
+# Logs
+*.log
+logs/
