@@ -41,3 +41,4 @@ Use **Docker Compose only** for orchestration — no Kubernetes manifests. Provi
 - ADR-0003 (PoC-scope, production-hygiene calibration)
 - ADR-0012 (migration runbook is the architectural differentiator, not the apply)
 - ADR-0016 (community Terraform modules — the code that doesn't get applied)
+- ADR-0018 (managed-default tool selection — ECS Fargate is the managed-default for the compute-orchestration domain)

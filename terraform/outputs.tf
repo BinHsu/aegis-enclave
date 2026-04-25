@@ -44,3 +44,13 @@ output "ecs_cluster_arn" {
   description = "ECS Fargate cluster ARN"
   value       = module.ecs.cluster_arn
 }
+
+output "vpc_endpoint_ids" {
+  description = "VPC interface endpoint identifiers (PrivateLink — see ADR-0019)"
+  value       = { for k, v in aws_vpc_endpoint.interfaces : k => v.id }
+}
+
+output "s3_gateway_endpoint_id" {
+  description = "S3 gateway VPC endpoint identifier"
+  value       = aws_vpc_endpoint.s3.id
+}

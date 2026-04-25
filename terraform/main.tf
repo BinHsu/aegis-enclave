@@ -36,6 +36,9 @@ provider "aws" {
 }
 
 # ─── Network (ADR-0007: single-region eu-central-1, multi-AZ) ──────────────
+# ADR-0019 — Private-only VPC: no public subnets, no IGW, no NAT.
+# AWS service egress goes through VPC Endpoints (declared below); the VPC
+# has no public-internet egress path at all.
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 5.8"
@@ -45,14 +48,67 @@ module "vpc" {
 
   azs              = ["${var.region}a", "${var.region}b"]
   private_subnets  = ["10.0.1.0/24", "10.0.2.0/24"]
-  public_subnets   = ["10.0.101.0/24", "10.0.102.0/24"]
   database_subnets = ["10.0.201.0/24", "10.0.202.0/24"]
+  # public_subnets intentionally absent — see ADR-0019.
 
-  enable_nat_gateway   = true
-  single_nat_gateway   = true # Phase 1 cost discipline
+  enable_nat_gateway   = false # ADR-0019 — no public-internet egress
   enable_dns_hostnames = true
+  enable_dns_support   = true # required for VPC Endpoints to resolve
 
   create_database_subnet_group = true
+}
+
+# ─── VPC Endpoints (ADR-0019: private-only VPC, AWS API egress via PrivateLink) ──
+
+# Security group permitting HTTPS from the VPC CIDR to the endpoint ENIs.
+module "vpc_endpoints_sg" {
+  source  = "terraform-aws-modules/security-group/aws"
+  version = "~> 5.2"
+
+  name        = "aegis-enclave-vpc-endpoints-sg"
+  description = "VPC Endpoint ENI inbound — HTTPS from within the VPC"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress_cidr_blocks = [var.vpc_cidr]
+  ingress_rules       = ["https-443-tcp"]
+  egress_rules        = ["all-all"]
+}
+
+# Gateway endpoint — S3 (free; ECR uses S3 for layer storage).
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = module.vpc.vpc_id
+  service_name      = "com.amazonaws.${var.region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = module.vpc.private_route_table_ids
+
+  tags = { Name = "aegis-enclave-s3-gateway" }
+}
+
+# Interface endpoints — for AWS service APIs that the workload calls.
+locals {
+  interface_endpoints = toset([
+    "ecr.api",
+    "ecr.dkr",
+    "secretsmanager",
+    "logs",
+    "ecs",
+    "ecs-agent",
+    "ecs-telemetry",
+    "sts",
+  ])
+}
+
+resource "aws_vpc_endpoint" "interfaces" {
+  for_each = local.interface_endpoints
+
+  vpc_id              = module.vpc.vpc_id
+  service_name        = "com.amazonaws.${var.region}.${each.value}"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = module.vpc.private_subnets
+  security_group_ids  = [module.vpc_endpoints_sg.security_group_id]
+  private_dns_enabled = true
+
+  tags = { Name = "aegis-enclave-${replace(each.value, ".", "-")}" }
 }
 
 # ─── Security groups (ALB → app → RDS chain) ───────────────────────────────

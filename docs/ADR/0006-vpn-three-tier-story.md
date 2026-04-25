@@ -46,3 +46,5 @@ WireGuard's role is demoted to demo plumbing. The design doc and migration runbo
 - ADR-0010 (VPN ownership boundary — where the candidate's responsibility ends and the operator's begins)
 - ADR-0011 (hub-spoke topology — the cloud-side network shape Client VPN endpoint plugs into)
 - ADR-0012 (migration runbook agent-executable spec — Track 2 covers the NetBird migration)
+- ADR-0018 (managed-default tool selection — Client VPN endpoint is the managed-default for the VPN-gateway domain)
+- ADR-0019 (private-only VPC — completes the network story: this ADR governs ingress, ADR-0019 governs egress)

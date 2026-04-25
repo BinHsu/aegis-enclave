@@ -43,3 +43,4 @@ Build the Terraform composition from `terraform-aws-modules/*` registry modules.
 ## Related ADRs
 - ADR-0005 (AWS as deployment target — the cloud this Terraform composition targets)
 - ADR-0015 (no real apply — the code is module-based but not executed against a real account)
+- ADR-0019 (private-only VPC — the VPC module's `public_subnets` and `enable_nat_gateway` are explicitly omitted to realise the private-only architecture)
