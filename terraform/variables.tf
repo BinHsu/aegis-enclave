@@ -44,3 +44,9 @@ variable "client_cert_arn" {
   type        = string
   default     = ""
 }
+
+variable "alb_internal_hostname" {
+  description = "Hostname embedded in the internal ALB's self-signed cert (ADR-0027). Operator's curl uses --resolve <this>:443:<alb-private-ip> against it."
+  type        = string
+  default     = "api.enclave.internal"
+}
