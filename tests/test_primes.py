@@ -165,8 +165,21 @@ class TestBuildPrimeTable:
         assert _build_prime_table(bound) == sympy_primes(2, bound)
 
     def test_module_table_matches_oracle(self) -> None:
-        """The actual `_PRIME_TABLE` loaded at import time must match sympy."""
-        assert _PRIME_TABLE == sympy_primes(2, _TABLE_BOUND)
+        """The actual `_PRIME_TABLE` loaded at import time must match sympy.
+
+        `_PRIME_TABLE` is stored as a tuple for immutability (see ADR-0017);
+        cast to list for equality comparison against the sympy oracle output.
+        """
+        assert list(_PRIME_TABLE) == sympy_primes(2, _TABLE_BOUND)
+
+    def test_module_table_is_immutable(self) -> None:
+        """ADR-0017: storage as tuple guards against accidental mutation."""
+        import pytest as _pytest
+
+        with _pytest.raises(AttributeError):
+            _PRIME_TABLE.append(999_983)  # type: ignore[attr-defined]
+        with _pytest.raises(TypeError):
+            _PRIME_TABLE[0] = 0  # type: ignore[index]
 
 
 # ───────────────────────────────────────────────────────────────────────────

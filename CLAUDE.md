@@ -165,6 +165,49 @@ This repo's migration runbook is designed for AI-agent execution. The same gatin
 
 ---
 
+## 8b. Test discipline — TDD-style
+
+**Every implementation file under `src/` must have a corresponding test file under `tests/`.** No exceptions for "trivial" code — `__init__.py` with only a `__version__` constant is the only carve-out.
+
+### Process discipline (TDD posture, retro-applicable)
+
+When adding new functionality:
+
+1. **Test first.** Write the test (or at least the test stub with assertions) before the implementation.
+2. Run the test → red (failing).
+3. Implement just enough to make it green.
+4. Refactor.
+5. Commit test + implementation together.
+
+When modifying an existing function:
+
+- **Update the corresponding test in the same commit as the implementation change.** A commit that touches `src/prime_service/foo.py` without touching `tests/test_foo.py` is a regression against this rule.
+- If the change is a pure refactor (no behaviour change), the existing test must still pass. If the test needs adjustment, the behaviour changed — re-derive the test from the new contract first.
+- If a function is removed, its tests are removed in the same commit.
+
+### Coverage expectation
+
+- **Branch coverage** ≥ 95 % on `src/` per `make test-cov` (configured in `pyproject.toml`).
+- **Boundary value analysis** at every numeric / structural threshold — three points per boundary (`B-1`, `B`, `B+1`).
+- **Differential testing** against a trusted oracle when one exists (e.g. `sympy` for prime correctness — see ADR-0017). The brief's "implementation should be yours" rule scopes the implementation, not test oracles.
+
+### What "needs a test" by file kind
+
+| File kind | Test approach |
+|---|---|
+| Pure logic (algorithms, validators, schemas) | Unit tests; differential where oracle exists; BVA |
+| I/O layer (`db.py`, network) | Mock-based unit tests + integration via smoke test |
+| HTTP handlers (`main.py`) | FastAPI `TestClient` with dependency overrides; mock the I/O layer |
+| `Dockerfile`, `docker-compose.yml` | `hadolint` / `docker compose config` validation; `make smoke` end-to-end |
+| Terraform (`terraform/`) | `terraform validate` + `terraform fmt -check` + `terraform plan` (no apply per ADR-0015) |
+| Shell scripts (`*.sh`) | `sh -n` syntax check; smoke test exercises behaviour |
+| Markdown docs | No tests; reviewed for ADR cross-reference resolution |
+
+### Pre-push check
+The `make pre-push-check` target enforces leak-guard cleanliness. Test coverage and parity is enforced by the developer reading the diff: every staged `src/` change should have a paired `tests/` change.
+
+---
+
 ## 9. Commit and push hygiene
 
 ### README is the project's status indicator

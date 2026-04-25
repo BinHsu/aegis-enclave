@@ -1,5 +1,9 @@
 """Prime number generation in a bounded range.
 
+See ADR-0017 (`docs/ADR/0017-prime-computation-strategy.md`) for the full
+rationale of the layered strategy, the tuple-stored lookup table, and the
+sympy-as-test-oracle differential testing approach.
+
 Algorithm choice (layered cache + compute):
     Layer 1 — lookup table:
         Pre-computed sorted list of primes up to _TABLE_BOUND, built once at
@@ -64,7 +68,12 @@ def _build_prime_table(bound: int) -> list[int]:
 
 # Pre-computed at module load — amortises sieve allocation across all queries
 # whose range is fully (or partially) covered by [2, _TABLE_BOUND].
-_PRIME_TABLE: list[int] = _build_prime_table(_TABLE_BOUND)
+#
+# Stored as a tuple (immutable) so accidental in-process mutation
+# (`.append`, `.sort`, `.clear`) raises TypeError instead of silently
+# corrupting subsequent lookups. `bisect` works on any sorted sequence,
+# so the API surface is unchanged.
+_PRIME_TABLE: tuple[int, ...] = tuple(_build_prime_table(_TABLE_BOUND))
 
 
 def primes_in_range(start: int, end: int) -> list[int]:
@@ -111,10 +120,13 @@ def _lookup_in_table(start: int, end: int) -> list[int]:
     """Slice the precomputed prime table for the inclusive range [start, end].
 
     O(log n) per range bound via bisect; O(k) for the slice copy.
+    Returns a list (not a tuple) to match the public `primes_in_range`
+    contract and so the partial-overlap path can concatenate with the
+    runtime-computed suffix via `cached + computed`.
     """
     lo = bisect_left(_PRIME_TABLE, start)
     hi = bisect_right(_PRIME_TABLE, end)
-    return _PRIME_TABLE[lo:hi]
+    return list(_PRIME_TABLE[lo:hi])
 
 
 def _compute(start: int, end: int) -> list[int]:
