@@ -14,12 +14,12 @@ The repo is a runnable artifact, not a demo session. The smoke test in [§ Initi
 |---|---|
 | **Service** | FastAPI prime-number generator, three endpoints, VPN-only access |
 | **Database** | PostgreSQL container, single tenant, execution audit table |
-| **Local network** | Docker Compose, WireGuard container as VPN gateway, in-container test-client for verification |
+| **Local verification harness** | Docker Compose stack with in-container test-client; WireGuard gateway here is a self-contained local fixture for the security-boundary test, not part of the deployment architecture |
 | **Cloud target (AWS)** | Terraform with community modules — VPC, ECS Fargate behind internal ALB, RDS, **AWS Client VPN endpoint**, Secrets Manager, ECR |
 | **Cloud migration (e.g., IONOS / sovereign)** | Agent-executable runbook with service-mapping table; recommends self-hosted **NetBird** where managed VPN doesn't exist |
 | **Operations** | Mermaid smoke-test sequence, capability-gated agent execution, scope-honest reliability targets |
 
-The architecture story is layered: WireGuard exists only as local demo plumbing, AWS Client VPN endpoint is the cloud-side primary, and NetBird (Berlin-based, EU-sovereign, self-hostable) is the recommended alternative when managed VPN is unavailable or cost-prohibitive. See [ADR-0006](docs/ADR/0006-vpn-three-tier-story.md).
+The deployment architecture has one VPN: **AWS Client VPN endpoint**. The local Docker Compose stack ships with a WireGuard gateway as a self-contained verification harness so reviewers can prove the security boundary in five commands without standing up cloud — it is not part of the cloud architecture. **NetBird** (Berlin-based, EU-sovereign, self-hostable) is the recommended alternative when migrating to a cloud without a managed VPN endpoint. See [ADR-0006](docs/ADR/0006-vpn-three-tier-story.md).
 
 ---
 
@@ -120,7 +120,9 @@ docker compose up -d
 docker compose logs -f --tail=20
 
 # 3. Run the smoke test (see next section)
-docker compose run --rm test-client ./smoke.sh
+#    Either path works — smoke.sh self-bootstraps tooling if absent.
+docker compose exec test-client ./smoke.sh        # preferred after `up -d`
+# docker compose run --rm test-client ./smoke.sh  # one-off container, also works
 ```
 
 For full local development (with linting + tests):
@@ -146,7 +148,16 @@ The pre-push pytest gate mirrors the `.github/workflows/ci.yml` GitHub Actions c
 
 ## Initial Acceptance (Smoke Test)
 
-This is the **one** verification the deliverable supports. It's structured as a sequence diagram so a reviewer can trace what each step proves about the system.
+The deliverable supports **two** acceptance gates that exercise different surfaces:
+
+| Gate | What it proves | When |
+|---|---|---|
+| **Local stack acceptance** (below) | Security-boundary correctness — host can't reach app/DB; only the in-VPN test-client can. Five commands, two minutes, no cloud account required. | Today, against the running Docker Compose stack |
+| **Cloud deployment acceptance** ([§ Cloud deployment acceptance](#cloud-deployment-acceptance-phase-23-pending)) | End-to-end path: macOS → AWS Client VPN tunnel → internal ALB → ECS Fargate `/primes` endpoint returns a list. Confirms the deployment architecture itself works against real AWS. | Phase 2.3 (pending real `terraform apply`) |
+
+### Local stack acceptance
+
+Structured as a sequence diagram so a reviewer can trace what each step proves about the system.
 
 ```mermaid
 sequenceDiagram
@@ -214,6 +225,47 @@ curl -m 5 http://localhost:8000/health
 
 Five steps. Two minutes. Pass = system meets the brief's security boundary requirement.
 
+### Cloud deployment acceptance (Phase 2.3 — pending)
+
+This gate exercises the **deployment-architecture VPN** (AWS Client VPN endpoint) end-to-end from a developer laptop. It only runs after Phase 2.3 completes a real `terraform apply` against a personal AWS account.
+
+```text
+[macOS Tunnelblick / native OpenVPN client]
+        │  mutual-TLS handshake (client cert in ACM, see ADR-0024)
+        ▼
+[AWS Client VPN endpoint]  ──► VPC private subnet
+        │
+        ▼
+[Internal ALB]  ──► [ECS Fargate task]  ──► [RDS PostgreSQL Multi-AZ]
+```
+
+```bash
+# 1. (one-off) Bootstrap state backend + GHA OIDC role per ADR-0025/0026
+make tf-bootstrap
+
+# 2. (one-off) Generate Client VPN server + client certs and import to ACM (ADR-0024)
+make ts-bootstrap-certs OPERATOR=<your-handle>
+
+# 3. Uncomment `backend "s3"` and the auto-scaling block in terraform/main.tf,
+#    paste cert ARNs into gitignored terraform/terraform.tfvars, then:
+make tf-apply
+
+# 4. Import the operator .ovpn package into Tunnelblick (or `openvpn3 session-start`)
+#    and connect.
+
+# 5. From macOS, with the VPN tunnel active:
+curl --resolve api.enclave.internal:443:<alb-private-ip> \
+     https://api.enclave.internal/primes \
+     -X POST -H 'Content-Type: application/json' \
+     -d '{"start":2,"end":100}'
+# Expected: 200, primes array length 25, execution_id present.
+
+# 6. Negative test — disconnect VPN, repeat the curl:
+# Expected: timeout (ALB is in private subnets only — see ADR-0019).
+```
+
+Evidence (request/response pairs, screenshots of the Client VPN handshake, `terraform output`) lands in [`docs/deployment_guide.md`](docs/deployment_guide.md) when this phase completes. The stack is torn down after evidence capture; cost while live ≈ $50-80/mo (RDS Multi-AZ + Client VPN endpoint + ALB are the dominant lines).
+
 ---
 
 ## Delivery Phases
@@ -232,6 +284,7 @@ The deliverable is staged into numbered phases (decimals allowed for sub-progres
 | **1.5** | ✅ done | Phase 1 smoke test passes | Verified on 2026-04-25: OrbStack docker daemon, `docker compose up --build` healthy, smoke test 5/5 (test-client → API → DB), negative test confirms host-side `:8000` + `:5432` both `Connection refused` — VPN-only boundary proven. Initial Acceptance achieved. Two real bugs caught and fixed during this gate (`.dockerignore` over-excluded README.md; Dockerfile's editable install path mismatched runtime layout) |
 | **2.1** | ✅ done | Cross-cloud migration runbook | `docs/migration_runbook.md` — agent-executable spec, two tracks (Application + VPN modernisation) |
 | **2.2** | ✅ done | Multi-region scaling runbook | `docs/scaling_runbook.md` — same format, single-region → multi-region axis |
+| **2.3** | ⏳ pending | Cloud deployment live + AWS Client VPN end-to-end verified from local | `make tf-bootstrap` (state backend + GHA OIDC per ADR-0025/0026) → `make ts-bootstrap-certs OPERATOR=…` (Client VPN certs into ACM per ADR-0024) → uncomment `backend "s3"` + auto-scaling in `terraform/main.tf` → paste cert ARNs into gitignored `terraform.tfvars` → `make tf-apply` (6-step pre-flight per `scripts/ts_apply.sh`) → connect via Client VPN client from macOS → `curl https://<alb-private>/primes` returns prime list → evidence captured in `docs/deployment_guide.md`. ADR-0015 plan-only stance was superseded for this phase (see ADR-0015 supersession block). Cost while live: ~$50-80/mo (RDS + Client VPN + ALB dominate); torn down after evidence captured |
 | **3.0** | ⏳ pending | Polish + cover note | Final README pass, `cover_note.md` (gitignored) drafted |
 | **3.1** | ⏳ pending | Repo published to private remote | Pre-push leak guard clean, repo invitation sent to recipient |
 | **3.2** | ⏳ pending | Submission email sent | End of cycle |
@@ -266,7 +319,7 @@ The cloud target is a Terraform composition built entirely from `terraform-aws-m
 - AWS Client VPN endpoint with mutual-TLS authentication (ingress)
 - Secrets Manager + ECR + CloudWatch Logs (all reached via PrivateLink)
 
-**The Terraform code in this repo is `plan`-only.** The brief explicitly accepts a deployment guide as sufficient (Task 3 of the source brief — gitignored under `case_study/`), and applying real AWS infrastructure is not the deliverable. See [ADR-0015](docs/ADR/0015-no-k8s-no-real-apply.md).
+**The Terraform code is `plan`-only by default** — the brief accepts a deployment guide as sufficient (Task 3 of the source brief — gitignored under `case_study/`). For Phase 2.3 of this delivery, ADR-0015's plan-only stance is superseded so the AWS Client VPN end-to-end path can be verified from a developer laptop against a real personal AWS account; see the supersession block at the bottom of [ADR-0015](docs/ADR/0015-no-k8s-no-real-apply.md) and [§ Cloud deployment acceptance](#cloud-deployment-acceptance-phase-23-pending) above for the gate that consumes it.
 
 For the full architectural walkthrough (Mermaid diagram, component table, network flow, plan walkthrough) see [`docs/deployment_guide.md`](docs/deployment_guide.md).
 

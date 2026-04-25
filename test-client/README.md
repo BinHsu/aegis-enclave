@@ -6,7 +6,10 @@ Lightweight Alpine container that runs `smoke.sh` from inside the Docker network
 
 ```bash
 make up                                 # bring up the stack
-docker compose run --rm test-client ./smoke.sh
+
+# Either path works — smoke.sh self-bootstraps `wireguard-tools` if absent.
+docker compose exec test-client ./smoke.sh        # long-lived container (preferred after `up`)
+docker compose run --rm test-client ./smoke.sh    # one-off container
 ```
 
 Or via the Makefile:

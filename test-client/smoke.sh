@@ -9,6 +9,13 @@
 
 set -eu
 
+# Self-bootstrap verification tooling. Idempotent across both invocation paths:
+#   docker compose exec  test-client ./smoke.sh   ← long-lived container, tools cached
+#   docker compose run --rm test-client ./smoke.sh ← one-off container, tools missing
+# The compose-file `command:` runs `apk add` for the long-lived container, but `run`
+# overrides command and skips it; doing the install here covers both.
+apk add --no-cache curl jq wireguard-tools >/dev/null 2>&1 || true
+
 API_BASE="${API_BASE:-http://app:8000}"
 
 step() {
