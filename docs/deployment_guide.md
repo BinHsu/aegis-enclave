@@ -1,8 +1,10 @@
-# Deployment Guide — aegis-enclave (AWS, plan-only)
+# Deployment Guide — aegis-enclave (AWS)
 
 ## Scope of this guide
 
-This guide describes the Terraform composition under [`terraform/`](../terraform/), which is **plan-only** for the case-study cycle (ADR-0015). The brief explicitly accepts a deployment guide as sufficient — Task 3 reads "A list of clear instructions would suffice." No `terraform apply` is performed against a real AWS account during the case-study cycle, and no live state is committed. The Terraform code is reviewable as code, the plan output is reproducible from the example variables, and the runbook (ADR-0012) carries the cross-cloud architectural differentiator. If the buyer asks "could you actually deploy this?", the answer is yes — here's the composition, here's the plan, here's the runbook.
+This guide describes the Terraform composition under [`terraform/`](../terraform/). The composition was developed **plan-only** through Phase 1 (ADR-0015 — the brief's Task 3 reads "A list of clear instructions would suffice"), then runs through **one bounded cloud-acceptance window in Phase 2.3** — `terraform apply` against a personal AWS account, ≤ 3 hours, evidence captured into [§ Phase 2.3 Cloud-acceptance evidence](#phase-23-cloud-acceptance-evidence) below, then `terraform destroy`. ADR-0015's plan-only stance is partially superseded for that one window (see ADR-0015's supersession block) — outside the window, the composition remains code + plan, no sustained live state.
+
+If the buyer asks "could you actually deploy this?" — the Phase 2.3 evidence section is the answer to "yes, and we did, end-to-end with VPN-from-laptop". If the buyer asks "could we run this in production?" — the runbook (ADR-0012) carries the cross-cloud architectural differentiator and the design doc carries the observability + reliability sketches.
 
 The local Docker Compose layout is documented in [`README.md` § Architecture](../README.md#architecture); the diagram below is the cloud-side companion.
 
@@ -144,10 +146,143 @@ Cross-cloud migration to alternative providers (the brief names IONOS as one suc
 
 Single-region → multi-region scaling lives in [`docs/scaling_runbook.md`](scaling_runbook.md) as a second instance of the same agent-executable schema. The triggers that would move multi-region from Phase 2 plan to Phase 1 implementation are recorded in ADR-0007. Two instances make the runbook format credible as a portfolio template; one would just be a one-off. See ADR-0012 for the full agent-executable spec design.
 
+## Phase 2.3 Cloud-acceptance evidence
+
+> **STATUS: not yet captured — skeleton section pre-baked.** Replace `<TBD>` markers and empty blocks with real artefacts when the cloud-acceptance window runs. Bounded to ≤ 3 hours, < $2 total cost, then `terraform destroy`. Spec lives in [`docs/design_doc.md` § 3 (Observability posture)](design_doc.md); operational checklist lives in `strategy.md` § 3 Phase 2.3 sequence (gitignored); irreversible-destroy reminder lives in the `feedback_phase23_screenshot_evidence.md` memory rule.
+>
+> **Redaction discipline before commit:** AWS account ID, full ARNs, full Client VPN endpoint IDs, ALB DNS, RDS endpoint hostnames, and any operator PII must be partially redacted (e.g., `123456789012` → `XXXXXXX89012`, `arn:aws:.../i-0abc...` → `arn:aws:.../i-XXXX...`). Re-run `make pre-push-check` before commit; visually grep the diff for 12-digit numeric strings and `arn:aws:` prefixes.
+
+| Field | Value |
+|---|---|
+| Captured | `<TBD: YYYY-MM-DD HH:MM CEST>` |
+| Operator | `<TBD: handle>` |
+| AWS account ID | `<TBD: 12-digit ID, partially redacted>` |
+| AWS region | `eu-central-1` |
+| Acceptance window duration | `<TBD: Xh Ym>` |
+| Total AWS cost (final bill line items) | `<TBD: $X.XX>` |
+| `terraform apply` from commit | `<TBD: SHA>` |
+
+### `terraform output`
+
+Full `terraform output` after `make tf-apply` completes. Includes ALB DNS, RDS endpoint, Client VPN endpoint ID, and tag verification.
+
+```
+<TBD: paste terraform output verbatim, redacted>
+```
+
+### Per-endpoint round-trips
+
+Three manual `curl` invocations against the live VPN-only endpoint, each capturing request and full response. The `execution_id` from the `POST /primes` response feeds the third call.
+
+#### `GET /health`
+
+```bash
+$ curl https://api.enclave.internal/health
+```
+```json
+<TBD: response — expected {"status":"ok","db":"reachable","version":"0.1.0"}>
+```
+
+#### `POST /primes`
+
+```bash
+$ curl https://api.enclave.internal/primes \
+    -X POST -H 'Content-Type: application/json' \
+    -d '{"start":2,"end":100}'
+```
+```json
+<TBD: response — expected 200, primes array length 25, execution_id present>
+```
+
+Captured `execution_id`: `<TBD>`
+
+#### `GET /executions/{execution_id}`
+
+```bash
+$ curl https://api.enclave.internal/executions/<TBD-execution_id>
+```
+```json
+<TBD: audit row — expected start=2, end=100, primes_count=25, created_at>
+```
+
+#### Negative test (VPN disconnected)
+
+```bash
+$ # disconnect VPN from Tunnelblick / openvpn3
+$ curl --max-time 5 https://api.enclave.internal/health
+```
+```
+<TBD: expected timeout / connection refused — proves private-only routing per ADR-0019>
+```
+
+### ALB access logs (S3)
+
+The three `curl` requests above generate three lines in the ALB's S3 access-log bucket. Pulled here for the per-request audit trail.
+
+```
+<TBD: 3 ALB access log lines>
+```
+
+Pull command for reference:
+```bash
+aws s3 cp s3://<TBD-alb-logs-bucket>/AWSLogs/<TBD-acct>/elasticloadbalancing/eu-central-1/<TBD-YYYY/MM/DD>/ - \
+  --recursive | gunzip | grep -E '/health|/primes|/executions'
+```
+
+### ECS application logs (CloudWatch)
+
+FastAPI structured log lines emitted while serving the three `curl` requests. CloudWatch log group: `/aws/ecs/aegis-enclave-app-<TBD-env>`.
+
+```
+<TBD: 3 structured log lines correlating to the curl timestamps>
+```
+
+Pull command for reference:
+```bash
+aws logs filter-log-events \
+  --log-group-name /aws/ecs/aegis-enclave-app-<TBD-env> \
+  --start-time <TBD-curl-window-start-epoch-ms> \
+  --end-time <TBD-curl-window-end-epoch-ms>
+```
+
+### Aggregate metric dashboards (CloudWatch screenshots)
+
+Per [`docs/design_doc.md` § 3.1](design_doc.md) — four dashboards captured during the live window before teardown. Screenshots land under `docs/evidence/phase23/`.
+
+| Dashboard | Metrics shown | Screenshot |
+|---|---|---|
+| ALB | `RequestCount` / `TargetResponseTime` p50/p90/p99 / 5xx counts / `HealthyHostCount` | `<TBD: docs/evidence/phase23/alb-metrics.png>` |
+| ECS service | per-task `CPUUtilization` / `MemoryUtilization` | `<TBD: docs/evidence/phase23/ecs-task-health.png>` |
+| RDS | `CPUUtilization` / `DatabaseConnections` / `FreeableMemory` / `ReplicaLag` | `<TBD: docs/evidence/phase23/rds-metrics.png>` |
+| Client VPN endpoint | `ActiveConnectionsCount` / `AuthenticationFailures` / `IngressBytes` / `EgressBytes` | `<TBD: docs/evidence/phase23/client-vpn-metrics.png>` |
+
+### VPN handshake
+
+Tunnelblick (or `openvpn3`) connection-status pane showing successful mTLS handshake and connect timestamp.
+
+`<TBD: docs/evidence/phase23/vpn-handshake.png>`
+
+### Stack teardown confirmation
+
+`terraform destroy` summary plus `aws ec2 describe-client-vpn-endpoints` confirmation that the Client VPN endpoint is gone (the most common cost-leak resource if a destroy partially fails).
+
+```
+<TBD: terraform destroy summary — "Destroy complete! Resources: NN destroyed.">
+```
+
+```bash
+$ aws ec2 describe-client-vpn-endpoints --region eu-central-1
+```
+```json
+<TBD: empty {"ClientVpnEndpoints": []} confirms full teardown>
+```
+
+---
+
 ## What this guide is NOT
 
-- **Not a real-cloud deployment record.** No `terraform apply` is performed; no live state, no screenshots, no leaked account IDs / IPs / ARNs (ADR-0015).
-- **Not an operations runbook for a live service.** That would need an observability stack, on-call rotations, runbooks for incidents — all out of scope per ADR-0003.
-- **Not a cost projection.** The `default_tags` set up the cost-attribution scaffold; a real cost model needs production traffic data.
+- **Not a continuous-operations record.** Phase 2.3 above captures one bounded acceptance window (≤ 3h, then `terraform destroy`) — not a record of a sustained production deployment. Ongoing live state is not committed.
+- **Not an operations runbook for a live service.** That would need an observability stack (on-call rotations, alerting, incident runbooks) — all out of scope per ADR-0003. The Observability posture section in `docs/design_doc.md` § 3 sketches the architectural extension; this guide does not implement it.
+- **Not a cost projection.** The `default_tags` set up the cost-attribution scaffold; a real cost model needs production traffic data. Phase 2.3's < $2 acceptance window is a one-shot bounded number, not a sustained-cost extrapolation.
 
-This is a deployment guide for a plan-stage Terraform composition. The brief asks for a deployment guide and accepts a guide as sufficient. This is that guide.
+This is a deployment guide for a Terraform composition that is reviewable as code, planned to verify shape, and exercised once end-to-end against real AWS via the Phase 2.3 acceptance window. The brief asks for a deployment guide and accepts a guide as sufficient. This is that guide, with one bounded real-run receipt attached.
