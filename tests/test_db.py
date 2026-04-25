@@ -32,7 +32,7 @@ that are explicitly out of case-study scope per ADR-0003.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -47,10 +47,10 @@ from prime_service.db import (
     insert_execution,
 )
 
-
 # ───────────────────────────────────────────────────────────────────────────
 # Settings — pydantic-settings env loading
 # ───────────────────────────────────────────────────────────────────────────
+
 
 class TestSettings:
     """Verify Settings default values and env-var override behaviour."""
@@ -70,7 +70,7 @@ class TestSettings:
             "POSTGRES_HOST",
             "POSTGRES_PORT",
         )
-        with patch.dict(os.environ, {k: "" for k in keys}, clear=False):
+        with patch.dict(os.environ, dict.fromkeys(keys, ""), clear=False):
             for k in keys:
                 os.environ.pop(k, None)
             settings = Settings(_env_file=None)  # type: ignore[call-arg]
@@ -122,6 +122,7 @@ class TestSettings:
 # Execution model — schema mapping mirrors db/init.sql
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestExecutionModel:
     """Verify the SQLAlchemy declarative mapping matches db/init.sql."""
 
@@ -163,6 +164,7 @@ class TestExecutionModel:
 # ───────────────────────────────────────────────────────────────────────────
 # insert_execution — verify add / commit / refresh / return id pattern
 # ───────────────────────────────────────────────────────────────────────────
+
 
 class TestInsertExecution:
     """Async unit tests for ``insert_execution`` using AsyncMock session.
@@ -295,6 +297,7 @@ class TestInsertExecution:
 # get_execution — SELECT by id, returns model or None
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestGetExecution:
     """Verify the ``select() → execute() → scalar_one_or_none()`` pattern."""
 
@@ -307,7 +310,7 @@ class TestGetExecution:
             primes_count=4,
             primes=[2, 3, 5, 7],
             duration_ms=5,
-            created_at=datetime(2026, 4, 25, 12, 0, 0, tzinfo=timezone.utc),
+            created_at=datetime(2026, 4, 25, 12, 0, 0, tzinfo=UTC),
         )
         result_obj = MagicMock()
         result_obj.scalar_one_or_none.return_value = expected
@@ -346,6 +349,7 @@ class TestGetExecution:
 # health_check — True on SELECT 1 success; errors propagate
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestHealthCheck:
     """Verify the ``SELECT 1`` round-trip pattern.
 
@@ -383,9 +387,7 @@ class TestHealthCheck:
     async def test_propagates_operational_error(self) -> None:
         """Connection failures bubble up so the caller can map to 503."""
         session = AsyncMock()
-        session.execute = AsyncMock(
-            side_effect=OperationalError("conn refused", None, Exception())
-        )
+        session.execute = AsyncMock(side_effect=OperationalError("conn refused", None, Exception()))
 
         with pytest.raises(OperationalError):
             await health_check(session)

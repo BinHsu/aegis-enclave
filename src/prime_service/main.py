@@ -18,15 +18,8 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# Three-layer timeout defense (ADR-0020):
-#   compute   — asyncio.wait_for around primes_in_range, 30s
-#   audit DB  — asyncio.wait_for around insert_execution, 10s
-#   ALB idle  — Terraform sets idle_timeout = 45s (above app + slack)
-_COMPUTE_TIMEOUT_S = 30.0
-_AUDIT_TIMEOUT_S = 10.0
-
 from prime_service import __version__
-from prime_service.db import get_session, get_execution, health_check, insert_execution
+from prime_service.db import get_execution, get_session, health_check, insert_execution
 from prime_service.primes import primes_in_range
 from prime_service.schemas import (
     ExecutionDetail,
@@ -34,6 +27,13 @@ from prime_service.schemas import (
     PrimeRangeRequest,
     PrimeRangeResponse,
 )
+
+# Three-layer timeout defense (ADR-0020):
+#   compute   — asyncio.wait_for around primes_in_range, 30s
+#   audit DB  — asyncio.wait_for around insert_execution, 10s
+#   ALB idle  — Terraform sets idle_timeout = 45s (above app + slack)
+_COMPUTE_TIMEOUT_S = 30.0
+_AUDIT_TIMEOUT_S = 10.0
 
 # Structured JSON logging
 structlog.configure(
@@ -92,7 +92,7 @@ async def compute_primes(
             asyncio.to_thread(primes_in_range, req.start, req.end),
             timeout=_COMPUTE_TIMEOUT_S,
         )
-    except asyncio.TimeoutError as exc:
+    except TimeoutError as exc:
         log.warning(
             "compute_timeout",
             start=req.start,
@@ -119,7 +119,7 @@ async def compute_primes(
             ),
             timeout=_AUDIT_TIMEOUT_S,
         )
-    except asyncio.TimeoutError as exc:
+    except TimeoutError as exc:
         log.error("audit_write_timeout", timeout_s=_AUDIT_TIMEOUT_S)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

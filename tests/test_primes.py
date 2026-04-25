@@ -73,6 +73,7 @@ def sympy_primes(start: int, end: int) -> list[int]:
 # Autouse cache reset
 # ───────────────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture(autouse=True)
 def _reset_prime_cache():
     """Reset the module-level cache to a freshly-prewarmed state before each test.
@@ -90,6 +91,7 @@ def _reset_prime_cache():
 # ───────────────────────────────────────────────────────────────────────────
 # _validate — start/end bounds, range ceiling, cost-estimate gating
 # ───────────────────────────────────────────────────────────────────────────
+
 
 class TestValidate:
     """BVA on ``start >= 2``, ``start <= end``, range-size ceiling, and the
@@ -174,6 +176,7 @@ class TestValidate:
 # ───────────────────────────────────────────────────────────────────────────
 # _estimate_compute_ms — pure function, deterministic given inputs
 # ───────────────────────────────────────────────────────────────────────────
+
 
 class TestEstimateComputeMs:
     """Per-layer cost-model coverage with BVA at every layer transition."""
@@ -277,6 +280,7 @@ class TestEstimateComputeMs:
 # _is_prime_6k — single-number primality
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestIsPrime6k:
     """BVA on the internal branches of the 6k±1 primality test."""
 
@@ -322,6 +326,7 @@ class TestIsPrime6k:
 # _build_prime_table — Sieve of Eratosthenes helper
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestBuildPrimeTable:
     """BVA at the lowest bounds + differential against sympy."""
 
@@ -356,6 +361,7 @@ class TestBuildPrimeTable:
 # ───────────────────────────────────────────────────────────────────────────
 # _slice_known — bisect-and-slice on the cache (replaces TestLookupInTable)
 # ───────────────────────────────────────────────────────────────────────────
+
 
 class TestSliceKnown:
     """Cache-slicing direct calls. The autouse fixture pre-warms the cache to
@@ -422,6 +428,7 @@ class TestSliceKnown:
 # _compute — sieve / trial-division dispatcher
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestCompute:
     """Dispatches to sieve or trial division based on ``_SIEVE_THRESHOLD``."""
 
@@ -447,6 +454,7 @@ class TestCompute:
 # ───────────────────────────────────────────────────────────────────────────
 # _sieve_eratosthenes — generator
 # ───────────────────────────────────────────────────────────────────────────
+
 
 class TestSieveEratosthenes:
     """Generator coverage with start/upper boundaries."""
@@ -478,6 +486,7 @@ class TestSieveEratosthenes:
 # _trial_division_6k — generator
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestTrialDivision6k:
     """6k±1 trial-division generator coverage."""
 
@@ -500,6 +509,7 @@ class TestTrialDivision6k:
 # ───────────────────────────────────────────────────────────────────────────
 # primes_in_range — Layer 1 (pure cache hit)
 # ───────────────────────────────────────────────────────────────────────────
+
 
 class TestPrimesInRangeLayer1FullCacheHit:
     """All queries fit inside the pre-warmed cache; ``_known_max`` must not
@@ -534,6 +544,7 @@ class TestPrimesInRangeLayer1FullCacheHit:
 # ───────────────────────────────────────────────────────────────────────────
 # primes_in_range — cache extension path
 # ───────────────────────────────────────────────────────────────────────────
+
 
 class TestPrimesInRangeCacheExtension:
     """Queries that satisfy ``start <= _known_max + _GAP_THRESHOLD`` and
@@ -597,6 +608,7 @@ class TestPrimesInRangeCacheExtension:
 # primes_in_range — far-gap (standalone) path
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestPrimesInRangeFarGap:
     """``start > _known_max + _GAP_THRESHOLD`` — compute standalone, do not
     pollute cache. ``_known_max`` must remain unchanged."""
@@ -649,6 +661,7 @@ class TestPrimesInRangeFarGap:
 # primes_in_range — pre-flight rejection on cost estimate
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestPrimesInRangeRejection:
     """``_HARD_TIMEOUT_MS`` gate must reject expensive queries before any
     compute starts. Counter-test confirms cheaper queries pass.
@@ -687,6 +700,7 @@ class TestPrimesInRangeRejection:
 # ───────────────────────────────────────────────────────────────────────────
 # Cache consistency across multiple queries
 # ───────────────────────────────────────────────────────────────────────────
+
 
 class TestCacheConsistencyAfterMultipleQueries:
     """Sequence-level verification: known_max progresses monotonically and the
@@ -739,6 +753,7 @@ class TestCacheConsistencyAfterMultipleQueries:
 # ───────────────────────────────────────────────────────────────────────────
 # Thread-safety smoke test
 # ───────────────────────────────────────────────────────────────────────────
+
 
 class TestThreadSafety:
     """Smoke-level concurrency: four threads issue the same query; results
@@ -805,6 +820,7 @@ class TestThreadSafety:
 # Deterministic seeded fuzz — one block per layer / scenario
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestPrimesInRangeFuzz:
     """Per-layer randomised differential against sympy. Each block uses a
     fixed seed, so any failure is reproducible from the printed seed."""
@@ -854,6 +870,7 @@ class TestPrimesInRangeFuzz:
 # ───────────────────────────────────────────────────────────────────────────
 # _segmented_sieve — cache-leveraging segmented sieve (ADR-0021)
 # ───────────────────────────────────────────────────────────────────────────
+
 
 class TestSegmentedSieve:
     """Direct tests for ``_segmented_sieve(low, high, small_primes)``.
@@ -936,12 +953,12 @@ class TestSegmentedSieve:
     @pytest.mark.parametrize(
         ("low", "high"),
         [
-            (2, 100),                    # tiny segment, includes 2
-            (1000, 2000),                # mid-range, fully inside prewarm
-            (50_000, 60_000),            # straddles upper prewarm interior
-            (99_000, 100_500),           # straddles the prewarm boundary
-            (500_000, 500_500),          # Layer-2 territory (sieve-threshold)
-            (999_900, 1_000_100),        # straddles _SIEVE_THRESHOLD
+            (2, 100),  # tiny segment, includes 2
+            (1000, 2000),  # mid-range, fully inside prewarm
+            (50_000, 60_000),  # straddles upper prewarm interior
+            (99_000, 100_500),  # straddles the prewarm boundary
+            (500_000, 500_500),  # Layer-2 territory (sieve-threshold)
+            (999_900, 1_000_100),  # straddles _SIEVE_THRESHOLD
         ],
     )
     def test_differential_against_sympy(self, low: int, high: int) -> None:
@@ -951,11 +968,11 @@ class TestSegmentedSieve:
     @pytest.mark.parametrize(
         ("low", "high"),
         [
-            (2, 1000),                   # tiny — fully inside prewarm
-            (90_000, 110_000),           # straddles _INITIAL_PREWARM_BOUND
-            (200_000, 250_000),          # mid-range, far above prewarm
-            (500_000, 600_000),          # Layer-2 sieve range
-            (999_000, 1_001_000),        # straddles _SIEVE_THRESHOLD
+            (2, 1000),  # tiny — fully inside prewarm
+            (90_000, 110_000),  # straddles _INITIAL_PREWARM_BOUND
+            (200_000, 250_000),  # mid-range, far above prewarm
+            (500_000, 600_000),  # Layer-2 sieve range
+            (999_000, 1_001_000),  # straddles _SIEVE_THRESHOLD
         ],
     )
     def test_cross_validation_against_legacy_sieve(self, low: int, high: int) -> None:
@@ -969,6 +986,7 @@ class TestSegmentedSieve:
 # ───────────────────────────────────────────────────────────────────────────
 # _is_prime_with_known — single-number primality via known small primes
 # ───────────────────────────────────────────────────────────────────────────
+
 
 class TestIsPrimeWithKnown:
     """Direct tests for ``_is_prime_with_known(n, small_primes)``.
@@ -1016,6 +1034,7 @@ class TestIsPrimeWithKnown:
 # _trial_division_with_known — range trial division via known small primes
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestTrialDivisionWithKnown:
     """Direct tests for ``_trial_division_with_known(start, end, small_primes)``.
 
@@ -1034,11 +1053,11 @@ class TestTrialDivisionWithKnown:
     @pytest.mark.parametrize(
         ("start", "end"),
         [
-            (2, 100),                    # smallest range, includes 2
-            (1000, 2000),                # mid prewarm
-            (99_900, 100_100),           # straddles _INITIAL_PREWARM_BOUND
-            (999_900, 1_000_100),        # straddles _SIEVE_THRESHOLD
-            (5_000_000, 5_000_500),      # deep Layer-3 territory
+            (2, 100),  # smallest range, includes 2
+            (1000, 2000),  # mid prewarm
+            (99_900, 100_100),  # straddles _INITIAL_PREWARM_BOUND
+            (999_900, 1_000_100),  # straddles _SIEVE_THRESHOLD
+            (5_000_000, 5_000_500),  # deep Layer-3 territory
         ],
     )
     def test_differential_against_sympy(self, start: int, end: int) -> None:
@@ -1048,12 +1067,12 @@ class TestTrialDivisionWithKnown:
     @pytest.mark.parametrize(
         ("start", "end"),
         [
-            (2, 100),                    # cache-only range
-            (10_000, 11_000),            # mid prewarm
-            (95_000, 105_000),           # straddles prewarm boundary
-            (500_000, 500_500),          # Layer-2 territory
-            (999_900, 1_000_100),        # straddles _SIEVE_THRESHOLD
-            (4_999_900, 5_000_100),      # Layer-3 territory
+            (2, 100),  # cache-only range
+            (10_000, 11_000),  # mid prewarm
+            (95_000, 105_000),  # straddles prewarm boundary
+            (500_000, 500_500),  # Layer-2 territory
+            (999_900, 1_000_100),  # straddles _SIEVE_THRESHOLD
+            (4_999_900, 5_000_100),  # Layer-3 territory
         ],
     )
     def test_cross_validation_against_legacy_trial(self, start: int, end: int) -> None:
@@ -1065,11 +1084,11 @@ class TestTrialDivisionWithKnown:
     @pytest.mark.parametrize(
         ("start", "end"),
         [
-            (2, 100),                    # tiny
-            (1000, 5000),                # mid prewarm
-            (50_000, 60_000),            # mid prewarm, larger
-            (99_000, 100_500),           # straddles prewarm boundary
-            (500_000, 500_500),          # Layer-2 territory, below _SIEVE_THRESHOLD
+            (2, 100),  # tiny
+            (1000, 5000),  # mid prewarm
+            (50_000, 60_000),  # mid prewarm, larger
+            (99_000, 100_500),  # straddles prewarm boundary
+            (500_000, 500_500),  # Layer-2 territory, below _SIEVE_THRESHOLD
         ],
     )
     def test_cross_validation_against_segmented_sieve(self, start: int, end: int) -> None:
@@ -1086,6 +1105,7 @@ class TestTrialDivisionWithKnown:
 # _compute integration — verify dispatcher picks the right algorithm and
 # returns oracle-correct output. Caller must hold ``_cache_lock``.
 # ───────────────────────────────────────────────────────────────────────────
+
 
 class TestComputeIntegration:
     """High-level dispatcher tests for ``_compute(start, end)``.

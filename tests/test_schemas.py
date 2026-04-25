@@ -15,7 +15,7 @@ Tests use ``pytest.raises(ValidationError)`` from pydantic to assert rejection
 paths, with ``match=`` to verify the error message anchors on the right field.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
@@ -33,6 +33,7 @@ _RANGE_CEILING = 10_000_000
 # ───────────────────────────────────────────────────────────────────────────
 # PrimeRangeRequest — has the most validation logic; most thorough coverage
 # ───────────────────────────────────────────────────────────────────────────
+
 
 class TestPrimeRangeRequestBoundaries:
     """BVA on the start/end field constraints and the range-size invariant."""
@@ -127,6 +128,7 @@ class TestPrimeRangeRequestTypeCoercion:
 # PrimeRangeResponse — structural; no custom validators
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestPrimeRangeResponse:
     """Structural coverage for the response model — no custom validators."""
 
@@ -158,6 +160,7 @@ class TestPrimeRangeResponse:
 # HealthResponse — Literal type enforcement
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestHealthResponse:
     """Literal type enforcement on the health endpoint contract."""
 
@@ -166,8 +169,8 @@ class TestHealthResponse:
         [
             ("ok", "reachable"),
             ("degraded", "unreachable"),
-            ("ok", "unreachable"),       # observed in fault scenarios
-            ("degraded", "reachable"),   # uncommon but type-valid
+            ("ok", "unreachable"),  # observed in fault scenarios
+            ("degraded", "reachable"),  # uncommon but type-valid
         ],
     )
     def test_valid_literal_combinations(self, status: str, db: str) -> None:
@@ -192,6 +195,7 @@ class TestHealthResponse:
 # ExecutionDetail — structural; verifies datetime handling
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestExecutionDetail:
     """Structural coverage + datetime coercion for execution-history records."""
 
@@ -203,7 +207,7 @@ class TestExecutionDetail:
             primes_count=4,
             primes=[2, 3, 5, 7],
             duration_ms=12,
-            created_at=datetime(2026, 4, 25, 10, 30, 0, tzinfo=timezone.utc),
+            created_at=datetime(2026, 4, 25, 10, 30, 0, tzinfo=UTC),
         )
         assert d.id == 1
         assert d.primes_count == 4
@@ -239,12 +243,34 @@ class TestExecutionDetail:
             range_end=100,
             primes_count=25,
             primes=[
-                2, 3, 5, 7, 11, 13, 17, 19, 23, 29,
-                31, 37, 41, 43, 47, 53, 59, 61, 67, 71,
-                73, 79, 83, 89, 97,
+                2,
+                3,
+                5,
+                7,
+                11,
+                13,
+                17,
+                19,
+                23,
+                29,
+                31,
+                37,
+                41,
+                43,
+                47,
+                53,
+                59,
+                61,
+                67,
+                71,
+                73,
+                79,
+                83,
+                89,
+                97,
             ],
             duration_ms=8,
-            created_at=datetime(2026, 4, 25, 12, 0, 0, tzinfo=timezone.utc),
+            created_at=datetime(2026, 4, 25, 12, 0, 0, tzinfo=UTC),
         )
         round_tripped = ExecutionDetail.model_validate_json(original.model_dump_json())
         assert round_tripped == original

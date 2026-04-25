@@ -19,8 +19,9 @@ install: ## Install dev dependencies (uv preferred; falls back to pip)
 	# Fallback if uv is unavailable: pip install -e '.[dev]'
 
 .PHONY: pre-commit-install
-pre-commit-install: ## One-time setup of pre-commit hooks
+pre-commit-install: ## One-time setup of pre-commit + pre-push hooks
 	pre-commit install
+	pre-commit install --hook-type pre-push
 
 # ---------------------------------------------------------------------------
 # Code quality
@@ -48,6 +49,10 @@ check: lint typecheck ## Composite: lint + typecheck
 .PHONY: test
 test: ## Run pytest
 	pytest -v
+
+.PHONY: test-ci
+test-ci: ## Headless pytest for pre-push hook + GitHub Actions (PYTHONPATH-aware, no -v noise)
+	@PYTHONPATH=src pytest tests/ -q --tb=short
 
 .PHONY: test-cov
 test-cov: ## Run pytest with coverage report

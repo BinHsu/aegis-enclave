@@ -1,5 +1,11 @@
-# Run `pre-commit install` once. Pre-commit framework: https://pre-commit.com/
-# — secret scan, lint, format, terraform fmt
+# One-time setup:
+#   pre-commit install                          # commit-time hooks
+#   pre-commit install --hook-type pre-push     # pre-push pytest gate
+# Or just: `make pre-commit-install` — handles both.
+#
+# Pre-commit framework: https://pre-commit.com/
+#   - commit-time: gitleaks secret scan, ruff lint+format, terraform fmt+validate
+#   - pre-push:    full pytest suite (mirrors the GitHub Actions CI gate)
 #
 # Version pins are current as of 2026-04 — bump on next dependency review.
 
@@ -35,5 +41,20 @@ repos:
       - id: terraform_fmt
       - id: terraform_validate
         # Lightweight validation — full plan happens via `make tf-plan`.
+
+  # ─── Pre-push stage: full pytest suite ────────────────────────────────────
+  # Runs only on `git push`, not on every commit (too slow for that).
+  # Mirrors the GitHub Actions CI gate so red tests are caught locally
+  # before they hit the remote. See ADR (post-Phase-1.7 process audit) —
+  # the gap that let 9 latent failures sit on main for two phases.
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest (full suite — pre-push gate)
+        entry: make test-ci
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
 
 # After modifying this file, run: pre-commit run --all-files

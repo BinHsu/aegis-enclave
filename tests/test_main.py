@@ -21,11 +21,10 @@ Cross-cutting:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import AsyncIterator
-from unittest.mock import AsyncMock, MagicMock, patch
-
 import asyncio
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -33,7 +32,6 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from prime_service.db import Execution, get_session
 from prime_service.main import app
-
 
 # ───────────────────────────────────────────────────────────────────────────
 # Fixtures
@@ -49,6 +47,7 @@ def mock_session() -> AsyncMock:
 @pytest.fixture
 def client(mock_session: AsyncMock) -> AsyncIterator[AsyncClient]:
     """AsyncClient with `get_session` overridden to yield the mock_session."""
+
     async def _override() -> AsyncIterator[AsyncMock]:
         yield mock_session
 
@@ -65,9 +64,11 @@ def client(mock_session: AsyncMock) -> AsyncIterator[AsyncClient]:
 # Async fixtures need `pytest-asyncio` "auto" mode (already configured in pyproject.toml).
 # Use a helper to construct the AsyncClient inside each test (avoids ASGITransport leakage).
 
+
 async def make_client(mock_session: AsyncMock) -> AsyncClient:
     async def _override() -> AsyncIterator[AsyncMock]:
         yield mock_session
+
     app.dependency_overrides[get_session] = _override
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
@@ -75,6 +76,7 @@ async def make_client(mock_session: AsyncMock) -> AsyncClient:
 # ───────────────────────────────────────────────────────────────────────────
 # /health
 # ───────────────────────────────────────────────────────────────────────────
+
 
 class TestHealthEndpoint:
     @pytest.mark.asyncio
@@ -117,6 +119,7 @@ class TestHealthEndpoint:
 # POST /primes
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestComputePrimesEndpoint:
     @pytest.mark.asyncio
     async def test_happy_path(self) -> None:
@@ -142,14 +145,14 @@ class TestComputePrimesEndpoint:
     @pytest.mark.parametrize(
         "payload, expected_status",
         [
-            ({"start": 1, "end": 10}, 422),       # start < 2 → Pydantic 422
-            ({"start": -5, "end": 10}, 422),      # negative start
-            ({"start": 10, "end": 5}, 422),       # start > end → Pydantic model_validator
+            ({"start": 1, "end": 10}, 422),  # start < 2 → Pydantic 422
+            ({"start": -5, "end": 10}, 422),  # negative start
+            ({"start": 10, "end": 5}, 422),  # start > end → Pydantic model_validator
             ({"start": 2, "end": 100_000_000}, 422),  # range > ceiling → Pydantic
             ({"start": "abc", "end": 10}, 422),  # invalid type
-            ({"end": 10}, 422),                  # missing start
-            ({"start": 2}, 422),                 # missing end
-            ({}, 422),                           # empty payload
+            ({"end": 10}, 422),  # missing start
+            ({"start": 2}, 422),  # missing end
+            ({}, 422),  # empty payload
         ],
     )
     async def test_validation_errors_return_422(
@@ -218,6 +221,7 @@ class TestComputePrimesEndpoint:
 # GET /executions/{id}
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestFetchExecutionEndpoint:
     @pytest.mark.asyncio
     async def test_returns_audit_row(self) -> None:
@@ -229,7 +233,7 @@ class TestFetchExecutionEndpoint:
             primes_count=4,
             primes=[2, 3, 5, 7],
             duration_ms=5,
-            created_at=datetime(2026, 4, 25, 12, 0, 0, tzinfo=timezone.utc),
+            created_at=datetime(2026, 4, 25, 12, 0, 0, tzinfo=UTC),
         )
         # get_execution uses session.execute(stmt) → result.scalar_one_or_none()
         result_obj = MagicMock()
@@ -275,6 +279,7 @@ class TestFetchExecutionEndpoint:
 # OpenAPI / docs surface
 # ───────────────────────────────────────────────────────────────────────────
 
+
 class TestApplicationSurface:
     @pytest.mark.asyncio
     async def test_openapi_schema_published(self) -> None:
@@ -314,9 +319,7 @@ class TestComputeTimeoutGate:
     """
 
     @pytest.mark.asyncio
-    async def test_compute_timeout_returns_504(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_compute_timeout_returns_504(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Patch `primes_in_range` to sleep beyond a shrunk compute budget.
 
         Strategy: shrink `_COMPUTE_TIMEOUT_S` to 0.05s and replace
@@ -346,9 +349,7 @@ class TestComputeTimeoutGate:
         assert "s budget" in detail or "second" in detail
 
     @pytest.mark.asyncio
-    async def test_compute_within_budget_returns_200(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_compute_within_budget_returns_200(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Fast `primes_in_range` resolves well under the budget → 200."""
 
         def _fast_primes(start: int, end: int) -> list[int]:
@@ -383,7 +384,7 @@ class TestComputeTimeoutGate:
         """
 
         async def _raise_timeout(*args: object, **kwargs: object) -> object:
-            raise asyncio.TimeoutError()
+            raise TimeoutError()
 
         with patch("prime_service.main.asyncio.wait_for", side_effect=_raise_timeout):
             session = AsyncMock()
@@ -481,9 +482,7 @@ class TestAuditTimeoutGate:
     """
 
     @pytest.mark.asyncio
-    async def test_audit_timeout_returns_503(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_audit_timeout_returns_503(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Slow `insert_execution` past a shrunk audit budget → 503."""
 
         async def _slow_insert(*args: object, **kwargs: object) -> int:
@@ -503,9 +502,7 @@ class TestAuditTimeoutGate:
         assert "audit log write exceeded" in detail
 
     @pytest.mark.asyncio
-    async def test_audit_sqlalchemy_error_still_503(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_audit_sqlalchemy_error_still_503(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Preserve the existing failure mode: SQLAlchemyError → 503.
 
         Distinct detail string from the timeout case ("audit log unavailable"

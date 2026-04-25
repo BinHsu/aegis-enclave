@@ -130,13 +130,13 @@ def _estimate_compute_ms(start: int, end: int, known_max: int) -> int:
         upper-bound on candidates inspected
     """
     if end <= known_max:
-        return 1   # bisect + slice path, sub-millisecond
+        return 1  # bisect + slice path, sub-millisecond
 
     # Determine if we'll extend the cache or compute standalone.
     if start <= known_max + _GAP_THRESHOLD:
-        compute_start = known_max + 1   # extend
+        compute_start = known_max + 1  # extend
     else:
-        compute_start = start            # standalone (no cache pollution)
+        compute_start = start  # standalone (no cache pollution)
 
     compute_range = end - compute_start + 1
 
@@ -146,7 +146,7 @@ def _estimate_compute_ms(start: int, end: int, known_max: int) -> int:
         return max(50, compute_range // 10_000)
 
     # Layer 3: trial division by known primes over `compute_range` candidates
-    sqrt_max = int(end ** 0.5) + 1
+    sqrt_max = int(end**0.5) + 1
     estimated_ops = compute_range * sqrt_max // 6
     return estimated_ops // 7_000
 

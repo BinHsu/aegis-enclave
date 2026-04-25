@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import datetime
-from typing import Any
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import Integer, select, text
@@ -42,7 +41,8 @@ class Settings(BaseSettings):
     )
 
     POSTGRES_USER: str = "primes_app"
-    POSTGRES_PASSWORD: str = "changeme_local_dev_only"
+    # Local-dev sentinel; production sources from AWS Secrets Manager.
+    POSTGRES_PASSWORD: str = "changeme_local_dev_only"  # noqa: S105
     POSTGRES_DB: str = "primes"
     POSTGRES_HOST: str = "db"
     POSTGRES_PORT: int = 5432
