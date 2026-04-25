@@ -8,6 +8,12 @@
 #
 # Runs against Python 3.12 (matches `requires-python` in pyproject.toml
 # and ruff's `target-version`). Bump in lockstep with the project floor.
+#
+# DEFERRED: GitHub Actions is deprecating Node.js 20 by 2026-06-02. Both
+# `actions/checkout@v4` and `actions/setup-python@v5` ship on Node 20.
+# When a successor major (Node 24-based) is released for either action,
+# bump pinned versions here. Action-version lookup was unavailable at
+# the time this comment was written; revisit before 2026-06-02.
 
 name: CI
 

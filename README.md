@@ -55,11 +55,11 @@ aegis-enclave/
 │   ├── outputs.tf                     # exposed outputs (filled in during Phase 1 build)
 │   └── README.md                      # plan-only deployment guide (no apply per ADR-0015)
 ├── docs/
-│   ├── ADR/                           # 16 architecture decision records (Nygard MADR)
+│   ├── ADR/                           # architecture decision records (Nygard MADR) — see `docs/ADR/`
 │   │   ├── 0001-repo-identity-aegis-enclave.md
 │   │   ├── 0002-time-budget-15h.md
 │   │   ├── 0003-poc-scope-prod-hygiene.md
-│   │   └── ... (0004 through 0016)
+│   │   └── ... (numbered monotonically; see `docs/ADR/` for the full set)
 │   ├── design_doc.md                  # Reliability + VPN Architecture (long form, written in Phase 1)
 │   ├── deployment_guide.md            # Cloud deploy walkthrough + architecture diagram (Phase 1)
 │   ├── migration_runbook.md           # Phase 2 — agent-executable cross-cloud migration spec
@@ -275,7 +275,7 @@ The deliverable is staged into numbered phases (decimals allowed for sub-progres
 | Phase | State | Scope | Key artifacts |
 |---|---|---|---|
 | **0.0** | ✅ done | Repo init, remote bound | `.git/`, `README.md` (placeholder) |
-| **0.1** | ✅ done | ADRs + docs scaffolding | `CLAUDE.md`, 16 `docs/ADR/*.md`, gitignored `strategy.md` + `*_steps.md` |
+| **0.1** | ✅ done | ADRs + docs scaffolding | `CLAUDE.md`, `docs/ADR/*.md` set, gitignored `strategy.md` + `*_steps.md` |
 | **0.2** | ✅ done | Hygiene additions (GitOps × DevSecOps × FinOps) | `Makefile`, `.pre-commit-config.yaml`, `.github/dependabot.yml`, `SECURITY.md`, `terraform/` stub with `default_tags` |
 | **1.1** | ✅ done | Service foundation | `src/prime_service/`, `tests/`, `pyproject.toml`, `db/init.sql`, `.env.example` |
 | **1.2** | ✅ done | Container + VPN demo | `Dockerfile`, `docker-compose.yml`, `wireguard/`, `test-client/smoke.sh` |
@@ -288,14 +288,6 @@ The deliverable is staged into numbered phases (decimals allowed for sub-progres
 | **3.0** | ⏳ pending | Polish + cover note | Final README pass, `cover_note.md` (gitignored) drafted |
 | **3.1** | ⏳ pending | Repo published to private remote | Pre-push leak guard clean, repo invitation sent to recipient |
 | **3.2** | ⏳ pending | Submission email sent | End of cycle |
-
-**Phase 2 runbooks are spec-grade, not code-grade.** They describe step-by-step intent, verification commands, expected outputs, rollback paths, and capability gates — designed to be executed by either an AI coding agent (with human oversight on irreversible steps) or a human engineer following the spec. The mapping table at the top of each runbook is the only destination-specific artifact; the rest of the spec is invariant across destinations.
-
-Why phase the delivery:
-
-- **Phase 1 is the contract** with the brief. It is small, runnable, verifiable in five commands.
-- **Phase 2 demonstrates judgement** beyond the brief — the candidate doesn't just answer the assignment, they show what they'd build next.
-- **The same spec format** unifies both phases — once the runbook shape is proven once (cross-cloud), instantiating it for another axis (multi-region scaling) is mechanical work, not new design.
 
 **Phase 2 runbooks are spec-grade, not code-grade.** They describe step-by-step intent, verification commands, expected outputs, rollback paths, and capability gates — designed to be executed by either an AI coding agent (with human oversight on irreversible steps) or a human engineer following the spec. The mapping table at the top of each runbook is the only destination-specific artifact; the rest of the spec is invariant across destinations.
 
@@ -361,7 +353,7 @@ See [ADR-0004](docs/ADR/0004-reusability-90-10-split.md).
 
 ## Where to read next
 
-- **Why each design choice was made** → [`docs/ADR/`](docs/ADR/) (read in numerical order, 1–19)
+- **Why each design choice was made** → [`docs/ADR/`](docs/ADR/) (read in numerical order)
 - **How to run / extend the system** → [`CLAUDE.md`](CLAUDE.md)
 - **Long-form design rationale** → [`docs/design_doc.md`](docs/design_doc.md)
 - **Cloud deployment walkthrough** → [`docs/deployment_guide.md`](docs/deployment_guide.md)
