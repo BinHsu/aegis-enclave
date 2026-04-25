@@ -9,7 +9,7 @@ Brief Task 4 asks for "cloud deployment guidelines and scripts" that explain how
 Two failure modes are easy to fall into:
 
 1. **Static markdown runbook** — "step 1: do X, step 2: do Y" — readable but not actionable by an AI agent and not particularly reviewable by a human either. Commodity output.
-2. **Full Terraform per destination cloud** — fakeable up to a point, but real cross-cloud Terraform requires real expertise in each cloud's primitives. Faking it is detectable, and writing it for real is out of the 15h budget (ADR-0002) and the AWS-only target (ADR-0005).
+2. **Full Terraform per destination cloud** — fakeable up to a point, but real cross-cloud Terraform requires real expertise in each cloud's primitives. Faking it is detectable, and writing it for real is out of the 22h budget (ADR-0028, originally 15h per ADR-0002) and the AWS-only target (ADR-0005).
 
 The third path is the differentiator: an **agent-executable spec** with a structured per-step schema. Each step has clear preconditions, declarative actions, verification commands, expected outputs, rollback paths, and a human-gate flag for irreversible operations. AI coding agents (Claude Code, Cursor, etc.) execute this format reliably *only* if the spec is written in agent-executable form — and the same structure is what makes the runbook reviewable by a human engineer.
 

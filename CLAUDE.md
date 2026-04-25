@@ -89,9 +89,9 @@ If a user instruction contradicts an ADR, **flag the conflict before acting**. E
 
 ---
 
-## 4. Hard scope ceiling — 15 hours
+## 4. Hard scope ceiling — 22 hours
 
-This deliverable is calibrated to a **15-hour build budget** (rationale in `docs/ADR/`, time-budget record).
+This deliverable is calibrated to a **22-hour build budget** (rationale in `docs/ADR/`, time-budget record — original 15h cap superseded twice for HTTPS + Phase 2.3 cloud-acceptance + async L1-L3 implementation + distributed cache implementation).
 
 Before adding scope:
 - Estimate the time cost honestly
@@ -293,7 +293,7 @@ Reuse is the long game. Each ADR is an asset that compounds across cycles.
 
 ## 12. Anti-patterns (don't do these)
 
-- ❌ Silently exceed the 15h budget by "adding one more thing"
+- ❌ Silently exceed the 22h budget by "adding one more thing"
 - ❌ Commit `strategy.md` or any `*_steps.md` file because "git status looks clean now"
 - ❌ Inline buyer-specific framing into committed files because "it sounds nicer"
 - ❌ Replace Mermaid diagrams with images or PDFs

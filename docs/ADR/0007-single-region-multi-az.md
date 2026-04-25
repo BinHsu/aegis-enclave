@@ -18,7 +18,7 @@ Honest implementation cost for full multi-region active-active in Phase 1, estim
 | Failover drill + documentation | 1–2h |
 | **Total** | **10–14h** |
 
-That consumes the entire 15h Phase 1 budget. Cognitive complexity scales 2.5–3× (split-brain, replication lag, DNS propagation, cross-region orchestration). Cost scales 2–2.5× monthly (Aurora Global premium, cross-region transfer, duplicated managed services).
+That consumes the bulk of the 22h budget (revised per ADR-0028, originally 15h per ADR-0002). Cognitive complexity scales 2.5–3× (split-brain, replication lag, DNS propagation, cross-region orchestration). Cost scales 2–2.5× monthly (Aurora Global premium, cross-region transfer, duplicated managed services).
 
 Multi-AZ inside a single region is a different shape entirely. `multi_az = true` on RDS, multi-subnet ASG on ECS — one-line Terraform toggles, no architectural complexity. Free architectural credit; declining it would read as careless and require its own ADR explanation.
 
@@ -45,7 +45,7 @@ None of these triggers are met at case-study scope. The reviewer reads "I have a
 | Multi-region skeleton inside Phase 1 (stub Terraform without Aurora Global) | The runbook approach (Phase 2) is more honest because it captures intent without faking implementation. A stub would mislead reviewers about what's actually deployable. |
 
 ## Consequences
-- Phase 1 deliverable stays within the 15h budget and matches the brief's "small application" framing.
+- Phase 1 deliverable stays within the 22h budget (per ADR-0028) and matches the brief's "small application" framing.
 - Phase 2 includes `docs/scaling_runbook.md` as agent-executable spec for moving to multi-region. It uses the same format as the cross-cloud migration runbook (see ADR-0005, ADR-0012) — proving the runbook shape generalises across axes of extension.
 - The design doc's Reliability section names the (1)/(2)/(3) triggers explicitly. A reviewer scanning for "did the candidate think about scale?" finds the answer in two paragraphs, not in absent code.
 - RTO 15min / RPO 5min targets are achievable with multi-AZ alone (see ADR-0008). No reliability claim is left unsupported by the chosen topology.

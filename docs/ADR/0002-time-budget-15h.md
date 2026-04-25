@@ -1,7 +1,7 @@
 # ADR-0002: Hard-cap the build at 15 hours
 
 ## Status
-Accepted (2026-04-25)
+Superseded by ADR-0028 (2026-04-25) — budget revised from 15h to 22h to accommodate HTTPS at the internal ALB (ADR-0027), the Phase 2.3 cloud-acceptance window (ADR-0015 supersession block), async L1-L3 implementation, and distributed cache implementation. The body below preserves the original 15h calibration record; ADR-0028 carries the revised budget and reasoning.
 
 ## Context
 The case-study brief offers a one-week soft deadline with explicit extension permission ("Feel free to inform the HR team if more time is needed"). The brief itself does not push back on scope. Without a self-imposed hour ceiling, scope creep becomes the dominant risk: every "just one more endpoint", "just add Prometheus", "just include K8s manifests" silently consumes budget against quality elsewhere.
