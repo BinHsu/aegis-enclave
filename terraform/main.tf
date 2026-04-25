@@ -230,6 +230,11 @@ module "alb" {
   internal           = true # not internet-facing — only VPN-reachable
   load_balancer_type = "application"
 
+  # Three-layer timeout defence (ADR-0020): app wait_for is 30s + 10s, ALB
+  # sits at 45s so the client sees the application's 504 response rather
+  # than a connection reset from ALB.
+  idle_timeout = 45
+
   security_groups = [module.alb_sg.security_group_id]
 
   listeners = {

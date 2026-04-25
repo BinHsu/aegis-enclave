@@ -1,45 +1,59 @@
-"""Comprehensive unit tests for prime_service.primes.
+"""Comprehensive unit tests for prime_service.primes — unified monotonic cache.
 
 Strategy
 --------
-- **Differential testing** against `sympy` as the trusted oracle.
-- **Boundary Value Analysis (BVA)**: every boundary `B` is tested at
-  `B-1`, `B`, `B+1` (three points to detect off-by-one and miscategorisation).
-- **Layered coverage**: each test or test group is annotated with which
-  algorithm layer it exercises (table / sieve / trial division), so a
-  reviewer can immediately see that both "uses lookup table" and "does
-  NOT use lookup table" branches are covered.
-- **Per-function**: each public and private function in `primes.py` has
-  its own test class.
-- **Differential fuzz**: deterministic seeded random ranges per layer.
+- **Differential testing** against ``sympy`` as the trusted oracle wherever a
+  known-good reference exists. The brief's "implementation should be yours"
+  rule scopes the production module (`src/prime_service/primes.py`); test
+  oracles are out of scope (see ADR-0017's "Why sympy is acceptable").
+- **Boundary Value Analysis (BVA)**: every numeric threshold is tested at
+  ``B-1`` / ``B`` / ``B+1`` to detect off-by-one and mis-bracketed branches.
+  Thresholds covered: ``_INITIAL_PREWARM_BOUND``, ``_SIEVE_THRESHOLD``,
+  ``_RANGE_CEILING``, ``_HARD_TIMEOUT_MS`` (via ``_estimate_compute_ms``),
+  ``_GAP_THRESHOLD``, plus the per-function start/end ordering bounds.
+- **Per-function classes**: each public and private function in
+  ``primes.py`` has its own test class so a reviewer can map one-to-one
+  between source and tests.
+- **Cache-state assertions**: every test that mutates the module-level
+  cache verifies ``_known_max`` advanced (or did not advance) as the layer
+  contract requires.
+- **Determinism**: an autouse fixture resets the module-level cache to its
+  fresh pre-warmed state before every test, so test order does not matter
+  and BVA assertions on ``_known_max ± 1`` stay reproducible.
+- **Deterministic seeded fuzz**: per-layer fuzz tests use a fixed seed so
+  failures are reproducible across runs.
 
 Why sympy as oracle (and why the brief allows it)
 -------------------------------------------------
-The case-study brief reads: "The implementation logic should be yours...
-not code". That rule scopes the **implementation** (`src/prime_service/primes.py`),
-not the **test oracle**. Differential testing against a known-good
-reference is standard practice in industry verification — compilers test
-against a reference compiler, crypto libraries test against OpenSSL,
-arithmetic libraries test against `sympy`. The implementation in
-`primes.py` imports nothing from `sympy`; it is 100 % self-written
-sieve + 6k±1 trial division layered on a self-built lookup table.
+Differential testing against a known-good reference is standard industry
+practice — compilers test against a reference compiler, crypto libraries
+test against OpenSSL, number-theory libraries test against ``sympy``. The
+implementation in ``primes.py`` imports nothing from ``sympy``; it is
+100 % self-written sieve + 6k±1 trial division layered on a self-built
+unified cache.
 """
 
+from __future__ import annotations
+
+import threading
 from random import Random
 
 import pytest
 from sympy import isprime as sympy_isprime
 from sympy import primerange as sympy_primerange
 
+from prime_service import primes
 from prime_service.primes import (
-    _PRIME_TABLE,
+    _GAP_THRESHOLD,
+    _INITIAL_PREWARM_BOUND,
     _RANGE_CEILING,
     _SIEVE_THRESHOLD,
-    _TABLE_BOUND,
     _build_prime_table,
+    _compute,
+    _estimate_compute_ms,
     _is_prime_6k,
-    _lookup_in_table,
     _sieve_eratosthenes,
+    _slice_known,
     _trial_division_6k,
     _validate,
     primes_in_range,
@@ -47,400 +61,764 @@ from prime_service.primes import (
 
 
 def sympy_primes(start: int, end: int) -> list[int]:
-    """Inclusive [start, end] via sympy oracle.
-
-    `sympy.primerange` is half-open `[a, b)`; we add 1 to make it inclusive.
-    """
+    """Inclusive ``[start, end]`` via sympy oracle (sympy's primerange is
+    exclusive on the upper bound, so we pass ``end + 1``)."""
     return list(sympy_primerange(start, end + 1))
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# _validate — exercises every ValueError branch
+# Autouse cache reset
+# ───────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _reset_prime_cache():
+    """Reset the module-level cache to a freshly-prewarmed state before each test.
+
+    The unified cache mutates ``_known_primes`` and ``_known_max`` over the
+    lifetime of the process. Without this fixture, tests would leak state
+    into each other and BVA assertions on ``_known_max ± 1`` would be
+    order-dependent.
+    """
+    primes._known_primes = primes._build_prime_table(primes._INITIAL_PREWARM_BOUND)
+    primes._set_known_max(primes._INITIAL_PREWARM_BOUND)
+    yield
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# _validate — start/end bounds, range ceiling, cost-estimate gating
 # ───────────────────────────────────────────────────────────────────────────
 
 class TestValidate:
-    """Boundary value analysis on the input validator."""
+    """BVA on ``start >= 2``, ``start <= end``, range-size ceiling, and the
+    estimated-compute-time gate. The estimator gate is the most novel
+    boundary in the rewritten module — it makes ``_validate`` cache-aware.
+    """
 
-    # BVA at start=2 (lower bound)
-    @pytest.mark.parametrize("start", [-1, 0, 1])
-    def test_below_2_rejected(self, start: int) -> None:
+    # BVA at start = 2 (lower field bound)
+    @pytest.mark.parametrize("start", [-5, 0, 1])
+    def test_start_below_2_rejected(self, start: int) -> None:
         with pytest.raises(ValueError, match="start must be >= 2"):
             _validate(start, 100)
 
     @pytest.mark.parametrize("start", [2, 3, 100])
-    def test_at_or_above_2_passes(self, start: int) -> None:
-        _validate(start, start)  # no exception
+    def test_start_at_or_above_2_accepted(self, start: int) -> None:
+        # Should not raise.
+        _validate(start, start + 10)
 
-    # BVA on start vs end ordering
-    def test_start_equals_end_passes(self) -> None:
-        _validate(7, 7)  # no exception — single point is valid
+    # BVA at start <= end ordering
+    def test_start_equals_end_accepted(self) -> None:
+        _validate(7, 7)
 
-    def test_start_greater_than_end_rejected(self) -> None:
+    def test_start_one_above_end_rejected(self) -> None:
         with pytest.raises(ValueError, match="must be <= end"):
-            _validate(10, 9)
+            _validate(8, 7)
 
-    # BVA at range ceiling
-    def test_range_one_below_ceiling_passes(self) -> None:
+    def test_start_far_above_end_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must be <= end"):
+            _validate(1_000_000, 2)
+
+    # BVA at _RANGE_CEILING (range size = end - start)
+    def test_range_size_one_below_ceiling_accepted(self) -> None:
         _validate(2, 2 + _RANGE_CEILING - 1)
 
-    def test_range_at_ceiling_passes(self) -> None:
+    def test_range_size_at_ceiling_accepted(self) -> None:
         _validate(2, 2 + _RANGE_CEILING)
 
-    def test_range_above_ceiling_rejected(self) -> None:
+    def test_range_size_one_above_ceiling_rejected(self) -> None:
         with pytest.raises(ValueError, match="range size"):
             _validate(2, 2 + _RANGE_CEILING + 1)
 
+    # BVA at _HARD_TIMEOUT_MS — Layer 3 query whose estimated cost straddles
+    # the hard cap. Construct the boundary by inverting the estimator:
+    #   estimated_ms = compute_range * sqrt(end) // 6 // 3000
+    # For end = 10_000_000 (sqrt ≈ 3163), ms = 30_000 occurs at
+    # compute_range ≈ 30_000 * 6 * 3000 / 3163 ≈ 170_724.
+    def test_estimator_just_below_cap_accepted(self) -> None:
+        # compute_range = 100_000 → estimated ≈ 17_572 ms < 30_000
+        end = 10_000_000
+        start = end - 100_000 + 1
+        _validate(start, end)
+
+    def test_estimator_well_above_cap_rejected(self) -> None:
+        # compute_range = 1_000_000 → estimated ≈ 175_722 ms ≫ 30_000.
+        # Stay within _RANGE_CEILING so the range check doesn't fire first.
+        end = 10_000_000
+        start = end - 1_000_000 + 1
+        with pytest.raises(ValueError, match="estimated compute time"):
+            _validate(start, end)
+
+    def test_estimator_layer1_always_passes(self) -> None:
+        # End fully inside the pre-warmed cache → estimator returns 1 ms.
+        _validate(2, _INITIAL_PREWARM_BOUND)
+
 
 # ───────────────────────────────────────────────────────────────────────────
-# _is_prime_6k — single primality check, every internal branch
+# _estimate_compute_ms — pure function, deterministic given inputs
+# ───────────────────────────────────────────────────────────────────────────
+
+class TestEstimateComputeMs:
+    """Per-layer cost-model coverage with BVA at every layer transition."""
+
+    # Layer 1: end <= known_max → constant 1 ms
+    def test_layer1_full_cache_hit_returns_1(self) -> None:
+        assert _estimate_compute_ms(2, 1000, _INITIAL_PREWARM_BOUND) == 1
+
+    def test_layer1_at_known_max_returns_1(self) -> None:
+        assert _estimate_compute_ms(2, _INITIAL_PREWARM_BOUND, _INITIAL_PREWARM_BOUND) == 1
+
+    # BVA at known_max boundary: end = known_max - 1 / known_max / known_max + 1
+    def test_layer_boundary_known_max_minus_1(self) -> None:
+        assert _estimate_compute_ms(2, _INITIAL_PREWARM_BOUND - 1, _INITIAL_PREWARM_BOUND) == 1
+
+    def test_layer_boundary_known_max(self) -> None:
+        assert _estimate_compute_ms(2, _INITIAL_PREWARM_BOUND, _INITIAL_PREWARM_BOUND) == 1
+
+    def test_layer_boundary_known_max_plus_1(self) -> None:
+        # Crosses into Layer 2 (sieve) — cost should jump above 1.
+        result = _estimate_compute_ms(2, _INITIAL_PREWARM_BOUND + 1, _INITIAL_PREWARM_BOUND)
+        assert result > 1
+
+    # Layer 2: end <= _SIEVE_THRESHOLD → max(50, end // 10_000)
+    def test_layer2_below_threshold_scales_with_end(self) -> None:
+        # end = 500_000 → 50_000 ÷ 10_000 = 50
+        assert _estimate_compute_ms(2, 500_000, _INITIAL_PREWARM_BOUND) == 50
+
+    def test_layer2_floor_at_50(self) -> None:
+        # Tiny end above known_max → max(50, ...) keeps result >= 50
+        assert _estimate_compute_ms(2, _INITIAL_PREWARM_BOUND + 1, _INITIAL_PREWARM_BOUND) >= 50
+
+    # BVA at _SIEVE_THRESHOLD: threshold-1, threshold, threshold+1
+    def test_sieve_threshold_minus_1(self) -> None:
+        result = _estimate_compute_ms(2, _SIEVE_THRESHOLD - 1, _INITIAL_PREWARM_BOUND)
+        # Layer 2: max(50, (10**6 - 1) // 10_000) = max(50, 99) = 99
+        assert result == 99
+
+    def test_sieve_threshold_exact(self) -> None:
+        result = _estimate_compute_ms(2, _SIEVE_THRESHOLD, _INITIAL_PREWARM_BOUND)
+        # Layer 2: max(50, 10**6 // 10_000) = 100
+        assert result == 100
+
+    def test_sieve_threshold_plus_1(self) -> None:
+        # Crosses into Layer 3 (trial division) — different cost model.
+        below = _estimate_compute_ms(2, _SIEVE_THRESHOLD, _INITIAL_PREWARM_BOUND)
+        above = _estimate_compute_ms(2, _SIEVE_THRESHOLD + 1, _INITIAL_PREWARM_BOUND)
+        # Layer 3 over an enormous compute_range is much more expensive than
+        # Layer 2 sieve at the same upper bound.
+        assert above > below
+
+    # Layer 3: end > _SIEVE_THRESHOLD → trial-division estimate
+    def test_layer3_scales_with_compute_range(self) -> None:
+        small_range = _estimate_compute_ms(9_900_001, 10_000_000, _INITIAL_PREWARM_BOUND)
+        big_range = _estimate_compute_ms(9_000_001, 10_000_000, _INITIAL_PREWARM_BOUND)
+        # 10x more compute range → ~10x more estimated ms
+        assert big_range > small_range * 5
+
+    # BVA at _GAP_THRESHOLD: extend vs standalone cost models switch here
+    def test_gap_threshold_minus_1_extends(self) -> None:
+        # start = known_max + gap - 1 → still extends from known_max + 1
+        start = _INITIAL_PREWARM_BOUND + _GAP_THRESHOLD - 1
+        end = start + 1_000_000  # push into Layer 3
+        extend_cost = _estimate_compute_ms(start, end, _INITIAL_PREWARM_BOUND)
+        # compute_start = known_max + 1 → compute_range much larger
+        assert extend_cost > 0
+
+    def test_gap_threshold_at_extends(self) -> None:
+        start = _INITIAL_PREWARM_BOUND + _GAP_THRESHOLD
+        end = start + 1_000_000
+        # At the boundary, still extends (start <= known_max + gap)
+        extend_cost = _estimate_compute_ms(start, end, _INITIAL_PREWARM_BOUND)
+        assert extend_cost > 0
+
+    def test_gap_threshold_plus_1_standalone(self) -> None:
+        # start = known_max + gap + 1 → falls through to standalone branch.
+        # Same end as the extend cases above; compute_start = start, so
+        # compute_range is *smaller*, so estimated cost is *smaller*.
+        end = _INITIAL_PREWARM_BOUND + _GAP_THRESHOLD + 1_000_000
+        standalone_start = _INITIAL_PREWARM_BOUND + _GAP_THRESHOLD + 1
+        extend_start = _INITIAL_PREWARM_BOUND + _GAP_THRESHOLD
+        standalone_cost = _estimate_compute_ms(standalone_start, end, _INITIAL_PREWARM_BOUND)
+        extend_cost = _estimate_compute_ms(extend_start, end, _INITIAL_PREWARM_BOUND)
+        assert standalone_cost < extend_cost
+
+    def test_layer1_irrespective_of_start(self) -> None:
+        # Even if start is a million, end <= known_max still routes Layer 1.
+        # (This exercises the ordering of the early return.)
+        assert _estimate_compute_ms(50, 100, 200) == 1
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# _is_prime_6k — single-number primality
 # ───────────────────────────────────────────────────────────────────────────
 
 class TestIsPrime6k:
-    """BVA + branch coverage on the 6k±1 primality check."""
+    """BVA on the internal branches of the 6k±1 primality test."""
 
-    # Below the n<2 short-circuit
-    @pytest.mark.parametrize("n", [-1, 0, 1])
-    def test_below_2_returns_false(self, n: int) -> None:
+    @pytest.mark.parametrize("n", [-5, -1, 0, 1])
+    def test_below_2_not_prime(self, n: int) -> None:
         assert _is_prime_6k(n) is False
 
-    # Hits the n<4 short-circuit
-    def test_2_is_prime(self) -> None:
-        assert _is_prime_6k(2) is True
+    @pytest.mark.parametrize("n", [2, 3])
+    def test_2_and_3_are_prime(self, n: int) -> None:
+        assert _is_prime_6k(n) is True
 
-    def test_3_is_prime(self) -> None:
-        assert _is_prime_6k(3) is True
-
-    # Hits the even/3-multiple short-circuits
     def test_4_is_composite(self) -> None:
         assert _is_prime_6k(4) is False
 
-    def test_9_is_composite(self) -> None:
-        # 9 = 3 × 3 — divisible by 3, hits the % 3 short-circuit
-        assert _is_prime_6k(9) is False
+    def test_5_is_prime(self) -> None:
+        assert _is_prime_6k(5) is True
 
-    # Square boundaries — common off-by-one trap
-    @pytest.mark.parametrize("n", [25, 49, 121, 169])
-    def test_perfect_squares_composite(self, n: int) -> None:
+    @pytest.mark.parametrize("n", [6, 8, 10, 100, 1000])
+    def test_even_numbers_above_2_composite(self, n: int) -> None:
         assert _is_prime_6k(n) is False
 
-    # Known small primes
-    @pytest.mark.parametrize("n", [5, 7, 11, 13, 17, 19, 23, 29, 31, 97])
-    def test_known_small_primes(self, n: int) -> None:
-        assert _is_prime_6k(n) is True
+    @pytest.mark.parametrize("n", [9, 15, 21, 27, 99])
+    def test_multiples_of_3_above_3_composite(self, n: int) -> None:
+        assert _is_prime_6k(n) is False
 
-    # Differential against sympy oracle for the entire range [0, 1000]
-    def test_differential_against_sympy_first_1000(self) -> None:
-        for n in range(0, 1001):
-            assert _is_prime_6k(n) == sympy_isprime(n), f"mismatch at n={n}"
+    @pytest.mark.parametrize("n", [25, 49, 121, 169, 289])
+    def test_perfect_squares_of_primes_composite(self, n: int) -> None:
+        assert _is_prime_6k(n) is False
 
-    # Boundary: smallest prime > 10**6
     def test_smallest_prime_above_million(self) -> None:
-        # 1_000_003 is the smallest prime > 10**6
+        # 1_000_003 is the smallest prime > 10**6 (oracle: sympy)
         assert _is_prime_6k(1_000_003) is True
 
-    # Boundary: 10**6 itself is composite
-    def test_million_is_composite(self) -> None:
+    def test_million_itself_composite(self) -> None:
         assert _is_prime_6k(1_000_000) is False
+
+    def test_differential_against_sympy_small_range(self) -> None:
+        for n in range(0, 1000):
+            assert _is_prime_6k(n) == sympy_isprime(n), f"disagreement at n={n}"
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# _build_prime_table — module-load helper
+# _build_prime_table — Sieve of Eratosthenes helper
 # ───────────────────────────────────────────────────────────────────────────
 
 class TestBuildPrimeTable:
-    """BVA on the bound parameter + differential against sympy."""
+    """BVA at the lowest bounds + differential against sympy."""
 
-    @pytest.mark.parametrize("bound", [0, 1])
-    def test_below_2_returns_empty(self, bound: int) -> None:
-        assert _build_prime_table(bound) == []
+    def test_bound_0_empty(self) -> None:
+        assert _build_prime_table(0) == []
 
-    def test_bound_2_returns_only_2(self) -> None:
+    def test_bound_1_empty(self) -> None:
+        assert _build_prime_table(1) == []
+
+    def test_bound_2_just_2(self) -> None:
         assert _build_prime_table(2) == [2]
 
-    def test_bound_30_returns_first_ten_primes(self) -> None:
+    def test_bound_3(self) -> None:
+        assert _build_prime_table(3) == [2, 3]
+
+    def test_bound_30_first_ten_primes(self) -> None:
         assert _build_prime_table(30) == [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
 
-    @pytest.mark.parametrize("bound", [10, 100, 1_000, 10_000])
+    @pytest.mark.parametrize("bound", [10, 100, 1000, 10_000])
     def test_differential_against_sympy(self, bound: int) -> None:
         assert _build_prime_table(bound) == sympy_primes(2, bound)
 
-    def test_module_table_matches_oracle(self) -> None:
-        """The actual `_PRIME_TABLE` loaded at import time must match sympy.
+    def test_returns_sorted_list(self) -> None:
+        result = _build_prime_table(10_000)
+        assert result == sorted(result)
 
-        `_PRIME_TABLE` is stored as a tuple for immutability (see ADR-0017);
-        cast to list for equality comparison against the sympy oracle output.
-        """
-        assert list(_PRIME_TABLE) == sympy_primes(2, _TABLE_BOUND)
-
-    def test_module_table_is_immutable(self) -> None:
-        """ADR-0017: storage as tuple guards against accidental mutation."""
-        import pytest as _pytest
-
-        with _pytest.raises(AttributeError):
-            _PRIME_TABLE.append(999_983)  # type: ignore[attr-defined]
-        with _pytest.raises(TypeError):
-            _PRIME_TABLE[0] = 0  # type: ignore[index]
+    def test_all_returned_values_are_prime(self) -> None:
+        for n in _build_prime_table(1000):
+            assert sympy_isprime(n), f"non-prime {n} in build_prime_table output"
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# _lookup_in_table — bisect-based slice (uses table by definition)
+# _slice_known — bisect-and-slice on the cache (replaces TestLookupInTable)
 # ───────────────────────────────────────────────────────────────────────────
 
-class TestLookupInTable:
-    """All inputs here exercise the table path. BVA at table boundaries."""
+class TestSliceKnown:
+    """Cache-slicing direct calls. The autouse fixture pre-warms the cache to
+    ``_INITIAL_PREWARM_BOUND``; tests acquire ``_cache_lock`` themselves to
+    honour the documented contract (caller holds the lock during access).
 
-    def test_head_of_table(self) -> None:
-        # uses table
-        assert _lookup_in_table(2, 10) == [2, 3, 5, 7]
+    Note: ``_slice_known`` does *not* validate that ``end <= _known_max`` —
+    it simply bisects. With ``end > _known_max``, it returns the cache
+    prefix (a short slice), which is the documented behaviour. The caller
+    (``primes_in_range``) is responsible for routing such queries to the
+    extension or standalone path.
+    """
 
-    def test_single_prime_hit(self) -> None:
-        # uses table
-        assert _lookup_in_table(7, 7) == [7]
+    def test_full_prewarmed_range(self) -> None:
+        with primes._cache_lock:
+            result = _slice_known(2, _INITIAL_PREWARM_BOUND)
+        assert result == sympy_primes(2, _INITIAL_PREWARM_BOUND)
 
-    def test_single_composite(self) -> None:
-        # uses table
-        assert _lookup_in_table(8, 8) == []
+    # BVA at _INITIAL_PREWARM_BOUND
+    def test_end_one_below_bound(self) -> None:
+        with primes._cache_lock:
+            result = _slice_known(2, _INITIAL_PREWARM_BOUND - 1)
+        assert result == sympy_primes(2, _INITIAL_PREWARM_BOUND - 1)
 
-    def test_empty_range_in_composite_run(self) -> None:
-        # uses table — 14, 15, 16 are all composite
-        assert _lookup_in_table(14, 16) == []
+    def test_end_at_bound(self) -> None:
+        with primes._cache_lock:
+            result = _slice_known(2, _INITIAL_PREWARM_BOUND)
+        assert result == sympy_primes(2, _INITIAL_PREWARM_BOUND)
 
-    def test_table_upper_bound_inclusive(self) -> None:
-        # uses table — end exactly TABLE_BOUND
-        result = _lookup_in_table(2, _TABLE_BOUND)
-        assert result == sympy_primes(2, _TABLE_BOUND)
+    def test_end_one_above_bound_returns_prefix(self) -> None:
+        # _slice_known returns whatever bisect finds in the cache; for an
+        # ``end`` past the cache, that is the entire pre-warm. Document the
+        # behaviour rather than asserting an exception is raised.
+        with primes._cache_lock:
+            result = _slice_known(2, _INITIAL_PREWARM_BOUND + 1)
+        assert result == sympy_primes(2, _INITIAL_PREWARM_BOUND)
 
-    def test_largest_prime_in_table(self) -> None:
-        # uses table — single point at the largest prime <= TABLE_BOUND
-        largest = sympy_primes(2, _TABLE_BOUND)[-1]
-        assert _lookup_in_table(largest, largest) == [largest]
+    def test_single_prime_query(self) -> None:
+        with primes._cache_lock:
+            result = _slice_known(7, 7)
+        assert result == [7]
+
+    def test_single_composite_query(self) -> None:
+        with primes._cache_lock:
+            result = _slice_known(8, 8)
+        assert result == []
 
     @pytest.mark.parametrize(
-        "start,end",
-        [(2, 100), (50, 200), (1_000, 2_000), (50_000, 60_000), (90_000, _TABLE_BOUND)],
+        ("start", "end"),
+        [
+            (2, 100),
+            (1000, 2000),
+            (50_000, 60_000),
+            (99_000, 99_999),
+        ],
     )
     def test_differential_against_sympy(self, start: int, end: int) -> None:
-        # uses table
-        assert _lookup_in_table(start, end) == sympy_primes(start, end)
+        with primes._cache_lock:
+            result = _slice_known(start, end)
+        assert result == sympy_primes(start, end)
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# _sieve_eratosthenes — runtime sieve (does NOT use table)
+# _compute — sieve / trial-division dispatcher
+# ───────────────────────────────────────────────────────────────────────────
+
+class TestCompute:
+    """Dispatches to sieve or trial division based on ``_SIEVE_THRESHOLD``."""
+
+    def test_below_threshold_dispatches_sieve(self) -> None:
+        result = _compute(2, 1000)
+        assert result == sympy_primes(2, 1000)
+
+    # BVA at _SIEVE_THRESHOLD
+    def test_threshold_minus_1(self) -> None:
+        result = _compute(_SIEVE_THRESHOLD - 100, _SIEVE_THRESHOLD - 1)
+        assert result == sympy_primes(_SIEVE_THRESHOLD - 100, _SIEVE_THRESHOLD - 1)
+
+    def test_threshold_exact(self) -> None:
+        result = _compute(_SIEVE_THRESHOLD - 100, _SIEVE_THRESHOLD)
+        assert result == sympy_primes(_SIEVE_THRESHOLD - 100, _SIEVE_THRESHOLD)
+
+    def test_threshold_plus_1_dispatches_trial(self) -> None:
+        # End just above threshold → trial-division branch.
+        result = _compute(_SIEVE_THRESHOLD + 1, _SIEVE_THRESHOLD + 100)
+        assert result == sympy_primes(_SIEVE_THRESHOLD + 1, _SIEVE_THRESHOLD + 100)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# _sieve_eratosthenes — generator
 # ───────────────────────────────────────────────────────────────────────────
 
 class TestSieveEratosthenes:
-    """Direct exercise of the runtime sieve (no table path)."""
+    """Generator coverage with start/upper boundaries."""
 
-    def test_minimum_upper(self) -> None:
-        # NO table — direct call to private function
-        assert list(_sieve_eratosthenes(2, 2)) == [2]
+    def test_full_range_from_2(self) -> None:
+        result = list(_sieve_eratosthenes(100, 2))
+        assert result == sympy_primes(2, 100)
 
-    def test_upper_3(self) -> None:
-        # NO table
-        assert list(_sieve_eratosthenes(3, 2)) == [2, 3]
+    def test_start_above_2(self) -> None:
+        result = list(_sieve_eratosthenes(100, 50))
+        assert result == sympy_primes(50, 100)
 
-    @pytest.mark.parametrize("upper", [10, 100, 1_000])
-    def test_differential_full_range(self, upper: int) -> None:
-        # NO table
-        assert list(_sieve_eratosthenes(upper, 2)) == sympy_primes(2, upper)
+    def test_start_equals_upper(self) -> None:
+        result = list(_sieve_eratosthenes(7, 7))
+        assert result == [7]
 
-    def test_start_filter(self) -> None:
-        # NO table — sieve generates up to upper but yields only >= start
-        assert list(_sieve_eratosthenes(20, 11)) == [11, 13, 17, 19]
+    def test_start_above_upper_yields_empty(self) -> None:
+        # start > upper → the inner `range(max(start, 2), upper + 1)` is empty
+        result = list(_sieve_eratosthenes(10, 20))
+        assert result == []
+
+    @pytest.mark.parametrize("upper", [100, 1000, 10_000, 100_000])
+    def test_differential_against_sympy(self, upper: int) -> None:
+        result = list(_sieve_eratosthenes(upper, 2))
+        assert result == sympy_primes(2, upper)
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# _trial_division_6k — runtime trial division (does NOT use table)
+# _trial_division_6k — generator
 # ───────────────────────────────────────────────────────────────────────────
 
 class TestTrialDivision6k:
-    """Direct exercise of the trial-division branch (no table path)."""
+    """6k±1 trial-division generator coverage."""
 
-    def test_first_ten_primes(self) -> None:
-        # NO table
-        assert list(_trial_division_6k(2, 30)) == [
-            2, 3, 5, 7, 11, 13, 17, 19, 23, 29,
-        ]
+    def test_small_range(self) -> None:
+        result = list(_trial_division_6k(2, 100))
+        assert result == sympy_primes(2, 100)
 
-    def test_smallest_prime_above_million(self) -> None:
-        # NO table — 1_000_003 is the smallest prime > 10**6
-        assert 1_000_003 in list(_trial_division_6k(1_000_001, 1_000_005))
+    def test_start_equals_end_prime(self) -> None:
+        assert list(_trial_division_6k(7, 7)) == [7]
+
+    def test_start_equals_end_composite(self) -> None:
+        assert list(_trial_division_6k(8, 8)) == []
+
+    def test_above_million(self) -> None:
+        # Layer-3-shaped query: small slice above _SIEVE_THRESHOLD
+        result = list(_trial_division_6k(1_000_000, 1_000_100))
+        assert result == sympy_primes(1_000_000, 1_000_100)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# primes_in_range — Layer 1 (pure cache hit)
+# ───────────────────────────────────────────────────────────────────────────
+
+class TestPrimesInRangeLayer1FullCacheHit:
+    """All queries fit inside the pre-warmed cache; ``_known_max`` must not
+    advance, the lock is acquired but no compute happens."""
 
     @pytest.mark.parametrize(
-        "start,end",
-        [(2, 100), (1_000, 2_000), (1_000_001, 1_000_100)],
+        ("start", "end"),
+        [
+            (2, 100),
+            (2, 1000),
+            (50, _INITIAL_PREWARM_BOUND),
+            (99_000, _INITIAL_PREWARM_BOUND),
+            (_INITIAL_PREWARM_BOUND - 1, _INITIAL_PREWARM_BOUND),
+        ],
     )
-    def test_differential(self, start: int, end: int) -> None:
-        # NO table
-        assert list(_trial_division_6k(start, end)) == sympy_primes(start, end)
+    def test_differential_against_sympy(self, start: int, end: int) -> None:
+        result = primes_in_range(start, end)
+        assert result == sympy_primes(start, end)
+
+    def test_known_max_unchanged_after_call(self) -> None:
+        before = primes._known_max
+        primes_in_range(2, 1000)
+        assert primes._known_max == before == _INITIAL_PREWARM_BOUND
+
+    def test_single_prime_query(self) -> None:
+        assert primes_in_range(7, 7) == [7]
+
+    def test_single_composite_query(self) -> None:
+        assert primes_in_range(8, 8) == []
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# primes_in_range — top-level layered behaviour
+# primes_in_range — cache extension path
 # ───────────────────────────────────────────────────────────────────────────
 
-class TestPrimesInRangeValidation:
-    """Validation rejections — top-level entry point."""
+class TestPrimesInRangeCacheExtension:
+    """Queries that satisfy ``start <= _known_max + _GAP_THRESHOLD`` and
+    ``end > _known_max`` — cache extends contiguously to ``end``."""
 
-    @pytest.mark.parametrize("start", [-5, 0, 1])
-    def test_start_below_2_raises(self, start: int) -> None:
-        with pytest.raises(ValueError, match="start must be >= 2"):
-            primes_in_range(start, 100)
+    # BVA at _known_max + 1 (lower edge of extension)
+    def test_extension_one_above_known_max(self) -> None:
+        end = _INITIAL_PREWARM_BOUND + 1
+        result = primes_in_range(2, end)
+        assert result == sympy_primes(2, end)
+        assert primes._known_max == end
 
-    def test_start_greater_than_end_raises(self) -> None:
-        with pytest.raises(ValueError, match="must be <= end"):
-            primes_in_range(100, 50)
+    def test_extension_at_known_max_exact(self) -> None:
+        # end == known_max → Layer 1, cache untouched
+        result = primes_in_range(2, _INITIAL_PREWARM_BOUND)
+        assert result == sympy_primes(2, _INITIAL_PREWARM_BOUND)
+        assert primes._known_max == _INITIAL_PREWARM_BOUND
 
-    def test_range_above_ceiling_raises(self) -> None:
+    def test_extension_known_max_minus_1(self) -> None:
+        # Pure cache hit (control case for the BVA triplet)
+        result = primes_in_range(2, _INITIAL_PREWARM_BOUND - 1)
+        assert result == sympy_primes(2, _INITIAL_PREWARM_BOUND - 1)
+        assert primes._known_max == _INITIAL_PREWARM_BOUND
+
+    # BVA at start = _known_max + _GAP_THRESHOLD (upper edge of extension)
+    def test_extension_at_gap_threshold(self) -> None:
+        start = _INITIAL_PREWARM_BOUND + _GAP_THRESHOLD
+        end = start + 100
+        result = primes_in_range(start, end)
+        assert result == sympy_primes(start, end)
+        # At the boundary, still extends → known_max advances to end
+        assert primes._known_max == end
+
+    def test_extension_one_below_gap_threshold(self) -> None:
+        start = _INITIAL_PREWARM_BOUND + _GAP_THRESHOLD - 1
+        end = start + 100
+        result = primes_in_range(start, end)
+        assert result == sympy_primes(start, end)
+        assert primes._known_max == end
+
+    def test_extension_advances_known_max_to_end(self) -> None:
+        end = 200_000
+        primes_in_range(2, end)
+        assert primes._known_max == end
+
+    def test_extension_cache_count_matches_sympy(self) -> None:
+        end = 200_000
+        primes_in_range(2, end)
+        assert len(primes._known_primes) == len(sympy_primes(2, end))
+
+    def test_extension_half_hit_prefix_plus_suffix(self) -> None:
+        # start inside cache, end outside → cache extends, full slice returned
+        start = 50_000
+        end = 150_000
+        result = primes_in_range(start, end)
+        assert result == sympy_primes(start, end)
+        assert primes._known_max == end
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# primes_in_range — far-gap (standalone) path
+# ───────────────────────────────────────────────────────────────────────────
+
+class TestPrimesInRangeFarGap:
+    """``start > _known_max + _GAP_THRESHOLD`` — compute standalone, do not
+    pollute cache. ``_known_max`` must remain unchanged."""
+
+    # BVA at start = _known_max + _GAP_THRESHOLD + 1 (first standalone start)
+    def test_far_gap_one_above_threshold(self) -> None:
+        start = _INITIAL_PREWARM_BOUND + _GAP_THRESHOLD + 1
+        end = start + 100
+        before_max = primes._known_max
+        result = primes_in_range(start, end)
+        assert result == sympy_primes(start, end)
+        assert primes._known_max == before_max
+
+    def test_far_gap_at_threshold_extends_not_standalone(self) -> None:
+        # The other side of the boundary: this one *does* extend.
+        start = _INITIAL_PREWARM_BOUND + _GAP_THRESHOLD
+        end = start + 100
+        result = primes_in_range(start, end)
+        assert result == sympy_primes(start, end)
+        assert primes._known_max == end  # cache advanced — proves not standalone
+
+    def test_far_gap_one_below_threshold_extends(self) -> None:
+        # Triplet's third element: extends (control)
+        start = _INITIAL_PREWARM_BOUND + _GAP_THRESHOLD - 1
+        end = start + 100
+        result = primes_in_range(start, end)
+        assert result == sympy_primes(start, end)
+        assert primes._known_max == end
+
+    def test_far_gap_layer2_sieve_path(self) -> None:
+        # Far gap, end <= _SIEVE_THRESHOLD → standalone via sieve
+        start = 500_000
+        end = 500_500
+        before_max = primes._known_max
+        result = primes_in_range(start, end)
+        assert result == sympy_primes(start, end)
+        assert primes._known_max == before_max
+
+    def test_far_gap_layer3_trial_path(self) -> None:
+        # Far gap, end > _SIEVE_THRESHOLD → standalone via trial division
+        start = 5_000_000
+        end = 5_001_000
+        before_max = primes._known_max
+        result = primes_in_range(start, end)
+        assert result == sympy_primes(start, end)
+        assert primes._known_max == before_max
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# primes_in_range — pre-flight rejection on cost estimate
+# ───────────────────────────────────────────────────────────────────────────
+
+class TestPrimesInRangeRejection:
+    """``_HARD_TIMEOUT_MS`` gate must reject expensive queries before any
+    compute starts. Counter-test confirms cheaper queries pass.
+    """
+
+    def test_layer3_above_cap_rejected(self) -> None:
+        # compute_range = 1_000_000 at end = 10**7 → ~175k ms, way above 30k.
+        end = 10_000_000
+        start = end - 1_000_000 + 1
+        with pytest.raises(ValueError, match="estimated compute time"):
+            primes_in_range(start, end)
+
+    def test_layer3_below_cap_accepted(self) -> None:
+        # Tiny Layer-3 slice — well under both the cap and any reasonable
+        # wall-clock budget. The point is "validation passes and the call
+        # returns oracle-correct primes", not "exercise the cap edge".
+        start = 5_000_000
+        end = start + 200
+        result = primes_in_range(start, end)
+        assert result == sympy_primes(start, end)
+
+    def test_range_size_above_ceiling_rejected_first(self) -> None:
+        # Range > _RANGE_CEILING → range error wins over estimator error
         with pytest.raises(ValueError, match="range size"):
             primes_in_range(2, 2 + _RANGE_CEILING + 1)
 
+    def test_start_below_2_rejected(self) -> None:
+        with pytest.raises(ValueError, match="start must be >= 2"):
+            primes_in_range(1, 100)
 
-class TestPrimesInRangeLayer1UsesTable:
-    """Layer 1 — `end <= _TABLE_BOUND`. ALL inputs here use the lookup table."""
-
-    @pytest.mark.parametrize(
-        "start,end",
-        [
-            (2, 10),                          # head of table
-            (2, 100),                         # well inside table
-            (50_000, _TABLE_BOUND - 1),       # B - 1 boundary
-            (2, _TABLE_BOUND),                # B exact boundary
-        ],
-    )
-    def test_inside_table(self, start: int, end: int) -> None:
-        # uses table only
-        assert primes_in_range(start, end) == sympy_primes(start, end)
-
-    def test_classic_brief_example(self) -> None:
-        # uses table — brief example: 1..10 should give 2,3,5,7
-        # (start clamped to 2 because brief reserves 1)
-        assert primes_in_range(2, 10) == [2, 3, 5, 7]
-
-
-class TestPrimesInRangeLayer1_5UsesTablePartially:
-    """Layer 1.5 — `start <= _TABLE_BOUND < end`. Table prefix + computed suffix."""
-
-    @pytest.mark.parametrize(
-        "start,end",
-        [
-            (2, _TABLE_BOUND + 1),              # B + 1 boundary — smallest spill
-            (2, _TABLE_BOUND + 100),            # spill into Layer 2
-            (_TABLE_BOUND - 100, _TABLE_BOUND + 100),  # straddle equally
-            (_TABLE_BOUND, _TABLE_BOUND + 1),   # boundary kissing — single prime above
-        ],
-    )
-    def test_partial_overlap(self, start: int, end: int) -> None:
-        # uses table prefix + computed suffix
-        assert primes_in_range(start, end) == sympy_primes(start, end)
-
-
-class TestPrimesInRangeLayer2NoTable:
-    """Layer 2 — `start > _TABLE_BOUND` and `end <= _SIEVE_THRESHOLD`.
-
-    No table is used; runtime Sieve of Eratosthenes.
-    """
-
-    @pytest.mark.parametrize(
-        "start,end",
-        [
-            (_TABLE_BOUND + 1, _TABLE_BOUND + 100),       # B + 1 (just above table)
-            (500_000, 500_500),                            # well inside Layer 2
-            (999_900, _SIEVE_THRESHOLD - 1),               # B - 1 of next boundary
-            (999_900, _SIEVE_THRESHOLD),                   # B at next boundary
-        ],
-    )
-    def test_above_table_below_sieve_threshold(self, start: int, end: int) -> None:
-        # NO table; runtime sieve
-        assert primes_in_range(start, end) == sympy_primes(start, end)
-
-
-class TestPrimesInRangeLayer3NoTable:
-    """Layer 3 — `end > _SIEVE_THRESHOLD`. No table; trial division."""
-
-    @pytest.mark.parametrize(
-        "start,end",
-        [
-            (_SIEVE_THRESHOLD + 1, _SIEVE_THRESHOLD + 100),   # B + 1 boundary
-            (1_000_001, 1_000_100),
-            (10_000_000, 10_000_100),                          # high range
-        ],
-    )
-    def test_above_sieve_threshold(self, start: int, end: int) -> None:
-        # NO table; trial division
-        assert primes_in_range(start, end) == sympy_primes(start, end)
-
-
-class TestPrimesInRangeSinglePoints:
-    """BVA on single-point ranges at every boundary."""
-
-    def test_smallest_valid(self) -> None:
-        # uses table
-        assert primes_in_range(2, 2) == [2]
-
-    def test_at_table_bound_known_composite(self) -> None:
-        # uses table — 100_000 is composite
-        assert primes_in_range(_TABLE_BOUND, _TABLE_BOUND) == []
-
-    def test_just_above_table_bound(self) -> None:
-        # NO table (start > TABLE_BOUND, falls through to Layer 2)
-        # 100_003 is prime
-        assert primes_in_range(100_003, 100_003) == [100_003]
-
-    def test_at_sieve_threshold_known_composite(self) -> None:
-        # NO table (well above table) — 1_000_000 is composite
-        assert primes_in_range(_SIEVE_THRESHOLD, _SIEVE_THRESHOLD) == []
-
-    def test_just_above_sieve_threshold(self) -> None:
-        # NO table; trial division — 1_000_003 is prime
-        assert primes_in_range(_SIEVE_THRESHOLD + 3, _SIEVE_THRESHOLD + 3) == [
-            1_000_003
-        ]
+    def test_start_above_end_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must be <= end"):
+            primes_in_range(100, 50)
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Differential fuzz tests — deterministic seed
+# Cache consistency across multiple queries
+# ───────────────────────────────────────────────────────────────────────────
+
+class TestCacheConsistencyAfterMultipleQueries:
+    """Sequence-level verification: known_max progresses monotonically and the
+    cache returns oracle-correct primes after a mixed sequence."""
+
+    def test_three_queries_advance_then_hit(self) -> None:
+        # Q1: pure cache hit — known_max stays at _INITIAL_PREWARM_BOUND
+        result1 = primes_in_range(2, 1000)
+        assert result1 == sympy_primes(2, 1000)
+        assert primes._known_max == _INITIAL_PREWARM_BOUND
+
+        # Q2: extension to 200_000 (50_000 is inside the prewarm, so we straddle)
+        result2 = primes_in_range(50_000, 200_000)
+        assert result2 == sympy_primes(50_000, 200_000)
+        assert primes._known_max == 200_000
+
+        # Q3: pure cache hit on the extended range — no further advance
+        result3 = primes_in_range(2, 200_000)
+        assert result3 == sympy_primes(2, 200_000)
+        assert primes._known_max == 200_000
+
+    def test_extension_then_far_gap_does_not_pollute(self) -> None:
+        # Extend to 150_000
+        primes_in_range(2, 150_000)
+        assert primes._known_max == 150_000
+
+        # Far-gap query: start > 150_000 + 100_000 = 250_000
+        far_start = 300_000
+        far_end = far_start + 100
+        primes_in_range(far_start, far_end)
+        # Cache stays at 150_000 — far gap did not pollute.
+        assert primes._known_max == 150_000
+
+    def test_repeated_extension_grows_monotonically(self) -> None:
+        primes_in_range(2, 120_000)
+        assert primes._known_max == 120_000
+        primes_in_range(2, 180_000)
+        assert primes._known_max == 180_000
+        primes_in_range(2, 150_000)
+        # Subsequent smaller-end query is a Layer 1 hit → cache stays at 180_000
+        assert primes._known_max == 180_000
+
+    def test_cache_remains_sorted_after_extensions(self) -> None:
+        primes_in_range(2, 200_000)
+        assert primes._known_primes == sorted(primes._known_primes)
+        # And matches the oracle
+        assert primes._known_primes == sympy_primes(2, 200_000)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Thread-safety smoke test
+# ───────────────────────────────────────────────────────────────────────────
+
+class TestThreadSafety:
+    """Smoke-level concurrency: four threads issue the same query; results
+    agree, no exception leaks. Not a race-condition harness — the lock
+    contract is verified by code review and the design doc."""
+
+    def test_four_threads_same_query_agree(self) -> None:
+        results: list[list[int]] = []
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+
+        def worker() -> None:
+            try:
+                r = primes_in_range(2, 50_000)
+                with lock:
+                    results.append(r)
+            except BaseException as exc:  # pragma: no cover - smoke guard
+                with lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        assert len(results) == 4
+        oracle = sympy_primes(2, 50_000)
+        for r in results:
+            assert r == oracle
+
+    def test_four_threads_extending_cache_agree(self) -> None:
+        # All four threads request an extension to 200_000; the cache should
+        # end up extended exactly once and every thread should see the same
+        # primes.
+        results: list[list[int]] = []
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+
+        def worker() -> None:
+            try:
+                r = primes_in_range(2, 200_000)
+                with lock:
+                    results.append(r)
+            except BaseException as exc:  # pragma: no cover - smoke guard
+                with lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        oracle = sympy_primes(2, 200_000)
+        for r in results:
+            assert r == oracle
+        assert primes._known_max == 200_000
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Deterministic seeded fuzz — one block per layer / scenario
 # ───────────────────────────────────────────────────────────────────────────
 
 class TestPrimesInRangeFuzz:
-    """Random-but-deterministic ranges per layer; cross-checked with sympy."""
+    """Per-layer randomised differential against sympy. Each block uses a
+    fixed seed, so any failure is reproducible from the printed seed."""
 
-    def test_fuzz_layer1_uses_table(self) -> None:
-        # uses table
-        rng = Random(42)
+    def test_fuzz_layer1_cache_hits(self) -> None:
+        rng = Random(0xA1)
         for _ in range(50):
-            start = rng.randint(2, _TABLE_BOUND - 1)
-            end = rng.randint(start, _TABLE_BOUND)
-            assert primes_in_range(start, end) == sympy_primes(start, end), (
-                f"Layer 1 mismatch at [{start}, {end}]"
-            )
+            start = rng.randint(2, 99_000)
+            end = rng.randint(start, 100_000)
+            assert primes_in_range(start, end) == sympy_primes(start, end)
+        # Layer 1 only — known_max must not have moved
+        assert primes._known_max == _INITIAL_PREWARM_BOUND
 
-    def test_fuzz_layer1_5_partial_overlap(self) -> None:
-        # uses table prefix + computed suffix
-        rng = Random(43)
+    def test_fuzz_cache_extension_straddling_prewarm(self) -> None:
+        rng = Random(0xB2)
         for _ in range(20):
-            start = rng.randint(_TABLE_BOUND - 1_000, _TABLE_BOUND - 1)
-            end = rng.randint(_TABLE_BOUND + 1, _TABLE_BOUND + 1_000)
-            assert primes_in_range(start, end) == sympy_primes(start, end), (
-                f"Layer 1.5 mismatch at [{start}, {end}]"
-            )
+            start = rng.randint(2, _INITIAL_PREWARM_BOUND)
+            end = rng.randint(_INITIAL_PREWARM_BOUND + 1, 200_000)
+            assert primes_in_range(start, end) == sympy_primes(start, end)
 
-    def test_fuzz_layer2_no_table(self) -> None:
-        # NO table; runtime sieve
-        rng = Random(44)
+    def test_fuzz_layer2_sieve(self) -> None:
+        rng = Random(0xC3)
+        # Far-gap queries that land in Layer 2 (between prewarm + gap and
+        # _SIEVE_THRESHOLD). Cache must not advance because they're far gap.
+        before_max = primes._known_max
         for _ in range(20):
-            start = rng.randint(_TABLE_BOUND + 1, _SIEVE_THRESHOLD - 1_000)
-            end = rng.randint(start, min(start + 1_000, _SIEVE_THRESHOLD))
-            assert primes_in_range(start, end) == sympy_primes(start, end), (
-                f"Layer 2 mismatch at [{start}, {end}]"
+            start = rng.randint(
+                _INITIAL_PREWARM_BOUND + _GAP_THRESHOLD + 1,
+                _SIEVE_THRESHOLD - 1_000,
             )
+            end = rng.randint(start, min(start + 500, _SIEVE_THRESHOLD))
+            assert primes_in_range(start, end) == sympy_primes(start, end)
+        assert primes._known_max == before_max
 
-    def test_fuzz_layer3_no_table(self) -> None:
-        # NO table; trial division
-        rng = Random(45)
+    def test_fuzz_layer3_trial(self) -> None:
+        rng = Random(0xD4)
+        # Random small ranges above _SIEVE_THRESHOLD — far-gap, cost well
+        # under the 30-second cap. Cache must not advance.
+        before_max = primes._known_max
         for _ in range(10):
-            start = rng.randint(_SIEVE_THRESHOLD + 1, _SIEVE_THRESHOLD + 100_000)
-            end = start + rng.randint(0, 100)
-            assert primes_in_range(start, end) == sympy_primes(start, end), (
-                f"Layer 3 mismatch at [{start}, {end}]"
-            )
+            start = rng.randint(_SIEVE_THRESHOLD + 1, 5_000_000)
+            end = start + rng.randint(1, 200)
+            assert primes_in_range(start, end) == sympy_primes(start, end)
+        assert primes._known_max == before_max

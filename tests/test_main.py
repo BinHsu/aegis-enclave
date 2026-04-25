@@ -23,7 +23,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import AsyncIterator
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import asyncio
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -287,3 +289,269 @@ class TestApplicationSurface:
         app.dependency_overrides.clear()
         # 200 if docs_url is enabled (it is in main.py — `docs_url="/docs"`).
         assert r.status_code == 200
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Three-layer timeout — compute layer (ADR-0020)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestComputeTimeoutGate:
+    """Layer 1 of three: 30s `asyncio.wait_for` around `primes_in_range`.
+
+    The compute layer protects against runaway primality work — either a
+    legitimate large query that the estimator under-counted, or a worst-case
+    cache state. On timeout, the endpoint maps `asyncio.TimeoutError` to
+    HTTP 504 with a detail string that names the seconds budget.
+    """
+
+    @pytest.mark.asyncio
+    async def test_compute_timeout_returns_504(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Patch `primes_in_range` to sleep beyond a shrunk compute budget.
+
+        Strategy: shrink `_COMPUTE_TIMEOUT_S` to 0.05s and replace
+        `primes_in_range` with a function that sleeps 0.5s on the worker
+        thread. `asyncio.wait_for` cancels the wait after the budget,
+        the endpoint catches `asyncio.TimeoutError`, and returns 504.
+        """
+        import time as _time
+
+        def _slow_primes(start: int, end: int) -> list[int]:
+            _time.sleep(0.5)
+            return []
+
+        monkeypatch.setattr("prime_service.main._COMPUTE_TIMEOUT_S", 0.05)
+        monkeypatch.setattr("prime_service.main.primes_in_range", _slow_primes)
+
+        session = AsyncMock()
+        async with await make_client(session) as ac:
+            r = await ac.post("/primes", json={"start": 2, "end": 10})
+        app.dependency_overrides.clear()
+
+        assert r.status_code == 504
+        detail = r.json()["detail"].lower()
+        assert "exceeded" in detail
+        # Detail must name the seconds budget — the int cast in main.py
+        # rounds 0.05 → 0, so we just confirm "s budget" framing is present.
+        assert "s budget" in detail or "second" in detail
+
+    @pytest.mark.asyncio
+    async def test_compute_within_budget_returns_200(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fast `primes_in_range` resolves well under the budget → 200."""
+
+        def _fast_primes(start: int, end: int) -> list[int]:
+            return [2, 3, 5, 7]
+
+        monkeypatch.setattr("prime_service.main.primes_in_range", _fast_primes)
+
+        session = AsyncMock()
+        session.flush = AsyncMock()
+
+        def capture_add(obj: Execution) -> None:
+            obj.id = 11
+
+        session.add = MagicMock(side_effect=capture_add)
+
+        async with await make_client(session) as ac:
+            r = await ac.post("/primes", json={"start": 2, "end": 10})
+        app.dependency_overrides.clear()
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["primes"] == [2, 3, 5, 7]
+        assert body["count"] == 4
+
+    @pytest.mark.asyncio
+    async def test_compute_timeout_via_wait_for_patch(self) -> None:
+        """Belt-and-braces: patch `asyncio.wait_for` itself to raise.
+
+        Ensures the 504 mapping does not depend on the slow-function trick —
+        if any future refactor swaps the cancellation mechanism, this still
+        catches the contract: TimeoutError from the compute wrap → 504.
+        """
+
+        async def _raise_timeout(*args: object, **kwargs: object) -> object:
+            raise asyncio.TimeoutError()
+
+        with patch("prime_service.main.asyncio.wait_for", side_effect=_raise_timeout):
+            session = AsyncMock()
+            async with await make_client(session) as ac:
+                r = await ac.post("/primes", json={"start": 2, "end": 10})
+            app.dependency_overrides.clear()
+
+        assert r.status_code == 504
+        assert "exceeded" in r.json()["detail"].lower()
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Pre-flight rejection — `_estimate_compute_ms` exceeds `_HARD_TIMEOUT_MS`
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestPreflightRejection:
+    """Pre-flight cost estimator — `_validate` rejects with ValueError when
+    the estimated compute cost exceeds the hard timeout. The endpoint maps
+    that to HTTP 400 (already wired for any ValueError from primes logic).
+    """
+
+    @pytest.mark.asyncio
+    async def test_estimated_too_expensive_returns_400(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Synthetic ValueError from `primes_in_range` → 400 with detail."""
+
+        msg = "estimated compute time 60000 ms exceeds 30000 ms ceiling"
+
+        def _reject(start: int, end: int) -> list[int]:
+            raise ValueError(msg)
+
+        monkeypatch.setattr("prime_service.main.primes_in_range", _reject)
+
+        session = AsyncMock()
+        async with await make_client(session) as ac:
+            r = await ac.post("/primes", json={"start": 2, "end": 10})
+        app.dependency_overrides.clear()
+
+        assert r.status_code == 400
+        assert "estimated compute time" in r.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_real_far_gap_layer3_query_rejected(self) -> None:
+        """End-to-end: a real far-gap query naturally trips the estimator.
+
+        With a freshly-reset cache (`_known_max == _INITIAL_PREWARM_BOUND`),
+        a `[2, 10_000_000]` range hits Layer 3 (trial division above the
+        sieve threshold) over ~10⁷ candidates. The estimator multiplies
+        `compute_range * sqrt(end) / 6 / 3000` → tens of millions of ms,
+        well past the 30 000 ms ceiling. `_validate` raises ValueError;
+        endpoint maps to 400.
+
+        Cache state matters: any prior test that extended `_known_max`
+        past ~10⁷ would make this query *cheap* (cache hit) and break the
+        test. We reset cache state explicitly to guarantee determinism.
+        """
+        # Manual reset — keeps the test self-contained without an autouse
+        # fixture that other tests in this module don't need.
+        from prime_service import primes as _primes_mod
+
+        with _primes_mod._cache_lock:
+            _primes_mod._known_primes = _primes_mod._build_prime_table(
+                _primes_mod._INITIAL_PREWARM_BOUND
+            )
+            _primes_mod._set_known_max(_primes_mod._INITIAL_PREWARM_BOUND)
+
+        session = AsyncMock()
+        async with await make_client(session) as ac:
+            r = await ac.post("/primes", json={"start": 2, "end": 10_000_000})
+        app.dependency_overrides.clear()
+
+        assert r.status_code == 400
+        detail = r.json()["detail"]
+        assert "estimated compute time" in detail
+        assert "ceiling" in detail
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Three-layer timeout — audit DB layer (ADR-0020)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestAuditTimeoutGate:
+    """Layer 2 of three: 10s `asyncio.wait_for` around `insert_execution`.
+
+    Audit DB writes that hang (slow write replica, network partition between
+    the enclave and Aurora, lock contention) must not strand the request on
+    the event loop. On timeout, 503 with detail `audit log write exceeded`.
+
+    The pre-existing `SQLAlchemyError → 503 'audit log unavailable'` path
+    is covered by `TestComputePrimesEndpoint.test_db_failure_returns_503` —
+    referenced here so the failure-mode picture stays whole.
+    """
+
+    @pytest.mark.asyncio
+    async def test_audit_timeout_returns_503(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Slow `insert_execution` past a shrunk audit budget → 503."""
+
+        async def _slow_insert(*args: object, **kwargs: object) -> int:
+            await asyncio.sleep(0.5)
+            return 1
+
+        monkeypatch.setattr("prime_service.main._AUDIT_TIMEOUT_S", 0.05)
+        monkeypatch.setattr("prime_service.main.insert_execution", _slow_insert)
+
+        session = AsyncMock()
+        async with await make_client(session) as ac:
+            r = await ac.post("/primes", json={"start": 2, "end": 10})
+        app.dependency_overrides.clear()
+
+        assert r.status_code == 503
+        detail = r.json()["detail"].lower()
+        assert "audit log write exceeded" in detail
+
+    @pytest.mark.asyncio
+    async def test_audit_sqlalchemy_error_still_503(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Preserve the existing failure mode: SQLAlchemyError → 503.
+
+        Distinct detail string from the timeout case ("audit log unavailable"
+        vs. "audit log write exceeded") so SREs can distinguish the two from
+        the response body alone.
+        """
+
+        async def _explode(*args: object, **kwargs: object) -> int:
+            raise SQLAlchemyError("audit log failed")
+
+        monkeypatch.setattr("prime_service.main.insert_execution", _explode)
+
+        session = AsyncMock()
+        async with await make_client(session) as ac:
+            r = await ac.post("/primes", json={"start": 2, "end": 10})
+        app.dependency_overrides.clear()
+
+        assert r.status_code == 503
+        detail = r.json()["detail"].lower()
+        assert "audit log unavailable" in detail
+        assert "exceeded" not in detail
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Cache-state persistence (sanity — not a speed assertion)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestCacheStatePersistence:
+    """Two POSTs over the same range return identical primes.
+
+    This is a consistency check, not a performance assertion. We do not
+    inspect `_known_max` advancement or measure latency — only that the
+    public contract (the prime list) is stable across repeated calls.
+    """
+
+    @pytest.mark.asyncio
+    async def test_repeated_range_returns_identical_primes(self) -> None:
+        session = AsyncMock()
+        session.flush = AsyncMock()
+
+        ids = iter([100, 101])
+
+        def capture_add(obj: Execution) -> None:
+            obj.id = next(ids)
+
+        session.add = MagicMock(side_effect=capture_add)
+
+        async with await make_client(session) as ac:
+            r1 = await ac.post("/primes", json={"start": 2, "end": 50})
+            r2 = await ac.post("/primes", json={"start": 2, "end": 50})
+        app.dependency_overrides.clear()
+
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        assert r1.json()["primes"] == r2.json()["primes"]
+        assert r1.json()["count"] == r2.json()["count"]

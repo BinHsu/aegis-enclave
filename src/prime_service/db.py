@@ -61,6 +61,14 @@ engine = create_async_engine(
     settings.database_url,
     echo=False,
     pool_pre_ping=True,
+    # Per-statement timeout enforced at the asyncpg driver level (ADR-0020).
+    # Layer alongside the application-level asyncio.wait_for in main.py and
+    # the ALB idle_timeout in Terraform — three independent defences against
+    # an infinitely-blocking response path.
+    connect_args={
+        "command_timeout": 10,
+        "timeout": 10,  # connection-establish timeout
+    },
 )
 
 async_session_maker = async_sessionmaker(
