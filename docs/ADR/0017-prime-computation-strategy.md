@@ -1,7 +1,7 @@
 # ADR-0017: Layered prime-generation strategy with tuple-stored cache and sympy-as-oracle differential tests
 
 ## Status
-Accepted (2026-04-25)
+Accepted (2026-04-25). **Partially superseded by ADR-0020** (the unified monotonic cache replaces the immutable-tuple `_PRIME_TABLE` posture; lock-protected mutability is required for monotonic cache extension. The other decisions in ADR-0017 — layered strategy, sympy as test oracle — remain in force).
 
 ## Context
 The case-study brief's Task 1 specifies "your own implementation" of a prime-number generator with bounded inputs. Three orthogonal concerns shaped the implementation in `src/prime_service/primes.py`:

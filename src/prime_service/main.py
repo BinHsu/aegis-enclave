@@ -7,6 +7,7 @@ production (per ADR-0006). No direct host-port exposure.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -16,6 +17,13 @@ import structlog
 from fastapi import Depends, FastAPI, HTTPException, status
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+
+# Three-layer timeout defense (ADR-0020):
+#   compute   — asyncio.wait_for around primes_in_range, 30s
+#   audit DB  — asyncio.wait_for around insert_execution, 10s
+#   ALB idle  — Terraform sets idle_timeout = 45s (above app + slack)
+_COMPUTE_TIMEOUT_S = 30.0
+_AUDIT_TIMEOUT_S = 10.0
 
 from prime_service import __version__
 from prime_service.db import get_session, get_execution, health_check, insert_execution
@@ -77,19 +85,46 @@ async def compute_primes(
 ) -> PrimeRangeResponse:
     started = time.perf_counter()
     try:
-        primes = primes_in_range(req.start, req.end)
+        # primes_in_range is CPU-bound + holds an internal threading.Lock during
+        # cache extension — run in the default asyncio thread pool so the event
+        # loop stays responsive, and wrap with wait_for to enforce the 30s budget.
+        primes = await asyncio.wait_for(
+            asyncio.to_thread(primes_in_range, req.start, req.end),
+            timeout=_COMPUTE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError as exc:
+        log.warning(
+            "compute_timeout",
+            start=req.start,
+            end=req.end,
+            timeout_s=_COMPUTE_TIMEOUT_S,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=f"computation exceeded {int(_COMPUTE_TIMEOUT_S)}s budget",
+        ) from exc
     except ValueError as exc:
+        # Includes pre-flight reject when _estimate_compute_ms exceeds budget.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     duration_ms = int((time.perf_counter() - started) * 1000)
 
     try:
-        execution_id = await insert_execution(
-            session,
-            range_start=req.start,
-            range_end=req.end,
-            primes=primes,
-            duration_ms=duration_ms,
+        execution_id = await asyncio.wait_for(
+            insert_execution(
+                session,
+                range_start=req.start,
+                range_end=req.end,
+                primes=primes,
+                duration_ms=duration_ms,
+            ),
+            timeout=_AUDIT_TIMEOUT_S,
         )
+    except asyncio.TimeoutError as exc:
+        log.error("audit_write_timeout", timeout_s=_AUDIT_TIMEOUT_S)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"audit log write exceeded {int(_AUDIT_TIMEOUT_S)}s",
+        ) from exc
     except SQLAlchemyError as exc:
         log.error("insert_execution_failed", error=str(exc))
         raise HTTPException(
