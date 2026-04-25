@@ -305,8 +305,41 @@ def _trial_division_with_known(start: int, end: int, small_primes: list[int]) ->
     return [n for n in range(start, end + 1) if _is_prime_with_known(n, small_primes)]
 
 
+# ─── Legacy reference implementations ─────────────────────────────────────
+# The three functions below (`_sieve_eratosthenes`, `_trial_division_6k`,
+# `_is_prime_6k`) are NOT called from the production runtime path. The
+# active compute paths are `_segmented_sieve`, `_is_prime_with_known`, and
+# `_trial_division_with_known` (see `_compute` above).
+#
+# They are retained deliberately for three reasons:
+#   1. Cross-validation. `tests/test_primes.py` runs three-way differential
+#      tests on every BVA point: the cache-leveraging path, these legacy
+#      functions, and the `sympy` oracle must all agree. Removing the
+#      legacy functions would collapse three-way differential coverage to
+#      two-way, weakening confidence in the new paths.
+#   2. ADR-0017 historical record. The 6k±1 path was the original
+#      production strategy; ADR-0017 documents it as the "trade-off lever"
+#      we considered. Keeping the implementation in tree means the ADR
+#      remains anchored to runnable code.
+#   3. Fallback baseline. If `_RANGE_CEILING` is ever raised above
+#      `_INITIAL_PREWARM_BOUND²` (i.e., 10¹⁰), `_known_primes` would no
+#      longer always cover sqrt(end), and the cache-leveraging paths
+#      would need an extension step. The 6k±1 path is correct without
+#      that precondition and would be the safe baseline.
+#
+# See ADR-0021 § Alternatives Considered for the full rationale.
+# Future contributors: do NOT delete these as "dead code" — the test
+# suite depends on them. If you do remove them, downgrade the differential
+# tests in `tests/test_primes.py` to two-way (new path vs sympy) and
+# document the rationale in a follow-up ADR.
+
+
 def _sieve_eratosthenes(upper: int, start: int) -> Iterator[int]:
-    """Sieve of Eratosthenes up to `upper`, yielding primes >= start."""
+    """Sieve of Eratosthenes up to `upper`, yielding primes >= start.
+
+    LEGACY REFERENCE — not called from production runtime. See the
+    section header above and ADR-0021 § Alternatives Considered.
+    """
     is_prime = bytearray([1]) * (upper + 1)
     is_prime[0] = 0
     is_prime[1] = 0
@@ -324,14 +357,22 @@ def _sieve_eratosthenes(upper: int, start: int) -> Iterator[int]:
 
 
 def _trial_division_6k(start: int, end: int) -> Iterator[int]:
-    """Trial division using 6k±1 candidate generation, no sieve allocation."""
+    """Trial division using 6k±1 candidate generation, no sieve allocation.
+
+    LEGACY REFERENCE — not called from production runtime. See the
+    section header above and ADR-0021 § Alternatives Considered.
+    """
     for n in range(start, end + 1):
         if _is_prime_6k(n):
             yield n
 
 
 def _is_prime_6k(n: int) -> bool:
-    """Check primality using 6k±1: every prime > 3 has form 6k-1 or 6k+1."""
+    """Check primality using 6k±1: every prime > 3 has form 6k-1 or 6k+1.
+
+    LEGACY REFERENCE — not called from production runtime. See the
+    section header above and ADR-0021 § Alternatives Considered.
+    """
     if n < 2:
         return False
     if n < 4:  # 2, 3
