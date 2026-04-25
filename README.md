@@ -73,7 +73,7 @@ Files marked **gitignored** in [CLAUDE.md § 2](CLAUDE.md#2-files-and-their-role
 
 **Three-axis hygiene at a glance:**
 - **GitOps** — `Makefile` declares all ops targets (`make help`); Terraform is the cloud's git-as-truth (community modules in `terraform/`)
-- **DevSecOps** — `SECURITY.md` (disclosure), `.pre-commit-config.yaml` (gitleaks + ruff + terraform fmt), `.github/dependabot.yml` (weekly automated updates), capability gates for AI agents in [`CLAUDE.md` § 7](CLAUDE.md#7-capability-gates-for-ai-agent-driven-work)
+- **DevSecOps** — `SECURITY.md` (disclosure), `.pre-commit-config.yaml` (gitleaks + ruff + terraform fmt at commit-time, full pytest gate at pre-push), `.github/workflows/ci.yml` (lint + pytest on every push and PR), `.github/dependabot.yml` (weekly automated updates), capability gates for AI agents in [`CLAUDE.md` § 7](CLAUDE.md#7-capability-gates-for-ai-agent-driven-work)
 - **FinOps** — `terraform/main.tf` provider block declares `default_tags` (Project / Environment / CostCenter / Owner) for cost attribution; cost analysis recorded in [ADR-0006](docs/ADR/0006-vpn-three-tier-story.md) and [ADR-0015](docs/ADR/0015-no-k8s-no-real-apply.md)
 
 ---
@@ -126,11 +126,21 @@ docker compose run --rm test-client ./smoke.sh
 For full local development (with linting + tests):
 
 ```bash
-uv sync --dev          # or: pip install -e '.[dev]'
+uv sync --dev               # or: pip install -e '.[dev]'
+make pre-commit-install     # installs commit-time + pre-push hooks (one-off)
 ruff check src tests
 mypy src
 pytest -v
 ```
+
+`make pre-commit-install` wires up two stages:
+
+| Stage | Hooks | When |
+|---|---|---|
+| **commit-time** | gitleaks (secret scan) + ruff (lint + format) + terraform fmt/validate | every `git commit` |
+| **pre-push** | full `pytest` suite via `make test-ci` | every `git push` |
+
+The pre-push pytest gate mirrors the `.github/workflows/ci.yml` GitHub Actions check — red tests are caught locally before they hit the remote, and the same gate guards the `main` branch on the server side.
 
 ---
 

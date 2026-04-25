@@ -1,0 +1,64 @@
+# CI — lint + typecheck + full pytest suite on every push and PR.
+#
+# Why this exists: pre-commit hooks run gitleaks + ruff + terraform_fmt
+# but NOT pytest (designed to keep commits fast). The pre-push hook
+# (.pre-commit-config.yaml, stages: [pre-push]) catches the local case;
+# this workflow is the remote-side mirror — what reviewers see on the
+# PR / commit status.
+#
+# Runs against Python 3.12 (matches `requires-python` in pyproject.toml
+# and ruff's `target-version`). Bump in lockstep with the project floor.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs of the same ref when a new commit lands —
+# avoids burning minutes on stale builds.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: ruff check
+        run: ruff check src tests
+
+      - name: ruff format --check
+        run: ruff format --check src tests
+
+  test:
+    name: Test (pytest, full suite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Run pytest
+        run: pytest tests/ -q --tb=short
