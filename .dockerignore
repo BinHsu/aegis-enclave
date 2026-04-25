@@ -21,10 +21,12 @@ cover_note.md
 .leakguard
 docs/
 terraform/
-README.md
 CLAUDE.md
 SECURITY.md
 Makefile
 .pre-commit-config.yaml
 tests/
 *.md
+# README.md is required for pyproject.toml `readme = "README.md"` field —
+# whitelist it back after the *.md exclusion above.
+!README.md
