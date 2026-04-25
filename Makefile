@@ -105,6 +105,18 @@ tf-fmt: ## Recursively format Terraform code
 tf-validate: tf-init ## Validate Terraform configuration
 	cd terraform && terraform validate
 
+.PHONY: tf-apply
+tf-apply: ## OPERATOR USE ONLY — apply Terraform via scripts/ts_apply.sh (see docs/production_adoption.md)
+	@./scripts/ts_apply.sh
+
+.PHONY: tf-destroy
+tf-destroy: ## OPERATOR USE ONLY — destroy Terraform via scripts/ts_teardown.sh (irreversible)
+	@./scripts/ts_teardown.sh
+
+.PHONY: tf-apply-plan-only
+tf-apply-plan-only: ## OPERATOR USE — run all pre-flight checks then plan; no apply
+	@./scripts/ts_apply.sh --plan-only
+
 # ---------------------------------------------------------------------------
 # Hygiene
 # ---------------------------------------------------------------------------
