@@ -84,3 +84,4 @@ node_modules/
 # Logs
 *.log
 logs/
+.venv-test/

@@ -86,6 +86,8 @@ def _build_prime_table(bound: int) -> list[int]:
     Used both at module load (for the pre-warm) and (in tests) to construct
     expected oracle values when sympy is not available.
     """
+    if bound < 2:
+        return []
     is_prime = bytearray([1]) * (bound + 1)
     is_prime[0] = 0
     is_prime[1] = 0
