@@ -20,7 +20,7 @@ COPY src/ ./src/
 
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --upgrade pip \
-    && /opt/venv/bin/pip install -e .
+    && /opt/venv/bin/pip install .
 
 # ─── Runtime stage ──────────────────────────────────────────────────────────
 FROM python:${PYTHON_VERSION}-slim AS runtime
@@ -39,7 +39,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
-COPY --from=builder /build/src /app/src
 WORKDIR /app
 
 USER app
