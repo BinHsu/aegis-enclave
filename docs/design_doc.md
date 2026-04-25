@@ -56,7 +56,7 @@ The following operations layers are deliberately deferred under ADR-0003 and ADR
 - **Multi-environment promotion** — single `environment = "dev"` only; no dev → staging → prod gating
 - **SLA / OLA** — explicitly out of scope (ADR-0008); no external contractual surface, no team structure to bind
 
-If the buyer requests any of these as follow-up work, the existing ADRs become the input to that conversation — the omissions are scoped, not surprise.
+If the buyer requests any of these as follow-up work, the existing ADRs become the input to that conversation — the omissions are scoped, not surprise. The observability deferral specifically has a designed-but-not-implemented architectural story — see § 3 (Observability posture) below.
 
 ## 2. VPN architecture
 
@@ -102,7 +102,93 @@ The reasoning is the same shape as the K8s decision in ADR-0015 and the VPN deci
 
 The principle is captured in ADR-0018 (managed-default tool selection) — pick the simplest primitive that meets the requirement, upgrade only when scale, sovereignty, or capability gaps demand it. NAT was the wrong default for this workload because the workload has no public-internet egress requirement.
 
-## 3. Where to read next
+## 3. Observability posture
+
+Observability is named in § 1.3 as deliberately out of scope: no Prometheus, no Grafana, no Loki, no centralised collector, no APM, no OpenTelemetry. That is the **scope** statement, not the **architecture** statement. The architecture statement — what the deployed system already emits, what it cannot answer with that emission alone, and what the upgrade path looks like — is below.
+
+This section is also the **evidence-capture spec for Phase 2.3**: the table in § 3.1 is what gets screenshotted into `docs/deployment_guide.md` while the cloud-acceptance window is live, before teardown.
+
+### 3.1 What the cloud composition emits for free
+
+Every primitive in the Terraform composition publishes a baseline of CloudWatch metrics and structured logs without additional code. This is the observability surface available the moment a real `terraform apply` lands:
+
+| Source | Metrics | Logs |
+|---|---|---|
+| Internal ALB | `RequestCount`, `HTTPCode_Target_{2,3,4,5}XX_Count`, `TargetResponseTime` (p50 / p90 / p99 built-in), `HealthyHostCount`, `UnHealthyHostCount` | Access logs to S3 (per request: client IP, path, response code, latency, target group) |
+| ECS Fargate task | `CPUUtilization`, `MemoryUtilization`, container exit codes | stdout / stderr → CloudWatch Logs via `awslogs` driver (FastAPI's structured logging lands here intact) |
+| RDS PostgreSQL Multi-AZ | `CPUUtilization`, `DatabaseConnections`, `FreeableMemory`, `ReadIOPS` / `WriteIOPS`, `ReplicaLag` | PostgreSQL log + slow-query log → CloudWatch Logs |
+| AWS Client VPN endpoint | `ActiveConnectionsCount`, `AuthenticationFailures`, `IngressBytes`, `EgressBytes` | Connection log: client cert CN, source IP, connect / disconnect timestamps |
+| VPC Flow Logs | (per-flow records) | All NIC-to-NIC traffic, including PrivateLink endpoint hits |
+
+Phase 2.3's cloud-acceptance gate consumes this baseline by combining four evidence sources, captured before the stack is destroyed:
+
+1. **Aggregate metric dashboards** — ALB `RequestCount` / `TargetResponseTime` / 5xx, ECS task CPU / memory, RDS CPU / connections, Client VPN active connections. One screenshot per dashboard captures system-level health.
+2. **Per-endpoint round-trip** — manual `curl` invocations against `/health`, `POST /primes`, and `GET /executions/{id}` with request and response bodies recorded. This is the per-endpoint correctness signal.
+3. **ALB access log lines** — pulled from S3 (or queried via Athena) for the `curl` timestamps. Each line carries the endpoint path, response code, latency, and target instance, providing the audit trail per request.
+4. **ECS CloudWatch Log entries** — corresponding FastAPI structured log lines for the same requests, providing the application-side view (DB query attempts, internal state, error context if any).
+
+Together these four sources tell a per-endpoint correctness story without needing target-group splitting or application-side custom metrics. **No application-side instrumentation is written for the case-study deliverable** — the baseline plus the curl-and-log pattern is sufficient to demonstrate that the deployment is reachable, the security boundary holds, and the prime-computation path executes end-to-end.
+
+### 3.2 What the baseline cannot answer
+
+The ALB metrics aggregate across endpoints. For aegis-enclave specifically — three endpoints with very different latency profiles (`GET /health` < 1 ms, `POST /primes` up to hundreds of ms, `GET /executions/{id}` ~10 ms) — that aggregation hides the signals that operating the system day-to-day would need:
+
+- **Per-endpoint latency.** A p99 spike on the ALB cannot tell whether `POST /primes` is degrading (expected under load) or `GET /health` is degrading (unexpected, likely a DB-connection or service-health canary). Mixed into one statistic, the smaller endpoint's signal is dominated and effectively invisible.
+- **Per-endpoint error rate.** A 5xx burst on `POST /primes` (e.g., a bad input range escaping validation) reads identically to a 5xx burst on `GET /executions/{id}` (e.g., DB unavailability). The remediation paths differ.
+- **Business-level dimensions.** Latency as a function of the requested range size (the dominant performance variable for `POST /primes`), cache hit vs miss for the prime-cache code path (ADR-0021), or per-tenant call patterns if multi-tenancy enters scope — none of these are visible from the ALB.
+- **Internal subsystem timing.** DB query duration, cache lookup duration, and computation time are a single black box from the ALB's perspective. Slow queries surface in the RDS slow-query log, but the linkage back to the API request that issued them is not.
+
+The gap is between **infrastructure observability** (already free) and **application observability** (requires a decision).
+
+### 3.3 When scope opens — the upgrade path
+
+The recommended primary upgrade is **CloudWatch Embedded Metric Format (EMF)** middleware, not `cloudwatch:PutMetricData` API calls. EMF works by writing a structured JSON log line per request:
+
+```json
+{
+  "_aws": {
+    "Timestamp": 1734085200000,
+    "CloudWatchMetrics": [{
+      "Namespace": "aegis-enclave/api",
+      "Dimensions": [["endpoint", "method", "status_class"]],
+      "Metrics": [
+        {"Name": "LatencyMs", "Unit": "Milliseconds"},
+        {"Name": "RequestCount", "Unit": "Count"}
+      ]
+    }]
+  },
+  "endpoint": "/primes", "method": "POST", "status_class": "2xx",
+  "LatencyMs": 12, "RequestCount": 1
+}
+```
+
+The ECS Fargate `awslogs` driver already ships every stdout line to CloudWatch Logs; the Logs Agent recognises the `_aws` envelope and extracts the metrics into the named namespace automatically. The application makes **zero synchronous API calls** for metric emission, and the metric extraction is included in the log-ingestion price — there is no per-metric `PutMetricData` charge. Latency overhead is bounded by JSON-serialisation cost; `cloudwatch:PutMetricData` would be a 5-50 ms synchronous network call per request, dominating `GET /health` and `GET /executions/{id}`, which is why that path is rejected.
+
+The metrics emitted follow the **RED method**:
+
+| Metric | Dimensions | Question answered |
+|---|---|---|
+| `RequestCount` | endpoint, method, status_class | Per-endpoint RPS and error rate |
+| `LatencyMs` | endpoint, method | Per-endpoint p50 / p95 / p99 |
+| `ErrorCount` | endpoint, error_class | 5xx breakdown for root-cause routing |
+
+`status_class` is bucketed into `2xx / 3xx / 4xx / 5xx` rather than carrying every distinct status code. CloudWatch metrics bill per unique dimension combination; `principal` / `user_id` / full path are common cardinality bombs deliberately excluded from this design. If per-tenant slicing is ever required, it lands as a sampled counter in a separate namespace (`aegis-enclave/business`) with bucketing rules of its own.
+
+**Target-group splitting** (routing `/health` to one target group, `/primes` and `/executions/{id}` to others) is a routing-side variant that gets per-endpoint metrics out of ALB without application code. At three endpoints it is workable; at thirty it becomes a Listener Rule maintenance burden that scales worse than EMF. The design treats it as a **sister option to EMF** evaluated together when scope opens, not a separate intermediate step — splitting target groups before any application instrumentation exists is using infrastructure to compensate for a deferred decision rather than implementing the decision. When the scope decision lands, the right pair (EMF only / EMF + TG split / TG split only) falls out of the endpoint count and dimension-richness needs at that moment.
+
+The Python implementation of the EMF middleware is a single ASGI middleware over FastAPI using the `aws-embedded-metrics` library — roughly 30 lines including the bucketing helper. A new ADR records the choice and trade-offs at the time of implementation; today it is **a sketch, not a commitment**.
+
+### 3.4 Beyond — APM and distributed tracing
+
+OpenTelemetry collectors, AWS X-Ray, Datadog APM, and similar managed APM services give request-level distributed traces. Traces subsume per-endpoint metrics and add internal-subsystem timing (DB query spans, cache spans, downstream-call spans), which is the next gap after EMF closes the per-endpoint visibility one. The cost profile shifts from per-metric to per-trace, which can be substantial under sustained high RPS, and the operational burden is a vendor relationship rather than infrastructure code. APM is the right answer at a different scope — larger team, multi-service estate, sustained high RPS, established platform-engineering function. For one service with three endpoints it is over-built.
+
+The migration runbook (`docs/migration_runbook.md`) is the right place to record an APM addition when the workload structure justifies it: the runbook's spec format already accommodates third-party SDK additions and credential bootstrap as standard step shapes.
+
+### 3.5 Calibration recap
+
+The architecture above mirrors the calibration shape in § 1.3: name the architecture, scope the implementation, leave deferred work as designed sketches rather than absent ones. Phase 2.3 ships the infrastructure-observability layer that AWS managed services emit by default; the application-observability sketch above gives the buyer enough design clarity to scope the upgrade conversation when (or if) the workload justifies it.
+
+## 4. Where to read next
 
 - **Smoke test** — [`README.md` § Initial Acceptance](../README.md#initial-acceptance-smoke-test). Five paste-and-run commands, two minutes, pass/fail visible without the candidate present.
 - **Cloud deployment walkthrough** — [`docs/deployment_guide.md`](deployment_guide.md). Architecture diagram, component table, network flow, plan-only Terraform usage.
