@@ -173,23 +173,36 @@ This repo's migration runbook is designed for AI-agent execution. The same gatin
 
 When adding new functionality:
 
-1. **Test first.** Write the test (or at least the test stub with assertions) before the implementation.
-2. Run the test → red (failing).
-3. Implement just enough to make it green.
-4. Refactor.
-5. Commit test + implementation together.
+1. **Identify boundaries first.** List every numeric / structural / ordering threshold the new function must respect (field min/max, range invariants, type discriminators, list-size limits). This list **drives** the tests.
+2. **Test first — and the tests MUST follow Boundary Value Analysis (BVA).** For every boundary `B` identified in step 1, the test suite must include explicit cases at `B-1`, `B`, and `B+1`. No boundary may be tested with a single point. This is non-negotiable: a function that "passes tests" without BVA is not adequately verified — off-by-one bugs are a class, not a one-off.
+3. Run the tests → red (failing — implementation doesn't exist yet).
+4. Implement just enough to turn the BVA suite green.
+5. Refactor with tests as the safety net.
+6. Commit test + implementation together.
 
 When modifying an existing function:
 
 - **Update the corresponding test in the same commit as the implementation change.** A commit that touches `src/prime_service/foo.py` without touching `tests/test_foo.py` is a regression against this rule.
-- If the change is a pure refactor (no behaviour change), the existing test must still pass. If the test needs adjustment, the behaviour changed — re-derive the test from the new contract first.
+- If the boundary set changes (e.g., a new threshold is introduced or an old one shifts), the BVA cases for the new/shifted boundary go in **first**, then the implementation follows.
+- If the change is a pure refactor (no behaviour change), the existing test (BVA included) must still pass. If a BVA case needs adjustment, the behaviour changed — re-derive the test from the new contract first.
 - If a function is removed, its tests are removed in the same commit.
 
-### Coverage expectation
+### Mandatory BVA coverage (non-negotiable)
+
+Every test class targeting a function with numeric or structural thresholds must include explicit `B-1` / `B` / `B+1` parametrised assertions for **every** threshold. The discipline applies regardless of whether the test path goes through a "happy" or "error" branch — boundaries cut across both. Examples present in this repo as canonical references:
+
+- `tests/test_primes.py`: BVA at `_TABLE_BOUND`, `_SIEVE_THRESHOLD`, `_RANGE_CEILING` — each at `-1` / boundary / `+1`. Plus internal-branch boundaries (n<2, n<4, %2, %3) on `_is_prime_6k`.
+- `tests/test_schemas.py`: BVA at `start>=2`, `end>=2`, `start<=end`, range-size ceiling — each at three points.
+- `tests/test_main.py`: validation matrix exercising every Pydantic boundary by HTTP request → 422 mapping.
+
+A new test file that lacks `B-1` / `B` / `B+1` triplets at every threshold is **incomplete** — return it for revision before merging.
+
+### Other coverage expectations
 
 - **Branch coverage** ≥ 95 % on `src/` per `make test-cov` (configured in `pyproject.toml`).
-- **Boundary value analysis** at every numeric / structural threshold — three points per boundary (`B-1`, `B`, `B+1`).
 - **Differential testing** against a trusted oracle when one exists (e.g. `sympy` for prime correctness — see ADR-0017). The brief's "implementation should be yours" rule scopes the implementation, not test oracles.
+- **Equivalence partitioning** alongside BVA — for each input class (negative / zero / positive / out-of-type / missing), at least one representative test.
+- **Deterministic-seed fuzz** for layered or layered-cache code paths — random ranges seeded so failures are reproducible (see `TestPrimesInRangeFuzz`).
 
 ### What "needs a test" by file kind
 
