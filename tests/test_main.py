@@ -80,9 +80,9 @@ class TestHealthEndpoint:
     @pytest.mark.asyncio
     async def test_ok_when_db_reachable(self) -> None:
         session = AsyncMock()
-        # health_check uses session.execute → result.scalar() == 1
+        # health_check uses session.execute → result.scalar_one() == 1
         result_obj = MagicMock()
-        result_obj.scalar.return_value = 1
+        result_obj.scalar_one.return_value = 1
         session.execute = AsyncMock(return_value=result_obj)
 
         async with await make_client(session) as ac:
@@ -165,7 +165,9 @@ class TestComputePrimesEndpoint:
     async def test_db_failure_returns_503(self) -> None:
         session = AsyncMock()
         session.add = MagicMock()
-        session.flush = AsyncMock(side_effect=SQLAlchemyError("audit log failed"))
+        # insert_execution path: session.add → session.commit → session.refresh.
+        # Failure injected at commit (the SQL round-trip).
+        session.commit = AsyncMock(side_effect=SQLAlchemyError("audit log failed"))
 
         async with await make_client(session) as ac:
             r = await ac.post("/primes", json={"start": 2, "end": 10})
@@ -229,7 +231,10 @@ class TestFetchExecutionEndpoint:
             duration_ms=5,
             created_at=datetime(2026, 4, 25, 12, 0, 0, tzinfo=timezone.utc),
         )
-        session.get = AsyncMock(return_value=row)
+        # get_execution uses session.execute(stmt) → result.scalar_one_or_none()
+        result_obj = MagicMock()
+        result_obj.scalar_one_or_none.return_value = row
+        session.execute = AsyncMock(return_value=result_obj)
 
         async with await make_client(session) as ac:
             r = await ac.get("/executions/42")
@@ -244,7 +249,10 @@ class TestFetchExecutionEndpoint:
     @pytest.mark.asyncio
     async def test_returns_404_when_not_found(self) -> None:
         session = AsyncMock()
-        session.get = AsyncMock(return_value=None)
+        # get_execution returns None when scalar_one_or_none has no row.
+        result_obj = MagicMock()
+        result_obj.scalar_one_or_none.return_value = None
+        session.execute = AsyncMock(return_value=result_obj)
 
         async with await make_client(session) as ac:
             r = await ac.get("/executions/99999")

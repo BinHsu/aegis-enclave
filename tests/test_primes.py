@@ -120,16 +120,32 @@ class TestValidate:
         with pytest.raises(ValueError, match="must be <= end"):
             _validate(1_000_000, 2)
 
-    # BVA at _RANGE_CEILING (range size = end - start)
-    def test_range_size_one_below_ceiling_accepted(self) -> None:
-        _validate(2, 2 + _RANGE_CEILING - 1)
-
-    def test_range_size_at_ceiling_accepted(self) -> None:
-        _validate(2, 2 + _RANGE_CEILING)
-
-    def test_range_size_one_above_ceiling_rejected(self) -> None:
+    # BVA at _RANGE_CEILING (range size = end - start).
+    #
+    # _validate runs checks in this order: start>=2 → start<=end → range size →
+    # cost estimate. The cost estimator (added in Phase 1.6 / ADR-0020) is
+    # strictly tighter than the range-size ceiling for any layer-3 query
+    # starting at 2: range = _RANGE_CEILING means end ≥ 10**7, which puts us
+    # in the trial-division path estimated at ~745s. So at the BVA points
+    # *below* and *at* the range ceiling, the cost check fires before the
+    # range check has anything to reject — the "accepted" partner of the
+    # BVA triple is no longer reachable from start=2.
+    def test_range_size_one_above_ceiling_rejected_by_range_first(self) -> None:
+        # range > ceiling → range check fires with "range size" message,
+        # never reaches the cost estimator.
         with pytest.raises(ValueError, match="range size"):
             _validate(2, 2 + _RANGE_CEILING + 1)
+
+    def test_range_size_at_ceiling_rejected_by_cost_first(self) -> None:
+        # range == ceiling → range check passes, cost estimator rejects
+        # with "estimated compute time" message.
+        with pytest.raises(ValueError, match="estimated compute time"):
+            _validate(2, 2 + _RANGE_CEILING)
+
+    def test_range_size_one_below_ceiling_rejected_by_cost_first(self) -> None:
+        # range == ceiling - 1 → same story, cost estimator bites.
+        with pytest.raises(ValueError, match="estimated compute time"):
+            _validate(2, 2 + _RANGE_CEILING - 1)
 
     # BVA at _HARD_TIMEOUT_MS — Layer 3 query whose estimated cost straddles
     # the hard cap. Construct the boundary by inverting the estimator:
@@ -183,7 +199,10 @@ class TestEstimateComputeMs:
 
     # Layer 2: end <= _SIEVE_THRESHOLD → max(50, end // 10_000)
     def test_layer2_below_threshold_scales_with_end(self) -> None:
-        # end = 500_000 → 50_000 ÷ 10_000 = 50
+        # ADR-0021 estimator is compute_range-based, not end-based.
+        # compute_start = known_max + 1 = 100_001 (start <= known_max + gap)
+        # compute_range = 500_000 - 100_001 + 1 = 399_900
+        # max(50, 399_900 // 10_000) = max(50, 39) = 50 (floor wins)
         assert _estimate_compute_ms(2, 500_000, _INITIAL_PREWARM_BOUND) == 50
 
     def test_layer2_floor_at_50(self) -> None:
@@ -191,15 +210,20 @@ class TestEstimateComputeMs:
         assert _estimate_compute_ms(2, _INITIAL_PREWARM_BOUND + 1, _INITIAL_PREWARM_BOUND) >= 50
 
     # BVA at _SIEVE_THRESHOLD: threshold-1, threshold, threshold+1
+    # Per ADR-0021, layer 2 cost is based on compute_range (end - compute_start + 1),
+    # not end. With start=2 and known_max=_INITIAL_PREWARM_BOUND (10**5),
+    # compute_start = known_max + 1 = 100_001.
     def test_sieve_threshold_minus_1(self) -> None:
         result = _estimate_compute_ms(2, _SIEVE_THRESHOLD - 1, _INITIAL_PREWARM_BOUND)
-        # Layer 2: max(50, (10**6 - 1) // 10_000) = max(50, 99) = 99
-        assert result == 99
+        # compute_range = (10**6 - 1) - 100_001 + 1 = 899_999
+        # max(50, 899_999 // 10_000) = max(50, 89) = 89
+        assert result == 89
 
     def test_sieve_threshold_exact(self) -> None:
         result = _estimate_compute_ms(2, _SIEVE_THRESHOLD, _INITIAL_PREWARM_BOUND)
-        # Layer 2: max(50, 10**6 // 10_000) = 100
-        assert result == 100
+        # compute_range = 10**6 - 100_001 + 1 = 900_000
+        # max(50, 900_000 // 10_000) = 90
+        assert result == 90
 
     def test_sieve_threshold_plus_1(self) -> None:
         # Crosses into Layer 3 (trial division) — different cost model.
