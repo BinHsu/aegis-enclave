@@ -601,6 +601,20 @@ resource "aws_security_group_rule" "worker_to_valkey" {
 # (InvalidPermission.Duplicate). If bootstrap ever needs its own SG, add a
 # separate aws_security_group.bootstrap and a corresponding rule.
 
+# Worker + cache_bootstrap need to reach RDS for schema migration (bootstrap)
+# and async result writes (worker). RDS SG only allows app SG by default;
+# extend it for worker SG. Single source for both worker and bootstrap since
+# they share aws_security_group.worker.
+resource "aws_security_group_rule" "worker_to_rds" {
+  type                     = "ingress"
+  from_port                = 5432
+  to_port                  = 5432
+  protocol                 = "tcp"
+  description              = "Worker + cache_bootstrap ECS tasks to RDS PostgreSQL 5432"
+  security_group_id        = module.rds_sg.security_group_id
+  source_security_group_id = aws_security_group.worker.id
+}
+
 resource "aws_elasticache_serverless_cache" "valkey" {
   engine = "valkey"
   name   = "aegis-enclave-valkey"

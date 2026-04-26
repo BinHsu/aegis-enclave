@@ -15,10 +15,28 @@ Strategy
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from prime_service.bootstrap import run_bootstrap
 from prime_service.cache import _BOOTSTRAP_END, _BOOTSTRAP_START
+
+
+@pytest.fixture(autouse=True)
+def _mock_ensure_schema() -> object:
+    """Patch out the async DB schema migration for all bootstrap tests.
+
+    `run_bootstrap` calls `asyncio.run(_ensure_schema())` before cache seeding.
+    Without this fixture, every test would try to connect to a real Postgres
+    (settings.database_url) and fail. Tests covering the schema migration
+    itself live in test_db.py / integration suite, not here.
+    """
+    with patch(
+        "prime_service.bootstrap._ensure_schema",
+        new=AsyncMock(return_value=None),
+    ):
+        yield
 
 # ───────────────────────────────────────────────────────────────────────────
 # Constants BVA
