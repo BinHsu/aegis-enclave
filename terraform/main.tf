@@ -191,7 +191,7 @@ module "rds" {
   identifier = "aegis-enclave-pg"
 
   engine               = "postgres"
-  engine_version       = "16.3"
+  engine_version       = "16.13"
   family               = "postgres16"
   major_engine_version = "16"
 
