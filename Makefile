@@ -167,6 +167,10 @@ cloud-smoke: ## Phase 2.5 cloud-side 6-step smoke (POST + poll + cache hit + 422
 cloud-evidence: ## Phase 2.5 evidence capture — CloudWatch metric widgets + worker/bootstrap logs + tf output
 	@./scripts/cloud-evidence.sh
 
+.PHONY: dlq-triage
+dlq-triage: ## Operator DLQ inspection + selective replay (per ADR-0038 — alarm + manual triage, not auto-retry)
+	@./scripts/dlq-triage.sh
+
 # ---------------------------------------------------------------------------
 # Supply-chain audit (rubric P1 — pip-audit; install via 'brew install pip-audit')
 # ---------------------------------------------------------------------------
