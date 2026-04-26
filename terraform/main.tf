@@ -117,6 +117,7 @@ locals {
     "ecs-agent",
     "ecs-telemetry",
     "sts",
+    "sqs",
   ])
 }
 
@@ -427,6 +428,25 @@ module "ecs" {
 
       subnet_ids         = module.vpc.private_subnets
       security_group_ids = [module.app_sg.security_group_id]
+
+      # App POSTs enqueue jobs to the primes queue. Worker has receive/delete
+      # perms (worker_inline policy) but app needs SendMessage. The community
+      # ecs/service module auto-creates the tasks IAM role; we extend it via
+      # tasks_iam_role_statements rather than detaching/recreating.
+      tasks_iam_role_statements = {
+        sqs_enqueue = {
+          actions = [
+            "sqs:SendMessage",
+            "sqs:GetQueueUrl",
+            "sqs:GetQueueAttributes",
+          ]
+          resources = [aws_sqs_queue.primes.arn]
+        }
+        secrets_manager_rds = {
+          actions   = ["secretsmanager:GetSecretValue"]
+          resources = [module.rds.db_instance_master_user_secret_arn]
+        }
+      }
     }
   }
 }
