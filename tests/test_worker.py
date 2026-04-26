@@ -409,9 +409,7 @@ class TestHandleMessageComputeErrors:
             return result
 
         with patch("prime_service.worker._run_async", side_effect=fake_run_async):
-            with patch(
-                "prime_service.worker.sieve_with_timeout", return_value=[2, 3, 5, 7]
-            ):
+            with patch("prime_service.worker.sieve_with_timeout", return_value=[2, 3, 5, 7]):
                 handle_message(msg, queue, cache)
 
         queue.ack.assert_called_once()

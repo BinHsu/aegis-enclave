@@ -256,9 +256,7 @@ class TestPutIfAbsent:
         members = fake_redis.zrange(_ZSET_KEY, 0, -1)
         assert len(members) >= 1
 
-    def test_zset_not_duplicated_on_absent_skip(
-        self, fake_redis: Any, cache: PrimeCache
-    ) -> None:
+    def test_zset_not_duplicated_on_absent_skip(self, fake_redis: Any, cache: PrimeCache) -> None:
         cache.put_if_absent(2, 100, [2, 3, 5, 7])
         cache.put_if_absent(2, 100, [2, 3, 5, 7])
         members = fake_redis.zrange(_ZSET_KEY, 0, -1)
@@ -385,9 +383,7 @@ class TestMergeOrPut:
 
     # ── A: No overlap ──────────────────────────────────────────────────────
 
-    def test_no_overlap_inserts_two_ranges(
-        self, fake_redis: Any, cache: PrimeCache
-    ) -> None:
+    def test_no_overlap_inserts_two_ranges(self, fake_redis: Any, cache: PrimeCache) -> None:
         p1 = [2, 3, 5, 7]
         p2 = [23, 29]
         cache.merge_or_put(2, 10, p1)
@@ -396,9 +392,7 @@ class TestMergeOrPut:
         assert cache.get(2, 10) == p1
         assert cache.get(20, 30) == p2
 
-    def test_no_overlap_two_members_in_zset(
-        self, fake_redis: Any, cache: PrimeCache
-    ) -> None:
+    def test_no_overlap_two_members_in_zset(self, fake_redis: Any, cache: PrimeCache) -> None:
         cache.merge_or_put(2, 10, [2, 3, 5, 7])
         cache.merge_or_put(20, 30, [23, 29])
         members = fake_redis.zrange(_ZSET_KEY, 0, -1)
@@ -412,9 +406,7 @@ class TestMergeOrPut:
 
     # ── B: Full subset ─────────────────────────────────────────────────────
 
-    def test_full_subset_existing_extends_to_superset(
-        self, cache: PrimeCache
-    ) -> None:
+    def test_full_subset_existing_extends_to_superset(self, cache: PrimeCache) -> None:
         large = _primes_from_2_to(100)
         small = [p for p in large if 10 <= p <= 50]
         cache.merge_or_put(2, 100, large)
@@ -423,9 +415,7 @@ class TestMergeOrPut:
         assert result[0] <= 2
         assert result[1] >= 100
 
-    def test_full_subset_merged_value_contains_all_primes(
-        self, cache: PrimeCache
-    ) -> None:
+    def test_full_subset_merged_value_contains_all_primes(self, cache: PrimeCache) -> None:
         large = _primes_from_2_to(100)
         small = [p for p in large if 10 <= p <= 50]
         cache.merge_or_put(2, 100, large)
@@ -457,9 +447,7 @@ class TestMergeOrPut:
 
     # ── C: Full superset ───────────────────────────────────────────────────
 
-    def test_full_superset_merges_into_new_range(
-        self, fake_redis: Any, cache: PrimeCache
-    ) -> None:
+    def test_full_superset_merges_into_new_range(self, fake_redis: Any, cache: PrimeCache) -> None:
         small = [11, 13, 17, 19]
         cache.merge_or_put(10, 20, small)
         large = _primes_from_2_to(100)
@@ -470,9 +458,7 @@ class TestMergeOrPut:
         # Merged entry at [2, 100] should exist
         assert cache.exists(2, 100)
 
-    def test_full_superset_result_contains_all_primes(
-        self, cache: PrimeCache
-    ) -> None:
+    def test_full_superset_result_contains_all_primes(self, cache: PrimeCache) -> None:
         small = [11, 13, 17, 19]
         cache.merge_or_put(10, 20, small)
         large = _primes_from_2_to(100)
@@ -503,9 +489,7 @@ class TestMergeOrPut:
         assert result[0] <= 2
         assert result[1] >= 20
 
-    def test_left_overlap_bva_new_start_one_below_existing_end(
-        self, cache: PrimeCache
-    ) -> None:
+    def test_left_overlap_bva_new_start_one_below_existing_end(self, cache: PrimeCache) -> None:
         # [2, 10] then new [9, 20] — overlap at 9 (B-1 relative to 10)
         p1 = _primes_from_2_to(10)
         p2 = [p for p in _primes_from_2_to(20) if p >= 9]
@@ -514,9 +498,7 @@ class TestMergeOrPut:
         assert result[0] <= 2
         assert result[1] >= 20
 
-    def test_left_overlap_bva_new_start_one_above_existing_end(
-        self, cache: PrimeCache
-    ) -> None:
+    def test_left_overlap_bva_new_start_one_above_existing_end(self, cache: PrimeCache) -> None:
         # [2, 10] then new [11, 20] — adjacent but NOT overlapping by value
         p1 = _primes_from_2_to(10)
         p2 = [p for p in _primes_from_2_to(20) if p >= 11]
@@ -539,9 +521,7 @@ class TestMergeOrPut:
         assert result[1] >= 20
 
     # BVA at right overlap: new end at existing start (B-1, B, B+1)
-    def test_right_overlap_bva_new_end_at_existing_start(
-        self, cache: PrimeCache
-    ) -> None:
+    def test_right_overlap_bva_new_end_at_existing_start(self, cache: PrimeCache) -> None:
         # Existing [10, 20], new [2, 10] → end==start overlap
         p1 = [p for p in _primes_from_2_to(20) if p >= 10]
         p2 = _primes_from_2_to(10)
@@ -551,9 +531,7 @@ class TestMergeOrPut:
         # → exists and candidate
         assert result[0] <= 2
 
-    def test_right_overlap_bva_new_end_one_below_existing_start(
-        self, cache: PrimeCache
-    ) -> None:
+    def test_right_overlap_bva_new_end_one_below_existing_start(self, cache: PrimeCache) -> None:
         # Existing [10, 20], new [2, 9] — no overlap (9 < 10)
         p1 = [p for p in _primes_from_2_to(20) if p >= 10]
         p2 = _primes_from_2_to(9)
@@ -563,9 +541,7 @@ class TestMergeOrPut:
         # 10 <= 9 is False → no overlap
         assert result == (2, 9)
 
-    def test_right_overlap_bva_new_end_one_above_existing_start(
-        self, cache: PrimeCache
-    ) -> None:
+    def test_right_overlap_bva_new_end_one_above_existing_start(self, cache: PrimeCache) -> None:
         # Existing [10, 20], new [2, 11] — overlaps at 11 (B+1 relative to 10)
         p1 = [p for p in _primes_from_2_to(20) if p >= 10]
         p2 = _primes_from_2_to(11)
@@ -637,9 +613,7 @@ class TestMergeOrPut:
 
     # ── Multiple overlapping ranges in ZSET ─────────────────────────────────
 
-    def test_merge_three_overlapping_ranges(
-        self, fake_redis: Any, cache: PrimeCache
-    ) -> None:
+    def test_merge_three_overlapping_ranges(self, fake_redis: Any, cache: PrimeCache) -> None:
         # Three overlapping ranges: [2,10], [8,20], [15,30]
         p1 = _primes_from_2_to(10)
         p2 = [p for p in _primes_from_2_to(20) if p >= 8]
@@ -680,9 +654,7 @@ class TestMergeOrPut:
 
     # ── TTL in merge ─────────────────────────────────────────────────────────
 
-    def test_merge_or_put_with_no_ttl(
-        self, fake_redis: Any, cache: PrimeCache
-    ) -> None:
+    def test_merge_or_put_with_no_ttl(self, fake_redis: Any, cache: PrimeCache) -> None:
         cache.merge_or_put(2, 10, [2, 3, 5, 7], ttl=0)
         val_key = _range_value_key(2, 10)
         ttl = fake_redis.ttl(val_key)
@@ -710,9 +682,7 @@ class TestLuaMergeRace:
     some ranges before the current call.
     """
 
-    def test_sequential_overlapping_merges_consistent(
-        self, cache: PrimeCache
-    ) -> None:
+    def test_sequential_overlapping_merges_consistent(self, cache: PrimeCache) -> None:
         from sympy import primerange
 
         # First merge: [2, 100]
@@ -743,9 +713,7 @@ class TestLuaMergeRace:
         result = cache.get_covering_slice(2, 100)
         assert result == primes
 
-    def test_merge_does_not_corrupt_non_overlapping_ranges(
-        self, cache: PrimeCache
-    ) -> None:
+    def test_merge_does_not_corrupt_non_overlapping_ranges(self, cache: PrimeCache) -> None:
         # Separate non-overlapping ranges — merge of one should not touch other
         p1 = _primes_from_2_to(10)
         p2 = [p for p in _primes_from_2_to(30) if p >= 20]
