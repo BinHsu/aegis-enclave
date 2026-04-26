@@ -88,7 +88,7 @@ module "vpc_endpoints_sg" {
   version = "~> 5.2"
 
   name        = "aegis-enclave-vpc-endpoints-sg"
-  description = "VPC Endpoint ENI inbound — HTTPS from within the VPC"
+  description = "VPC Endpoint ENI inbound - HTTPS from within the VPC"
   vpc_id      = module.vpc.vpc_id
 
   ingress_cidr_blocks = [var.vpc_cidr]
@@ -139,7 +139,7 @@ module "alb_sg" {
   version = "~> 5.2"
 
   name        = "aegis-enclave-alb-sg"
-  description = "Internal ALB — reachable only from VPC (Client VPN clients arrive via VPC routes)"
+  description = "Internal ALB - reachable only from VPC (Client VPN clients arrive via VPC routes)"
   vpc_id      = module.vpc.vpc_id
 
   ingress_cidr_blocks = [var.vpc_cidr]
@@ -152,7 +152,7 @@ module "app_sg" {
   version = "~> 5.2"
 
   name        = "aegis-enclave-app-sg"
-  description = "Application service — accept traffic only from internal ALB"
+  description = "Application service - accept traffic only from internal ALB"
   vpc_id      = module.vpc.vpc_id
 
   ingress_with_source_security_group_id = [{
@@ -170,7 +170,7 @@ module "rds_sg" {
   version = "~> 5.2"
 
   name        = "aegis-enclave-rds-sg"
-  description = "PostgreSQL — accept traffic only from app service"
+  description = "PostgreSQL - accept traffic only from app service"
   vpc_id      = module.vpc.vpc_id
 
   ingress_with_source_security_group_id = [{
@@ -456,7 +456,7 @@ module "ecs" {
 
 # ─── VPN (ADR-0006: AWS Client VPN endpoint primary, NetBird alternative) ──
 resource "aws_ec2_client_vpn_endpoint" "main" {
-  description            = "aegis-enclave Client VPN — operator + ground-station access"
+  description            = "aegis-enclave Client VPN - operator + ground-station access"
   server_certificate_arn = var.server_cert_arn
   client_cidr_block      = "10.20.0.0/16" # avoid VPC CIDR overlap
 
