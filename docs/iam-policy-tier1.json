@@ -1,0 +1,26 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PreflightAndValidation",
+      "Effect": "Allow",
+      "Action": [
+        "sts:GetCallerIdentity",
+        "ec2:DescribeRegions",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeClientVpnEndpoints",
+        "ec2:ExportClientVpnClientConfiguration",
+        "acm:ListCertificates",
+        "acm:DescribeCertificate",
+        "ecr:ListImages",
+        "ecr:GetAuthorizationToken",
+        "cloudwatch:GetMetricWidgetImage",
+        "logs:DescribeLogGroups",
+        "logs:FilterLogEvents",
+        "secretsmanager:ListSecrets",
+        "ce:GetCostAndUsage"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
