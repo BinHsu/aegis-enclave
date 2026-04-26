@@ -125,6 +125,22 @@ docker compose exec test-client ./smoke.sh        # preferred after `up -d`
 # docker compose run --rm test-client ./smoke.sh  # one-off container, also works
 ```
 
+## Prerequisites
+
+Before running this repo:
+
+- **Python 3.12+** (3.12 or 3.13 recommended; 3.14 supported)
+- **Docker** or compatible runtime (OrbStack on macOS recommended)
+- **Package manager** — pick one:
+  - `uv` (preferred): `curl -LsSf https://astral.sh/uv/install.sh | sh` or `brew install uv`
+  - or pip + venv: `python3.12 -m venv .venv && source .venv/bin/activate`
+
+For Phase 2.5 (cloud deploy / acceptance gate):
+
+- AWS CLI configured with credentials: `aws configure`
+- Terraform 1.6+ (`brew install terraform` on macOS)
+- AWS Client VPN client (Tunnelblick on macOS for `.ovpn` config)
+
 For full local development (with linting + tests):
 
 ```bash
