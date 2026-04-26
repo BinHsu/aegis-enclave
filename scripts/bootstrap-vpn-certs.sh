@@ -129,29 +129,42 @@ ok "pki dir: $PKI_DIR (chmod 700)"
 
 # ─── easy-rsa: init + build CA + server cert ─────────────────────────────────
 section "4/6 — easy-rsa PKI build"
+
+# Force easyrsa to write into OUR pki dir, not brew's default
+# /opt/homebrew/etc/easy-rsa/pki (which is what easy-rsa 3.x ships with on
+# macOS via brew). Without this, certs end up in shared system path → ACM
+# import line later can't find them. Per memory feedback_explicit_over_implicit.
+export EASYRSA_PKI="$PKI_DIR/pki"
+mkdir -p "$EASYRSA_PKI"
+info "EASYRSA_PKI=$EASYRSA_PKI (overrides brew default /opt/homebrew/etc/easy-rsa/pki)"
+
 cd "$PKI_DIR"
 
-if [[ ! -f "pki/ca.crt" ]]; then
+if [[ ! -f "$EASYRSA_PKI/ca.crt" ]]; then
     info "init-pki + build-ca (one-time)"
     $EASYRSA --batch init-pki >/dev/null
     $EASYRSA --batch --req-cn="aegis-enclave-ca" build-ca nopass >/dev/null
-    ok "CA built: pki/ca.crt"
+    [[ -f "$EASYRSA_PKI/ca.crt" ]] || fail "build-ca succeeded but ca.crt not found at $EASYRSA_PKI/ca.crt"
+    ok "CA built: $EASYRSA_PKI/ca.crt"
 
     info "build server cert (CN=server)"
     $EASYRSA --batch --san=DNS:server build-server-full server nopass >/dev/null
-    ok "server cert: pki/issued/server.crt"
+    [[ -f "$EASYRSA_PKI/issued/server.crt" ]] || fail "build-server-full ran but server.crt not found at $EASYRSA_PKI/issued/server.crt"
+    [[ -f "$EASYRSA_PKI/private/server.key" ]] || fail "build-server-full ran but server.key not found"
+    ok "server cert: $EASYRSA_PKI/issued/server.crt"
 else
     ok "CA + server cert already exist (re-using)"
 fi
 
 # Per-operator client certs (idempotent — easyrsa skips if cert exists)
 for OP in "${OPERATORS[@]}"; do
-    if [[ -f "pki/issued/$OP.crt" ]]; then
+    if [[ -f "$EASYRSA_PKI/issued/$OP.crt" ]]; then
         ok "client cert exists: $OP"
     else
         info "build client cert: $OP"
         $EASYRSA --batch build-client-full "$OP" nopass >/dev/null
-        ok "client cert: pki/issued/$OP.crt"
+        [[ -f "$EASYRSA_PKI/issued/$OP.crt" ]] || fail "build-client-full $OP ran but cert not found at $EASYRSA_PKI/issued/$OP.crt"
+        ok "client cert: $EASYRSA_PKI/issued/$OP.crt"
     fi
 done
 
