@@ -1,0 +1,44 @@
+# .leakguard — buyer-name / cycle-specific leak-guard patterns (gitignored).
+#
+# `make pre-push-check` reads this file (one regex per line) and greps every
+# diff commit between origin/main and HEAD for matches. Any match BLOCKS the
+# push so buyer-specific framing doesn't leak into committed history.
+#
+# To activate:
+#   1. Copy this file to .leakguard:    cp .leakguard.example .leakguard
+#   2. Edit .leakguard and replace the EXAMPLE entries below with the actual
+#      tokens you want to scan for (buyer / company / contact / domain names,
+#      product code names, internal program references, recipient email).
+#   3. Re-run `make pre-push-check` to confirm "clean".
+#
+# Format:
+#   - One regex per line (extended POSIX, used by `grep -iE`)
+#   - Lines starting with # are comments and ignored
+#   - Blank lines ignored
+#   - Case-insensitive (driven by grep -i in the Makefile target)
+#
+# Why this is gitignored (CLAUDE.md § 6):
+#   .leakguard contains buyer-specific tokens — committing it would leak the
+#   very names it's supposed to scan for. The .example template is committed
+#   to make first-fork setup discoverable; .leakguard itself never enters
+#   version control.
+#
+# ─── EXAMPLES (replace before activating) ────────────────────────────────
+#
+# # Buyer/recipient names (English + native script if applicable):
+# acme-corp
+# AcmeCorp
+# 株式会社エースミ
+#
+# # Recipient contacts:
+# john\.doe@acme\.com
+# Jane Doe
+#
+# # Product / program codes:
+# project-zephyr
+# AC-2026-Q2
+#
+# # Cycle-specific document filenames (avoid leaking via path quotes):
+# acme-corp_steps\.md
+EXAMPLE_BUYER_NAME
+example\.contact@example\.com

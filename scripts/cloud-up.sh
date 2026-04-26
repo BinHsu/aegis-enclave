@@ -53,11 +53,15 @@ echo "Terraform:   $TF_DIR"
 
 # ─── Pre-flight: tools ─────────────────────────────────────────────────────
 section "1/6 — Tool presence"
-command -v terraform >/dev/null 2>&1 || fail "terraform not found in PATH"
-command -v aws >/dev/null 2>&1       || fail "aws CLI not found in PATH"
-command -v docker >/dev/null 2>&1    || fail "docker not found in PATH"
-docker info >/dev/null 2>&1          || fail "docker daemon not running (start Docker Desktop?)"
-ok "terraform / aws / docker all present and ready"
+command -v terraform >/dev/null 2>&1 || fail "terraform not found in PATH (brew install terraform)"
+command -v aws >/dev/null 2>&1       || fail "aws CLI not found in PATH (brew install awscli)"
+command -v docker >/dev/null 2>&1    || fail "docker not found in PATH (install Docker Desktop or OrbStack)"
+docker info >/dev/null 2>&1          || fail "docker daemon not running (start Docker Desktop / OrbStack?)"
+# easy-rsa is required by scripts/bootstrap-vpn-certs.sh (called from phase 4
+# below). Pre-flight here so we fail fast in step 1, not 10 minutes into the
+# flow when bootstrap-vpn-certs.sh tries to invoke easyrsa and dies cryptically.
+command -v easyrsa >/dev/null 2>&1   || fail "easyrsa not found in PATH (brew install easy-rsa) — required by bootstrap-vpn-certs.sh"
+ok "terraform / aws / docker / easy-rsa all present and ready"
 
 # ─── Pre-flight: AWS authentication (source-agnostic; SSO recommended) ────
 # We don't care if the profile is SSO-configured or uses long-term creds —

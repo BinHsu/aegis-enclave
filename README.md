@@ -208,12 +208,14 @@ For Phase 2.5 (cloud deploy / acceptance gate):
 For full local development (with linting + tests):
 
 ```bash
-uv sync --dev               # or: pip install -e '.[dev]'
+make install                # auto-detects uv vs pip; honors uv.lock if present (hash-verified deps)
 make pre-commit-install     # installs commit-time + pre-push hooks (one-off)
-ruff check src tests
-mypy src
-pytest -v
+make lint                   # ruff check + format-check
+make typecheck              # mypy
+make test                   # pytest
 ```
+
+`make install` is self-bootstrapping: running `make test` / `make lint` / `make typecheck` for the first time will auto-call `make install` if no venv is detected. You don't need to run `make install` manually unless you prefer explicit control. With `uv` installed (`brew install uv`), `make install` uses `uv sync --locked --extra dev` for hash-verified reproducible builds; without `uv`, it falls back to `pip install -e '.[dev]'` (skips lock file).
 
 `make pre-commit-install` wires up two stages:
 
@@ -374,11 +376,18 @@ make cloud-up   # ~15-20 min; idempotent if cert-arns.auto.tfvars already exists
 make cloud-down
 # Collateral-free: only resources tagged owner=bin.hsu / managed by this terraform/ are touched.
 
-# Low-level / surgical alternatives (cloud-up + cloud-down call these internally):
+# Low-level / surgical alternatives (cloud-up + cloud-down call these internally —
+# DO NOT use these as your normal entry point. They skip pre-flight checks that
+# cloud-up runs and can leave partial state if invoked without their dependencies.
+# These exist for ops debugging / re-running a single phase after a cloud-up failure):
 #   make ts-bootstrap-certs OPERATOR=<name>  # VPN PKI provisioning only
 #   make tf-apply                            # surgical apply (skips cert + image push)
 #   make tf-destroy                          # surgical destroy (skips ECR drain + ACM cleanup)
-#   make tf-bootstrap                        # state backend (production adoption only — case-study uses local state)
+#   make tf-bootstrap                        # ⚠ PRODUCTION ADOPTION ONLY — provisions S3+DynamoDB
+#                                            #   remote state backend + GHA OIDC role.
+#                                            #   The case-study Phase 2.5 cycle uses LOCAL state
+#                                            #   (terraform init -backend=false) — do NOT run this
+#                                            #   target unless you are forking for production.
 ```
 
 #### Full operator walkthrough — what each step actually does

@@ -207,7 +207,13 @@ clean: ## Tear down stack and remove Python caches
 .PHONY: pre-push-check
 pre-push-check: ## Scan diff vs origin/main for buyer-name leaks (CLAUDE.md § 6)
 	@if [ ! -f .leakguard ]; then \
-	  echo "Missing .leakguard (gitignored). Create it with one regex pattern per line of buyer-specific tokens to scan for."; \
+	  echo "Missing .leakguard (gitignored — never committed)."; \
+	  echo ""; \
+	  echo "First-time setup:"; \
+	  echo "  cp .leakguard.example .leakguard"; \
+	  echo "  \$$EDITOR .leakguard            # replace EXAMPLE entries with your buyer-specific tokens"; \
+	  echo ""; \
+	  echo "See .leakguard.example for format + CLAUDE.md § 6 for the leak-guard rationale."; \
 	  exit 2; \
 	fi
 	@PATTERN=$$(grep -v '^[[:space:]]*#' .leakguard | grep -v '^[[:space:]]*$$' | tr '\n' '|' | sed 's/|$$//'); \
