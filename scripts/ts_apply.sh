@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # ts_apply.sh — operator-facing Terraform apply wrapper for aegis-enclave.
 #
-# This script is for OPERATOR PRODUCTION ADOPTION (see docs/production_adoption.md),
-# NOT for case-study operation. ADR-0015 explicitly defers `terraform apply` for
-# the case-study cycle — the deliverable is plan-only. Run this script only when
-# you have decided to adopt the composition into a real AWS environment.
+# This script is the low-level apply wrapper used by:
+#   - the Phase 2.5 case-study cloud-acceptance window (per ADR-0034 — bounded
+#     ≤ 3h apply-then-destroy with evidence capture; superseded ADR-0015's
+#     original plan-only stance)
+#   - operator production adoption (see docs/production_adoption.md)
+#
+# For the case-study window, prefer `make cloud-up` (orchestrates this script
+# plus VPN cert provisioning + ECR build/push). For surgical re-apply, call
+# this script directly.
 #
 # Pre-flight checks performed before any AWS API call:
 #   1. Bash + Terraform + AWS CLI installed

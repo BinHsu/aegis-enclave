@@ -5,10 +5,15 @@
 # Same pre-flight checks as apply, plus a stricter confirmation gate
 # (operator must type the literal word 'destroy', not just 'y' or 'yes').
 #
-# This script is for OPERATOR PRODUCTION ADOPTION (see docs/production_adoption.md),
-# NOT for case-study operation. ADR-0015 explicitly defers `terraform apply` /
-# `terraform destroy` for the case-study cycle — there is no real state to
-# tear down during the case-study deliverable.
+# This script is the low-level destroy wrapper used by:
+#   - the Phase 2.5 case-study cloud-acceptance window (per ADR-0034 — bounded
+#     ≤ 3h apply-then-destroy with evidence capture; superseded ADR-0015's
+#     original plan-only stance)
+#   - operator production adoption (see docs/production_adoption.md)
+#
+# For the case-study window, prefer `make cloud-down` (orchestrates this script
+# plus ECR drain + ACM cert cleanup + local pki/ wipe + collateral verify).
+# For surgical destroy of just terraform-managed resources, call this directly.
 #
 # Usage:
 #   ./scripts/ts_teardown.sh

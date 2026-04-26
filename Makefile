@@ -133,12 +133,20 @@ tf-validate: tf-init ## Validate Terraform configuration
 	cd terraform && terraform validate
 
 .PHONY: tf-apply
-tf-apply: ## OPERATOR USE ONLY — apply Terraform via scripts/ts_apply.sh (see docs/production_adoption.md)
+tf-apply: ## OPERATOR USE — apply Terraform via scripts/ts_apply.sh (low-level; prefer 'make cloud-up')
 	@./scripts/ts_apply.sh
 
 .PHONY: tf-destroy
-tf-destroy: ## OPERATOR USE ONLY — destroy Terraform via scripts/ts_teardown.sh (irreversible)
+tf-destroy: ## OPERATOR USE — destroy Terraform via scripts/ts_teardown.sh (low-level; prefer 'make cloud-down')
 	@./scripts/ts_teardown.sh
+
+.PHONY: cloud-up
+cloud-up: ## Phase 2.5 one-shot deploy — pre-flight + cert + ECR + image push + full apply
+	@./scripts/cloud-up.sh
+
+.PHONY: cloud-down
+cloud-down: ## Phase 2.5 one-shot teardown — drain ECR + destroy + ACM cleanup + collateral-free verify
+	@./scripts/cloud-down.sh
 
 .PHONY: tf-bootstrap
 tf-bootstrap: ## OPERATOR USE ONLY — provision Phase-2 prerequisites (state backend + GHA OIDC role)
