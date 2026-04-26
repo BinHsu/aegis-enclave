@@ -313,7 +313,10 @@ The distributed cache solves this by giving all workers a shared hit pool. The h
 
 ElastiCache Serverless Valkey (ADR-0031) is the cache backend. The full alternatives analysis is in ADR-0031; this section summarises the cost framing for the acceptance window.
 
-**Cost framing (3h apply-then-destroy):**
+**Cost framing — case-study Phase 2.5 (3h apply-then-destroy):**
+
+> The 3h framing in this comparison table is the case-study's cost-ceiling for evidence capture, NOT a design constraint. A forker chooses their own duration based on the per-hour rates in [`docs/deployment_guide.md` § Cost shape](deployment_guide.md#cost-shape) (also surfaced on the README front page).
+
 
 | Option | 3h window cost estimate | Notes |
 |---|---|---|
