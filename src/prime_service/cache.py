@@ -288,6 +288,33 @@ class PrimeCache:
         then checks if any of them has an end >= end.
 
         Returns (cached_start, cached_end) of the covering range, or None.
+
+        V2 opportunity (partial-hit read path, NOT implemented):
+            A request that is *partially* covered (e.g. [50_000, 150_000] when
+            cache has only bootstrap [1, 100_000]) currently returns None and
+            the worker re-computes the entire requested range. After compute,
+            the Lua merge_or_put coalesces the new write with the existing
+            bootstrap entry into [1, 150_000], so subsequent fully-covered
+            queries hit cache. The wasted work is the recomputation of the
+            already-cached overlap on the first miss. A V2 partial-hit
+            optimisation would: (a) detect partial coverage, (b) split the
+            request into cached_part + uncached_part, (c) compute only
+            uncached_part, (d) splice the two prime lists together, (e) merge.
+            Trade-off: query splitter + multiple Valkey GETs + result splice +
+            merge is non-trivial, while compute on a small uncached gap is
+            often <10ms — the optimisation pays off only for large gaps over
+            slow cache networks. Deferred until a real workload justifies it.
+
+        Iteration order trade-off (also V2):
+            Candidates are returned in ascending score (= ascending start). The
+            loop returns the *first* covering range, which is therefore the
+            range with the smallest start. When a query is covered by both the
+            bootstrap entry [1, 100_000] and a tighter user-driven entry, the
+            larger bootstrap entry is selected — pulling a 50KB JSON when a
+            <1KB tighter entry would have sufficed. Wall time impact is
+            sub-10ms over Valkey local network; storage transfer is the cost.
+            V2 fix: rank candidates by (m_end - m_start) ascending and return
+            the smallest covering range.
         """
         # Candidates: all ZSET members with score (start) <= start
         candidates: list[tuple[str, float]] = self._r.zrangebyscore(

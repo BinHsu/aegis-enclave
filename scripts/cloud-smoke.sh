@@ -11,12 +11,19 @@
 #   - jq installed (for response parsing)
 #
 # Steps:
-#   1. POST → assert 202 + execution_id
-#   2. Poll GET until status=done (30s timeout)
-#   3. Verify result length (25 primes in [2,100])
-#   4. Repeat → measure cache-hit latency
+#   1. POST [100_001, 200_000] → assert 202 + execution_id
+#      (deliberately OUTSIDE bootstrap pre-warm range [1, 100_000] so this
+#       request forces a true cache miss → compute → cache write)
+#   2. Poll GET until status=done (30s timeout); record ms-precision wall time
+#   3. Verify result length (8392 primes in [100_001, 200_000])
+#   4. Repeat SAME range → genuine cache-hit measurement
+#      (the prior step's compute populated [100_001, 200_000] in cache; this
+#       repeat round-trip should hit `find_covering` + slice without compute)
 #   5. Negative test: invalid range → 422
 #   6. Backpressure: N concurrent large requests → some 503
+#   7. Cross-check via worker CloudWatch logs: count `cache_hit` vs
+#      `compute_done` events from the last 5 minutes; expect ≥ 1 of each
+#      (step 1 must show as compute_done; step 4 must show as cache_hit)
 #
 # Exit codes:
 #   0 — 6/6 passed
@@ -44,6 +51,25 @@ TF_DIR="$REPO_ROOT/terraform"
 ENDPOINT_HOST="${ENDPOINT_HOST:-api.enclave.internal}"
 BACKPRESSURE_N="${BACKPRESSURE_N:-20}"
 POLL_TIMEOUT="${POLL_TIMEOUT:-30}"
+
+# Cache-test range — deliberately OUTSIDE bootstrap pre-warm [1, 100_000] so
+# step 1 forces a real cache miss → compute → cache write, and step 4 (same
+# range) measures a real cache hit. Without this, both steps would hit the
+# bootstrap-seeded covering range and the comparison would be meaningless.
+TEST_START="${TEST_START:-100001}"
+TEST_END="${TEST_END:-200000}"
+EXPECTED_COUNT="${EXPECTED_COUNT:-8392}"  # π(200000) − π(100000) = 17984 − 9592
+
+# ms-precision wall clock — BSD `date` lacks %N, fall back through python3 → perl → integer-second.
+ms_now() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import time; print(int(time.time()*1000))'
+    elif command -v perl >/dev/null 2>&1; then
+        perl -MTime::HiRes -e 'print int(Time::HiRes::time()*1000)'
+    else
+        echo $(($(date +%s) * 1000))
+    fi
+}
 
 section "aegis-enclave — cloud smoke (Phase 2.5)"
 
@@ -77,75 +103,92 @@ HEALTH_CODE=$("${CURL[@]}" -o /dev/null -w '%{http_code}' "${BASE}/health" 2>/de
 (timeout / 000 = network unreachable). Connect VPN and retry."
 ok "GET /health → 200"
 
-# ─── Step 1: POST → 202 + execution_id ────────────────────────────────────
-section "1/6 — POST /primes (async accept)"
-RESP=$("${CURL[@]}" -w '\n%{http_code}' -X POST -H 'Content-Type: application/json' \
-        -d '{"start":2,"end":100}' "${BASE}/primes")
-HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | sed '$d')
-[[ "$HTTP_CODE" == "202" ]] || fail "expected 202, got $HTTP_CODE: $BODY"
-EXEC_ID=$(echo "$BODY" | jq -r '.execution_id // empty')
-[[ -n "$EXEC_ID" ]] || fail "no execution_id in response: $BODY"
-ok "202 + execution_id=$EXEC_ID"
+# Helper: POST → poll → ms-precision wall time → return "<duration_ms> <exec_id>"
+post_and_poll() {
+    local payload="$1" t0 t1 status duration exec_id
+    t0=$(ms_now)
+    local resp
+    resp=$("${CURL[@]}" -w '\n%{http_code}' -X POST -H 'Content-Type: application/json' \
+            -d "$payload" "${BASE}/primes")
+    local code body
+    code=$(echo "$resp" | tail -1)
+    body=$(echo "$resp" | sed '$d')
+    [[ "$code" == "202" ]] || { echo "POST_FAIL_$code|$body" >&2; return 1; }
+    exec_id=$(echo "$body" | jq -r '.execution_id // empty')
+    [[ -n "$exec_id" ]] || { echo "NO_EXEC_ID|$body" >&2; return 1; }
+    # Tight 100ms poll for ms-precision read (vs old `sleep 1` rounding)
+    local poll_start=$(date +%s)
+    while (( $(date +%s) - poll_start < POLL_TIMEOUT )); do
+        status=$("${CURL[@]}" "${BASE}/primes/${exec_id}" | jq -r '.status // empty')
+        [[ "$status" == "done" ]] && break
+        [[ "$status" == "failed" ]] && { echo "EXEC_FAILED|$exec_id" >&2; return 1; }
+        sleep 0.1
+    done
+    [[ "$status" == "done" ]] || { echo "POLL_TIMEOUT|$exec_id|$status" >&2; return 1; }
+    t1=$(ms_now)
+    duration=$((t1 - t0))
+    echo "$duration $exec_id"
+}
 
-# ─── Step 2: Poll GET until status=done ───────────────────────────────────
-section "2/6 — Poll until status=done (timeout ${POLL_TIMEOUT}s)"
-STATUS=""
-T_START=$(date +%s)
-while (( $(date +%s) - T_START < POLL_TIMEOUT )); do
-    STATUS=$("${CURL[@]}" "${BASE}/primes/${EXEC_ID}" | jq -r '.status // empty')
-    [[ "$STATUS" == "done" ]] && break
-    [[ "$STATUS" == "failed" ]] && {
-        ERR=$("${CURL[@]}" "${BASE}/primes/${EXEC_ID}" | jq -r '.error_message // "unknown"')
-        fail "execution failed: $ERR"
-    }
-    sleep 1
-done
-[[ "$STATUS" == "done" ]] || fail "polling timeout after ${POLL_TIMEOUT}s (last status=$STATUS)"
-T_FIRST_MS=$(( ($(date +%s) - T_START) * 1000 ))
-ok "polled to done in ${T_FIRST_MS}ms"
+# ─── Step 1: POST cache-miss range → 202 + execution_id ───────────────────
+section "1/7 — POST /primes (range OUTSIDE bootstrap pre-warm → forces compute)"
+info "Range: [${TEST_START}, ${TEST_END}] (bootstrap pre-warmed only [1, 100_000])"
+RESULT_1=$(post_and_poll "{\"start\":${TEST_START},\"end\":${TEST_END}}") \
+    || fail "step 1 POST/poll failed: $RESULT_1"
+T_FIRST_MS=$(echo "$RESULT_1" | awk '{print $1}')
+EXEC_ID=$(echo "$RESULT_1" | awk '{print $2}')
+ok "202 + execution_id=$EXEC_ID + polled to done in ${T_FIRST_MS}ms (cache MISS — expected slower)"
 
-# ─── Step 3: Verify result length ─────────────────────────────────────────
-section "3/6 — Verify primes count"
+# ─── Step 2: Verify primes count (correctness) ────────────────────────────
+section "2/7 — Verify primes count"
 COUNT=$("${CURL[@]}" "${BASE}/primes/${EXEC_ID}" | jq -r '.result | length')
-[[ "$COUNT" == "25" ]] || fail "expected 25 primes in [2,100], got $COUNT"
-ok "primes count = 25 (correct for [2,100])"
+[[ "$COUNT" == "$EXPECTED_COUNT" ]] || fail "expected ${EXPECTED_COUNT} primes in [${TEST_START},${TEST_END}], got $COUNT"
+ok "primes count = ${EXPECTED_COUNT} (correct for [${TEST_START},${TEST_END}])"
 
-# ─── Step 4: Cache-hit repeat ─────────────────────────────────────────────
-section "4/6 — Cache hit (repeat same range, expect lower latency than first call)"
-T2_START_MS=$(($(date +%s%N) / 1000000))
-RESP2=$("${CURL[@]}" -X POST -H 'Content-Type: application/json' \
-         -d '{"start":2,"end":100}' "${BASE}/primes")
-EXEC_ID_2=$(echo "$RESP2" | jq -r '.execution_id // empty')
-T2_HALF_MS=$(( $(date +%s%N) / 1000000 - T2_START_MS ))
-
-# Poll second exec to done
-T2_POLL_START=$(date +%s)
-STATUS_2=""
-while (( $(date +%s) - T2_POLL_START < POLL_TIMEOUT )); do
-    STATUS_2=$("${CURL[@]}" "${BASE}/primes/${EXEC_ID_2}" | jq -r '.status // empty')
-    [[ "$STATUS_2" == "done" ]] && break
-    sleep 1
-done
-T2_TOTAL_MS=$(( ($(date +%s) - T2_POLL_START) * 1000 + T2_HALF_MS ))
-[[ "$STATUS_2" == "done" ]] || fail "cache-hit second exec did not reach done"
-ok "second call: ${T2_TOTAL_MS}ms total (vs first ${T_FIRST_MS}ms)"
-if (( T2_TOTAL_MS < T_FIRST_MS )); then
-    ok "cache hit: faster than miss ✓"
+# ─── Step 3: Cache-hit repeat (same range — should be served from cache) ──
+section "3/7 — Cache HIT (repeat same range — find_covering should match the just-written entry)"
+RESULT_3=$(post_and_poll "{\"start\":${TEST_START},\"end\":${TEST_END}}") \
+    || fail "step 3 POST/poll failed: $RESULT_3"
+T_HIT_MS=$(echo "$RESULT_3" | awk '{print $1}')
+EXEC_ID_3=$(echo "$RESULT_3" | awk '{print $2}')
+ok "second call: execution_id=$EXEC_ID_3 in ${T_HIT_MS}ms"
+if (( T_HIT_MS < T_FIRST_MS )); then
+    SPEEDUP=$(( (T_FIRST_MS - T_HIT_MS) * 100 / T_FIRST_MS ))
+    ok "cache hit: ${SPEEDUP}% faster than miss (${T_FIRST_MS}ms → ${T_HIT_MS}ms) ✓"
 else
-    warn "second call not faster — possible cache miss (worker fresh? Lua merge slow?)"
+    warn "second call not faster (${T_FIRST_MS}ms → ${T_HIT_MS}ms) — investigate worker logs"
 fi
 
-# ─── Step 5: Negative test: out-of-bounds range → 422 ─────────────────────
-section "5/6 — Negative test (out-of-bounds → 422)"
+# ─── Step 4: Partial-overlap demo (range straddles bootstrap + new) ───────
+section "4/7 — Partial overlap (read miss → compute → Lua merges into single entry)"
+PARTIAL_START=50000
+PARTIAL_END=150000
+info "Range [${PARTIAL_START}, ${PARTIAL_END}] partially overlaps bootstrap [1, 100_000]"
+info "and step-1 entry [${TEST_START}, ${TEST_END}], but neither fully covers it."
+info "Expected: cache miss → compute → merge_or_put coalesces all into [1, ${TEST_END}]"
+RESULT_4=$(post_and_poll "{\"start\":${PARTIAL_START},\"end\":${PARTIAL_END}}") \
+    || fail "step 4 POST/poll failed: $RESULT_4"
+T_PARTIAL_MS=$(echo "$RESULT_4" | awk '{print $1}')
+ok "partial-overlap call: ${T_PARTIAL_MS}ms (cache MISS path, then merge writes coalesced [1, ${TEST_END}])"
+
+# ─── Step 5: Post-coalesce hit (any sub-range of [1, TEST_END] now covered) ─
+section "5/7 — Post-coalesce hit (sub-range of newly coalesced [1, ${TEST_END}])"
+COALESCE_TEST=180000
+RESULT_5=$(post_and_poll "{\"start\":2,\"end\":${COALESCE_TEST}}") \
+    || fail "step 5 POST/poll failed: $RESULT_5"
+T_COALESCE_MS=$(echo "$RESULT_5" | awk '{print $1}')
+ok "post-coalesce call [2, ${COALESCE_TEST}]: ${T_COALESCE_MS}ms (should be cache HIT — proves Lua merge worked)"
+
+# ─── Step 6: Negative test: out-of-bounds range → 422 ─────────────────────
+section "6/7 — Negative test (out-of-bounds → 422)"
 HTTP_CODE=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
     -X POST -H 'Content-Type: application/json' \
     -d '{"start":-1,"end":100}' "${BASE}/primes")
 [[ "$HTTP_CODE" == "422" ]] || fail "expected 422 for negative start, got $HTTP_CODE"
 ok "negative test: 422 ✓"
 
-# ─── Step 6: Backpressure: N concurrent large → some 503 ──────────────────
-section "6/6 — Backpressure (${BACKPRESSURE_N} concurrent, expect ≥ 1 × 503)"
+# ─── Step 7: Backpressure: N concurrent large → some 503 ─────────────────
+section "7/7 — Backpressure (${BACKPRESSURE_N} concurrent, expect ≥ 1 × 503)"
 TMP_CODES="$(mktemp -t aegis-bp-codes.XXXXXX)"
 trap 'rm -f "$CA_PEM" "$TMP_CODES"' EXIT
 for i in $(seq 1 "$BACKPRESSURE_N"); do
@@ -168,9 +211,20 @@ fi
 
 # ─── Summary ──────────────────────────────────────────────────────────────
 section "Summary"
-ok "6/6 cloud smoke complete against $BASE"
-echo "  First call (cache miss):  ${T_FIRST_MS}ms"
-echo "  Second call (cache hit):  ${T2_TOTAL_MS}ms"
-echo "  Backpressure 503 count:   ${HIT_503} / ${BACKPRESSURE_N}"
+ok "7/7 cloud smoke complete against $BASE"
+echo
+echo "  Cache MISS (compute path)  [${TEST_START}, ${TEST_END}]:        ${T_FIRST_MS}ms"
+echo "  Cache HIT  (same range)    [${TEST_START}, ${TEST_END}]:        ${T_HIT_MS}ms"
+echo "  Partial OVERLAP (compute + merge) [${PARTIAL_START}, ${PARTIAL_END}]: ${T_PARTIAL_MS}ms"
+echo "  Post-coalesce HIT          [2, ${COALESCE_TEST}]:           ${T_COALESCE_MS}ms"
+echo "  Backpressure 503 count:                                ${HIT_503} / ${BACKPRESSURE_N}"
+echo
+info "Cache assertion is timer-based (subject to network jitter). Ground truth"
+info "is in worker CloudWatch logs — 'make cloud-evidence' fetches them and"
+info "counts 'cache_hit' vs 'compute_done' events. Expect:"
+info "  step 1 (miss)             → 1 × compute_done"
+info "  step 3 (hit)              → 1 × cache_hit"
+info "  step 4 (partial → miss)   → 1 × compute_done + 1 × Lua merge"
+info "  step 5 (post-coalesce hit) → 1 × cache_hit"
 echo
 info "Now run 'make cloud-evidence' to capture CloudWatch artifacts BEFORE 'make cloud-down'"

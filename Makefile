@@ -50,8 +50,9 @@ pre-commit-install: ## One-time setup of pre-commit + pre-push hooks
 # ---------------------------------------------------------------------------
 
 .PHONY: lint
-lint: _ensure-venv ## Run ruff lint over src + tests
+lint: _ensure-venv ## Run ruff lint + format check over src + tests
 	$(PYTHON_BIN)/ruff check src tests
+	$(PYTHON_BIN)/ruff format --check src tests
 
 .PHONY: format
 format: _ensure-venv ## Apply ruff formatter to src + tests

@@ -153,8 +153,42 @@ ACM_RAW=$(aws acm describe-certificate --region "$REGION" --certificate-arn "$CL
 }
 ok "client_cert_arn reachable"
 
+# ─── RDS engine_version still supported by AWS RDS ───────────────────────
+# Hardcoded in terraform/main.tf (module "rds" engine_version field). AWS
+# deprecates minor versions periodically — Phase 2.5 this cycle hit deprecated
+# 16.3 mid-apply (RDS module returned InvalidParameterValue at create time).
+# Pre-flight catches it before the 8-12 min RDS Multi-AZ provisioning starts.
+section "6/7 — RDS engine_version still supported"
+
+PG_VERSION=$(grep -E '^[[:space:]]*engine_version[[:space:]]*=' "$TF_DIR/main.tf" \
+              | head -1 \
+              | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/' || echo "")
+
+if [[ -z "$PG_VERSION" ]]; then
+    warn "could not extract engine_version from main.tf — skipping pre-flight"
+else
+    info "Found PostgreSQL engine_version=$PG_VERSION in main.tf"
+    SUPPORTED=$(aws rds describe-db-engine-versions \
+                  --region "$REGION" \
+                  --engine postgres \
+                  --engine-version "$PG_VERSION" \
+                  --query 'length(DBEngineVersions)' \
+                  --output text 2>/dev/null || echo "0")
+    if [[ "$SUPPORTED" == "0" ]] || [[ "$SUPPORTED" == "None" ]]; then
+        warn "engine_version $PG_VERSION is NOT in AWS RDS supported versions for region $REGION"
+        warn "Available PostgreSQL 16.x versions:"
+        aws rds describe-db-engine-versions \
+              --region "$REGION" --engine postgres \
+              --query "DBEngineVersions[?starts_with(EngineVersion, '16.')].EngineVersion" \
+              --output text 2>/dev/null \
+              | tr '\t' '\n' | sed 's/^/    /' >&2 || true
+        fail "Update terraform/main.tf engine_version to a supported version, then re-run."
+    fi
+    ok "engine_version $PG_VERSION is RDS-supported in $REGION"
+fi
+
 # ─── Terraform initialised ─────────────────────────────────────────────────
-section "6/6 — Terraform initialised"
+section "7/7 — Terraform initialised"
 if [[ ! -d "$TF_DIR/.terraform" ]]; then
     info ".terraform/ missing — running terraform init"
     (cd "$TF_DIR" && terraform init)

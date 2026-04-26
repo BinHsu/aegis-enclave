@@ -59,6 +59,14 @@ The Terraform `null_resource` trigger and `depends_on` wiring remain unchanged �
 - A production adoption that requires incremental schema migrations (ALTER TABLE, column additions, data migrations) must replace `create_all` with Alembic or an equivalent migration framework at that point. The `create_all` approach is explicitly bounded to a greenfield schema with no existing production state.
 - The bootstrap task's IAM task role must include `rds-db:connect` permission (already present for the worker's DB access) — no new IAM changes required.
 
+### Reconsidered in Phase 2.5 (2026-04-26): why we are not splitting now
+
+After this ADR was first written we revisited Strategy A ("split into separate `db_migrate` ECS task") at the end of the Phase 2.5 cycle, expecting to file the split as paid technical debt. The deeper conclusion was that splitting is the wrong scope cut by itself: the actual fragility in the bootstrap path is the **driver** — a Terraform `null_resource` with `local-exec → aws ecs run-task → poll completion`. That driver is brittle (dependent on the operator's local AWS CLI, no retry semantics, no timeout escape hatch, sequencing only via `depends_on`). Splitting the task without replacing the driver doubles the number of `null_resource`-fired one-shot invocations (one for `db_migrate`, one for `cache_bootstrap`, with the second `depends_on` the first), increasing the fragile surface for no architectural clarity gain — the same `null_resource` weakness exists, just twice.
+
+The right V2 cut is therefore **driver + split together**: replace `null_resource` with a proper job runner (Step Functions orchestrating two ECS task invocations, or a CodePipeline migration stage gated by the GHA workflow added in P1, or an Alembic CLI invocation as a CI step running before `terraform apply` of the ECS service module), then split the bootstrap into `db_migrate` + `cache_bootstrap` with the new runner sequencing them. Doing the split alone (without replacing the driver) trades one PoC expedient (combined task) for a worse one (two combined tasks behind the same fragile driver).
+
+This insight is recorded here rather than in a new ADR because the original decision (Strategy C) stands; what changed is the V2 exit criterion. The bullet above ("production adoption that requires incremental schema migrations must replace `create_all` with Alembic") is now refined: such an adoption must replace **both** `create_all` and the `null_resource` driver — the migration framework choice and the orchestration mechanism are coupled.
+
 ## Related ADRs
 - ADR-0029 (async POST + SQS + worker pool — the architecture the bootstrap task initialises for)
 - ADR-0031 (Valkey + ZSET + Lua range-coalescing — the original bootstrap task specification; this ADR extends it)

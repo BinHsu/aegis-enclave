@@ -87,3 +87,44 @@ output "bootstrap_task_arn" {
   description = "ARN of the ECS task definition for the cache bootstrap one-shot task."
   value       = aws_ecs_task_definition.cache_bootstrap.arn
 }
+
+# ─── CloudWatch dimension-resolution outputs (cloud-evidence.sh) ─────────────
+# These are the *bare* identifiers AWS CloudWatch expects in metric dimensions,
+# distinct from the ARNs / endpoints exported above. cloud-evidence.sh reads
+# these so widget JSON dimensions match the actual resource names without the
+# script having to reverse-engineer them from ARNs or DNS strings.
+
+output "rds_instance_identifier" {
+  description = "RDS DBInstanceIdentifier — used as the AWS/RDS dimension key for CloudWatch metric widgets."
+  value       = module.rds.db_instance_identifier
+}
+
+output "valkey_cache_name" {
+  description = "ElastiCache Serverless cache name — AWS/ElastiCache uses 'CacheName' (not 'CacheClusterId') as the dimension key for serverless caches."
+  value       = aws_elasticache_serverless_cache.valkey.name
+}
+
+output "ecs_cluster_name" {
+  description = "ECS cluster name (bare, not ARN) — used as the AWS/ECS 'ClusterName' dimension."
+  value       = module.ecs.cluster_name
+}
+
+output "alb_arn_suffix" {
+  description = "ALB ARN suffix in 'app/<name>/<id>' form — used as the AWS/ApplicationELB 'LoadBalancer' dimension."
+  value       = module.alb.arn_suffix
+}
+
+output "alb_target_group_arn_suffix" {
+  description = "ALB target group ARN suffix in 'targetgroup/<name>/<id>' form — used as the AWS/ApplicationELB 'TargetGroup' dimension."
+  value       = module.alb.target_groups["app"].arn_suffix
+}
+
+output "sqs_primes_name" {
+  description = "SQS queue bare name — used as the AWS/SQS 'QueueName' dimension."
+  value       = aws_sqs_queue.primes.name
+}
+
+output "worker_service_name" {
+  description = "ECS worker service bare name — used as the AWS/ECS 'ServiceName' dimension."
+  value       = aws_ecs_service.worker.name
+}
