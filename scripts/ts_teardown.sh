@@ -97,7 +97,15 @@ ok "$RESOURCE_COUNT resource(s) in state"
 section "5/5 — Plan destroy"
 PLAN_FILE="$TF_DIR/.tfplan-destroy-$(date -u +%Y%m%dT%H%M%SZ)"
 trap '[[ -f "$PLAN_FILE" ]] && rm -f "$PLAN_FILE"' EXIT
-(cd "$TF_DIR" && terraform plan -destroy -var-file=terraform.tfvars -out="$PLAN_FILE")
+# -refresh=false: skip re-evaluating data sources during plan. On a partial
+# teardown (some resources already destroyed in a prior failed attempt),
+# refresh would re-read references to dead module outputs and the ECS
+# service module's container_definitions for_each crashes with
+# 'var.container_definitions will be known only after apply'. Using state
+# alone (no refresh) lets terraform compute the destroy graph from cached
+# values. Trade-off: drift not detected, but case-study apply-then-destroy
+# doesn't drift in 3h.
+(cd "$TF_DIR" && terraform plan -destroy -refresh=false -var-file=terraform.tfvars -out="$PLAN_FILE")
 
 # ─── Confirm — strict ─────────────────────────────────────────────────────
 section "Confirm destroy"
