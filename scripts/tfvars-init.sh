@@ -140,8 +140,10 @@ ask() {
     #   1. env var TF_<UPPER_VAR_NAME> set → use it, log source
     #   2. batch mode → use default, log source
     #   3. interactive → prompt with default
+    # Note: tr-based uppercase for bash 3.2 compatibility (macOS default bash;
+    #       ${var^^} is bash 4+ only).
     local var_name="$1" prompt_msg="$2" default="$3"
-    local env_var="TF_${var_name^^}"
+    local env_var="TF_$(echo "$var_name" | tr '[:lower:]' '[:upper:]')"
     local env_value="${!env_var:-}"
 
     if [[ -n "$env_value" ]]; then
@@ -163,8 +165,9 @@ ask() {
 # (no infinite re-prompt). In interactive mode, return 0 = retry.
 batch_fail_or_retry() {
     local var_name="$1" var_value="$2" reason="$3"
+    local upper="$(echo "$var_name" | tr '[:lower:]' '[:upper:]')"
     if (( IS_BATCH )); then
-        fail "TF_${var_name^^}='$var_value' invalid: $reason (batch mode — aborting)"
+        fail "TF_${upper}='$var_value' invalid: $reason (batch mode — aborting)"
     fi
     warn "$reason"
     return 0

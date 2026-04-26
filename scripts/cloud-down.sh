@@ -64,6 +64,14 @@ if [[ -z "${AWS_PROFILE:-}" ]]; then
 fi
 info "Using AWS_PROFILE=$AWS_PROFILE"
 
+# Always offer SSO refresh BEFORE sts (Enter = skip = "I have a token")
+printf "SSO session name to refresh token (Enter to skip): "
+read -r SSO_SESSION_INPUT
+if [[ -n "$SSO_SESSION_INPUT" ]]; then
+    info "Running: aws sso login --sso-session $SSO_SESSION_INPUT"
+    aws sso login --sso-session "$SSO_SESSION_INPUT" || fail "SSO login failed"
+fi
+
 AUTH_RAW=""
 AUTH_RC=0
 AUTH_RAW=$(aws sts get-caller-identity 2>&1) || AUTH_RC=$?
@@ -80,19 +88,7 @@ if [[ "$AUTH_RC" -ne 0 ]]; then
         fail "Profile '$AWS_PROFILE' does not exist"
     fi
 
-    printf "SSO session name to refresh token (Enter to skip): "
-    read -r SSO_SESSION_INPUT
-    if [[ -n "$SSO_SESSION_INPUT" ]]; then
-        info "Running: aws sso login --sso-session $SSO_SESSION_INPUT"
-        aws sso login --sso-session "$SSO_SESSION_INPUT" || fail "SSO login failed"
-    fi
-
-    AUTH_RC=0
-    AUTH_RAW=$(aws sts get-caller-identity 2>&1) || AUTH_RC=$?
-    if [[ "$AUTH_RC" -ne 0 ]]; then
-        printf "\n--- aws sts STILL fails (exit %d) ---\n%s\n--- end ---\n" "$AUTH_RC" "$AUTH_RAW" >&2
-        fail "AWS auth still failing"
-    fi
+    fail "AWS auth failed for profile '$AWS_PROFILE'. Re-run with sso-session name at the prompt to refresh."
 fi
 
 ACCOUNT_ID=$( ( printf '%s' "$AUTH_RAW" | grep -oE '"Account":[[:space:]]*"[0-9]+"' | grep -oE '[0-9]+' | head -1 ) 2>/dev/null || echo "?" )

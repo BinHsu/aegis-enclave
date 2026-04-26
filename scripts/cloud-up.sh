@@ -72,44 +72,34 @@ if [[ -z "${AWS_PROFILE:-}" ]]; then
 fi
 info "Using AWS_PROFILE=$AWS_PROFILE"
 
-# Try sts. If fails, prompt for SSO session to refresh (Enter = skip + retry as-is).
+# Always offer SSO refresh BEFORE trying sts (per Bin: Enter = skip = "I have a token").
+# Operator can proactively refresh, or skip if confident token is valid.
+printf "SSO session name to refresh token (Enter to skip if you already have a valid token): "
+read -r SSO_SESSION_INPUT
+if [[ -n "$SSO_SESSION_INPUT" ]]; then
+    info "Running: aws sso login --sso-session $SSO_SESSION_INPUT"
+    aws sso login --sso-session "$SSO_SESSION_INPUT" || fail "SSO login failed for session $SSO_SESSION_INPUT"
+fi
+
+# Now try sts. If fails, diagnose (profile missing? creds bad?) and stop.
 AUTH_RAW=""
 AUTH_RC=0
 AUTH_RAW=$(aws sts get-caller-identity 2>&1) || AUTH_RC=$?
 
 if [[ "$AUTH_RC" -ne 0 ]]; then
-    # Print raw AWS CLI error first (per feedback_aws_creds_agnostic.md rule #4)
     printf "\n--- aws sts get-caller-identity --profile %s failed (exit %d) ---\n%s\n--- end ---\n" \
         "$AWS_PROFILE" "$AUTH_RC" "$AUTH_RAW" >&2
 
-    # Distinguish: profile doesn't exist vs profile exists but creds bad
     if ! aws configure list-profiles 2>/dev/null | grep -qx "$AWS_PROFILE"; then
         printf "\nProfile '%s' is NOT in 'aws configure list-profiles'.\n" "$AWS_PROFILE" >&2
         printf "Available profiles:\n" >&2
         aws configure list-profiles 2>/dev/null | sed 's/^/  - /' >&2
-        printf "\nNote: SSO sessions ([sso-session NAME]) are NOT profiles. SSO sessions in your config:\n" >&2
+        printf "\nSSO sessions in your config:\n" >&2
         (grep -E '^\[sso-session ' ~/.aws/config 2>/dev/null | sed 's/^\[sso-session \(.*\)\]/  - \1/' || echo "  (none)") >&2
         fail "Profile '$AWS_PROFILE' does not exist — pick one from the list above"
     fi
 
-    # Profile exists. Prompt for SSO session refresh (Enter = skip).
-    printf "SSO session name to refresh token (Enter to skip if you already have a valid token): "
-    read -r SSO_SESSION_INPUT
-    if [[ -n "$SSO_SESSION_INPUT" ]]; then
-        info "Running: aws sso login --sso-session $SSO_SESSION_INPUT"
-        aws sso login --sso-session "$SSO_SESSION_INPUT" || fail "SSO login failed for session $SSO_SESSION_INPUT"
-    else
-        info "Skipping SSO refresh; will retry sts as-is"
-    fi
-
-    # Retry sts after refresh attempt
-    AUTH_RC=0
-    AUTH_RAW=$(aws sts get-caller-identity 2>&1) || AUTH_RC=$?
-    if [[ "$AUTH_RC" -ne 0 ]]; then
-        printf "\n--- aws sts STILL fails after SSO refresh attempt (exit %d) ---\n%s\n--- end ---\n" \
-            "$AUTH_RC" "$AUTH_RAW" >&2
-        fail "AWS auth still failing. Check profile config (~/.aws/config) or refresh creds manually."
-    fi
+    fail "AWS auth failed for profile '$AWS_PROFILE'. If your SSO token expired, re-run cloud-up and enter your sso-session name at the prompt."
 fi
 
 # Parse account info — defensive (set -e + pipefail would silently abort on grep no-match).
