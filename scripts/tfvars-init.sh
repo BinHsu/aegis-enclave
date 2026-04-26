@@ -150,9 +150,19 @@ batch_fail_or_retry() {
 }
 
 validate_region() {
-    aws ec2 describe-regions --region us-east-1 \
-        --query "Regions[?RegionName=='$1'].RegionName" --output text 2>/dev/null \
-        | grep -q "^$1$"
+    # Returns 0 if region exists/enabled; 1 if not found; 2 if API call failed.
+    local region="$1" raw rc=0
+    raw=$(aws ec2 describe-regions --region us-east-1 \
+            --query "Regions[?RegionName=='$region'].RegionName" --output text 2>&1) || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        printf "\n--- aws ec2 describe-regions failed (exit %d) ---\n%s\n--- end ---\n" \
+            "$rc" "$raw" >&2
+        if echo "$raw" | grep -qE 'UnauthorizedOperation|AccessDenied'; then
+            printf "Hint: looks like missing IAM permission ec2:DescribeRegions.\n" >&2
+        fi
+        return 2
+    fi
+    echo "$raw" | grep -q "^$region$"
 }
 
 validate_cidr_format() {
@@ -169,7 +179,11 @@ check_cidr_overlap() {
     raw=$(aws ec2 describe-vpcs --region "$region" \
             --query 'Vpcs[*].CidrBlockAssociationSet[*].CidrBlock' --output text 2>&1) || rc=$?
     if [[ $rc -ne 0 ]]; then
-        printf "describe-vpcs failed: %s\n" "$raw" >&2
+        printf "\n--- aws ec2 describe-vpcs --region %s failed (exit %d) ---\n%s\n--- end ---\n" \
+            "$region" "$rc" "$raw" >&2
+        if echo "$raw" | grep -qE 'UnauthorizedOperation|AccessDenied'; then
+            printf "Hint: looks like missing IAM permission ec2:DescribeVpcs.\n" >&2
+        fi
         return 2
     fi
     local existing
@@ -201,12 +215,17 @@ validate_positive_int() {
 section "Region"
 while true; do
     ask REGION "AWS region" "eu-central-1"
-    if validate_region "$REGION"; then
-        ok "region '$REGION' enabled in account $ACCOUNT_ID"
-        break
-    fi
-    batch_fail_or_retry REGION "$REGION" \
-        "region '$REGION' not in 'aws ec2 describe-regions' (not enabled / typo)"
+    set +e
+    validate_region "$REGION"
+    rc=$?
+    set -e
+    case $rc in
+        0) ok "region '$REGION' enabled in account $ACCOUNT_ID"; break ;;
+        1) batch_fail_or_retry REGION "$REGION" \
+               "region '$REGION' not in 'aws ec2 describe-regions' (not enabled / typo)" ;;
+        2) fail "Cannot validate region — API call failed. See stderr above for missing IAM permission.
+For batch / CI: grant ec2:DescribeRegions to the runner role." ;;
+    esac
 done
 
 # ─── Q&A: tags (free text) ─────────────────────────────────────────────────
@@ -234,8 +253,9 @@ while true; do
                "overlaps existing VPC CIDR in $REGION (try 10.10.0.0/16 / 172.20.0.0/16 / 192.168.100.0/24)" ;;
         2) # AWS API failure. CI without AWS access should NOT run cloud-up — fail in batch.
            if (( IS_BATCH )); then
-               fail "describe-vpcs API failed (batch mode). CI without AWS access must not run tfvars-init / cloud-up.
-Provision AWS access for the runner (IAM role / OIDC / explicit creds) before retrying."
+               fail "Cannot validate CIDR — describe-vpcs API failed. See stderr above for missing IAM permission.
+For batch / CI: grant ec2:DescribeVpcs to the runner role.
+(CI without AWS access must not run tfvars-init / cloud-up — see Bin 04/26 rule.)"
            fi
            warn "AWS API failed — cannot auto-validate CIDR. Accept anyway? [yes/no]"
            read -r ack
