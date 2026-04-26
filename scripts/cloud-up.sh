@@ -91,14 +91,11 @@ ARN=$(echo "$CALLER_JSON" | grep -oE '"Arn":"[^"]*"' | sed -E 's/"Arn":"(.+)"/\1
 ok "AWS account: $ACCOUNT_ID"
 ok "AWS caller:  $ARN"
 
-# ─── Pre-flight: tfvars present ────────────────────────────────────────────
+# ─── Pre-flight: tfvars present (interactive Q&A if missing) ──────────────
 section "3/6 — tfvars present"
 if [[ ! -f "$TFVARS" ]]; then
-    info "$TFVARS missing — copying from terraform.tfvars.example"
-    cp "$TF_DIR/terraform.tfvars.example" "$TFVARS"
-    warn "tfvars created with defaults (region=eu-central-1, cost_center=engineering, owner=bin.hsu)"
-    warn "If you want non-defaults, abort now (Ctrl-C) and edit $TFVARS"
-    sleep 3
+    info "$TFVARS missing — running interactive tfvars-init"
+    "$SCRIPT_DIR/tfvars-init.sh"
 fi
 ok "$TFVARS present"
 

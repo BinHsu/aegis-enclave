@@ -140,8 +140,12 @@ tf-apply: ## OPERATOR USE — apply Terraform via scripts/ts_apply.sh (low-level
 tf-destroy: ## OPERATOR USE — destroy Terraform via scripts/ts_teardown.sh (low-level; prefer 'make cloud-down')
 	@./scripts/ts_teardown.sh
 
+.PHONY: tfvars-init
+tfvars-init: ## Generate terraform.tfvars via interactive Q&A (AWS-aware CIDR + region validate)
+	@./scripts/tfvars-init.sh
+
 .PHONY: cloud-up
-cloud-up: ## Phase 2.5 one-shot deploy — pre-flight + cert + ECR + image push + full apply
+cloud-up: ## Phase 2.5 one-shot deploy — pre-flight + tfvars-init (if missing) + cert + ECR + image push + full apply
 	@./scripts/cloud-up.sh
 
 .PHONY: cloud-down
