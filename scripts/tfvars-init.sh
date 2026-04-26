@@ -81,15 +81,32 @@ fi
 
 # ─── AWS auth (source-agnostic; SSO recommended) ───────────────────────────
 section "AWS auth (for region + CIDR validation)"
+PROFILES_AVAIL=$(aws configure list-profiles 2>/dev/null || true)
+SSO_SESSIONS_AVAIL=$(grep -E '^\[sso-session ' ~/.aws/config 2>/dev/null | sed 's/^\[sso-session \(.*\)\]/\1/' || true)
+
 if [[ -z "${AWS_PROFILE:-}" ]]; then
     if (( IS_BATCH )); then
         fail "AWS_PROFILE not set (batch mode requires explicit AWS_PROFILE env var)"
     fi
-    printf "AWS_PROFILE not set. Enter profile name [default]: "
+    if [[ -n "$PROFILES_AVAIL" ]]; then
+        printf "Available AWS profiles:\n"
+        echo "$PROFILES_AVAIL" | sed 's/^/  - /'
+    fi
+    if [[ -n "$SSO_SESSIONS_AVAIL" ]]; then
+        printf "SSO sessions (for reference, not pickable as profile):\n"
+        echo "$SSO_SESSIONS_AVAIL" | sed 's/^/  - /'
+    fi
+    printf "Enter AWS_PROFILE [default]: "
     read -r AWS_PROFILE_INPUT
     export AWS_PROFILE="${AWS_PROFILE_INPUT:-default}"
 fi
 info "Using AWS_PROFILE=$AWS_PROFILE"
+
+if [[ -n "$PROFILES_AVAIL" ]] && ! echo "$PROFILES_AVAIL" | grep -qx "$AWS_PROFILE"; then
+    printf "\nProfile '%s' is NOT in 'aws configure list-profiles'. Available:\n" "$AWS_PROFILE" >&2
+    echo "$PROFILES_AVAIL" | sed 's/^/  - /' >&2
+    fail "Re-run and pick from the list above"
+fi
 
 AUTH_RAW=""
 AUTH_RC=0

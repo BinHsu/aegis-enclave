@@ -65,15 +65,39 @@ ok "terraform / aws / docker all present and ready"
 # (refreshable, short-lived tokens, audit trail) but long-term creds also work.
 # See memory feedback_aws_creds_agnostic.md.
 section "2/6 — AWS authentication"
+
+# Helper: list available profiles + sso-sessions so operator picks from a visible
+# menu instead of guessing (per memory feedback_explicit_over_implicit.md).
+PROFILES_AVAIL=$(aws configure list-profiles 2>/dev/null || true)
+SSO_SESSIONS_AVAIL=$(grep -E '^\[sso-session ' ~/.aws/config 2>/dev/null | sed 's/^\[sso-session \(.*\)\]/\1/' || true)
+
 if [[ -z "${AWS_PROFILE:-}" ]]; then
-    printf "AWS_PROFILE not set. Enter profile name [default]: "
-    read AWS_PROFILE_INPUT
+    if [[ -n "$PROFILES_AVAIL" ]]; then
+        printf "Available AWS profiles:\n"
+        echo "$PROFILES_AVAIL" | sed 's/^/  - /'
+    fi
+    if [[ -n "$SSO_SESSIONS_AVAIL" ]]; then
+        printf "SSO sessions (NOT profiles — for reference only; pick a profile above):\n"
+        echo "$SSO_SESSIONS_AVAIL" | sed 's/^/  - /'
+    fi
+    printf "Enter AWS_PROFILE [default]: "
+    read -r AWS_PROFILE_INPUT
     export AWS_PROFILE="${AWS_PROFILE_INPUT:-default}"
 fi
 info "Using AWS_PROFILE=$AWS_PROFILE"
 
-# Always offer SSO refresh BEFORE trying sts (per Bin: Enter = skip = "I have a token").
-# Operator can proactively refresh, or skip if confident token is valid.
+# Validate profile early if list available — fail fast on typo, not after sts
+if [[ -n "$PROFILES_AVAIL" ]] && ! echo "$PROFILES_AVAIL" | grep -qx "$AWS_PROFILE"; then
+    printf "\nProfile '%s' is NOT in 'aws configure list-profiles'. Available:\n" "$AWS_PROFILE" >&2
+    echo "$PROFILES_AVAIL" | sed 's/^/  - /' >&2
+    fail "Re-run and pick from the list above (typo, or use 'aws configure sso --profile <new>' to create)"
+fi
+
+# Always offer SSO refresh (per Bin: Enter = skip = "I have a token").
+if [[ -n "$SSO_SESSIONS_AVAIL" ]]; then
+    printf "Available SSO sessions:\n"
+    echo "$SSO_SESSIONS_AVAIL" | sed 's/^/  - /'
+fi
 printf "SSO session name to refresh token (Enter to skip if you already have a valid token): "
 read -r SSO_SESSION_INPUT
 if [[ -n "$SSO_SESSION_INPUT" ]]; then
