@@ -361,7 +361,16 @@ module "ecs" {
 
   cluster_configuration = {
     execute_command_configuration = {
-      logging = "DEFAULT"
+      # ECS module 5.11.x auto-adds a log_configuration block when
+      # containerInsights is enabled. AWS API requires logging = "OVERRIDE"
+      # whenever log_configuration is present (DEFAULT only valid when no
+      # log_configuration). Without this, CreateCluster fails with
+      # InvalidParameterException: "You must set logging to 'OVERRIDE'
+      # when you supply a log configuration."
+      logging = "OVERRIDE"
+      log_configuration = {
+        cloud_watch_log_group_name = "/aws/ecs/aegis-enclave"
+      }
     }
   }
 
@@ -566,15 +575,11 @@ resource "aws_security_group_rule" "worker_to_valkey" {
 }
 
 # Allow the bootstrap ECS task to reach Valkey.
-resource "aws_security_group_rule" "bootstrap_to_valkey" {
-  type                     = "ingress"
-  from_port                = 6379
-  to_port                  = 6379
-  protocol                 = "tcp"
-  description              = "Bootstrap ECS task to Valkey 6379"
-  security_group_id        = aws_security_group.valkey.id
-  source_security_group_id = aws_security_group.worker.id
-}
+# Note: bootstrap_to_valkey rule removed - cache_bootstrap ECS task uses
+# aws_security_group.worker (same SG as worker), so worker_to_valkey already
+# authorises bootstrap traffic. AWS rejected the duplicate rule
+# (InvalidPermission.Duplicate). If bootstrap ever needs its own SG, add a
+# separate aws_security_group.bootstrap and a corresponding rule.
 
 resource "aws_elasticache_serverless_cache" "valkey" {
   engine = "valkey"
