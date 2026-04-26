@@ -74,7 +74,10 @@ if ! aws sts get-caller-identity >/dev/null 2>&1; then
     fi
 fi
 
-CALLER_JSON=$(aws sts get-caller-identity 2>&1) || fail "aws sts get-caller-identity still failed"
+CALLER_JSON=$(aws sts get-caller-identity 2>&1) || {
+    printf "\n--- aws sts get-caller-identity failed ---\n%s\n--- end ---\n" "$CALLER_JSON" >&2
+    fail "AWS auth still failed — see raw output above"
+}
 ACCOUNT_ID=$(echo "$CALLER_JSON" | grep -oE '"Account":[^,}]*' | sed -E 's/.*"([0-9]+)".*/\1/')
 ARN=$(echo "$CALLER_JSON" | grep -oE '"Arn":"[^"]*"' | sed -E 's/"Arn":"(.+)"/\1/')
 ok "AWS account: $ACCOUNT_ID"

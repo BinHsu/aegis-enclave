@@ -85,7 +85,13 @@ Or: check ~/.aws/credentials for valid long-term access keys."
     fi
 fi
 
-CALLER_JSON=$(aws sts get-caller-identity 2>&1) || fail "aws sts get-caller-identity still failed after auth attempt"
+CALLER_JSON=$(aws sts get-caller-identity 2>&1) || {
+    printf "\n--- aws sts get-caller-identity failed ---\n%s\n--- end ---\n" "$CALLER_JSON" >&2
+    if echo "$CALLER_JSON" | grep -qE 'UnauthorizedOperation|AccessDenied'; then
+        printf "Hint: looks like missing IAM permission sts:GetCallerIdentity (very rare — usually default).\n" >&2
+    fi
+    fail "AWS auth still failed after auth attempt — see raw output above"
+}
 ACCOUNT_ID=$(echo "$CALLER_JSON" | grep -oE '"Account":[^,}]*' | sed -E 's/.*"([0-9]+)".*/\1/')
 ARN=$(echo "$CALLER_JSON" | grep -oE '"Arn":"[^"]*"' | sed -E 's/"Arn":"(.+)"/\1/')
 ok "AWS account: $ACCOUNT_ID"
