@@ -8,6 +8,18 @@ If the buyer asks "could you actually deploy this?" — the Phase 2.3 evidence s
 
 The local Docker Compose layout is documented in [`README.md` § Architecture](../README.md#architecture); the diagram below is the cloud-side companion.
 
+### Forker prerequisites
+
+This guide assumes you have completed the README's Prerequisites and run `make install`. Additionally, for the cloud-acceptance gate (Phase 2.5):
+
+- AWS account with the IAM permissions listed in `terraform/iam-bootstrap-readme.md` (or equivalent — check `terraform/` for the bootstrap policy)
+- AWS region selected (default `eu-central-1` — see `terraform/variables.tf`)
+- VPC quotas sufficient for one VPC + 2 private subnets + 2 public subnets + 1 NAT gateway + 1 ALB + 1 ECS cluster + 1 ElastiCache Serverless cache + 1 Client VPN endpoint
+- Cost ceiling awareness: a 3h apply window typically costs **< $2** at us-east-1 / eu-central-1 rates; verify in AWS Pricing Calculator before apply if your account has unusual pricing
+- (Optional, recommended) AWS Cost Explorer enabled to see the actual spend post-destroy
+
+Local-stack acceptance (Phase 1.5) only requires the README Prerequisites — no AWS setup needed.
+
 ## Cloud architecture
 
 ```mermaid

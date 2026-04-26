@@ -5,6 +5,10 @@
 
 .DEFAULT_GOAL := help
 
+# Auto-detect Python venv: .venv (uv default / pip canonical) preferred,
+# falls back to .venv-test (legacy hand-crafted) if .venv absent.
+PYTHON_BIN := $(shell test -d .venv && echo .venv/bin || (test -d .venv-test && echo .venv-test/bin || echo ""))
+
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
@@ -14,9 +18,15 @@ help: ## Show this help (default)
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: install
-install: ## Install dev dependencies (uv preferred; falls back to pip)
-	uv sync --dev
-	# Fallback if uv is unavailable: pip install -e '.[dev]'
+install: ## Install dev dependencies (uv preferred; falls back to pip + .venv)
+	@if command -v uv >/dev/null 2>&1; then \
+		echo "==> uv found, running 'uv sync --dev'"; \
+		uv sync --dev; \
+	else \
+		echo "==> uv not found, falling back to pip + .venv"; \
+		test -d .venv || python3 -m venv .venv; \
+		.venv/bin/pip install -e '.[dev]'; \
+	fi
 
 .PHONY: pre-commit-install
 pre-commit-install: ## One-time setup of pre-commit + pre-push hooks
@@ -29,15 +39,18 @@ pre-commit-install: ## One-time setup of pre-commit + pre-push hooks
 
 .PHONY: lint
 lint: ## Run ruff lint over src + tests
-	ruff check src tests
+	@test -n "$(PYTHON_BIN)" || { echo "ERROR: no venv found. Run 'make install' first."; exit 1; }
+	$(PYTHON_BIN)/ruff check src tests
 
 .PHONY: format
 format: ## Apply ruff formatter to src + tests
-	ruff format src tests
+	@test -n "$(PYTHON_BIN)" || { echo "ERROR: no venv found. Run 'make install' first."; exit 1; }
+	$(PYTHON_BIN)/ruff format src tests
 
 .PHONY: typecheck
 typecheck: ## Run mypy over src
-	mypy src
+	@test -n "$(PYTHON_BIN)" || { echo "ERROR: no venv found. Run 'make install' first."; exit 1; }
+	$(PYTHON_BIN)/python -m mypy src
 
 .PHONY: check
 check: lint typecheck ## Composite: lint + typecheck
@@ -48,15 +61,18 @@ check: lint typecheck ## Composite: lint + typecheck
 
 .PHONY: test
 test: ## Run pytest
-	pytest -v
+	@test -n "$(PYTHON_BIN)" || { echo "ERROR: no venv found. Run 'make install' first."; exit 1; }
+	PYTHONPATH=src $(PYTHON_BIN)/pytest tests/ -v
 
 .PHONY: test-ci
 test-ci: ## Headless pytest for pre-push hook + GitHub Actions (PYTHONPATH-aware, no -v noise)
-	@PYTHONPATH=src pytest tests/ -q --tb=short
+	@test -n "$(PYTHON_BIN)" || { echo "ERROR: no venv found. Run 'make install' first."; exit 1; }
+	@PYTHONPATH=src $(PYTHON_BIN)/pytest tests/ -q --tb=short
 
 .PHONY: test-cov
 test-cov: ## Run pytest with coverage report
-	pytest -v --cov=src --cov-report=term-missing
+	@test -n "$(PYTHON_BIN)" || { echo "ERROR: no venv found. Run 'make install' first."; exit 1; }
+	PYTHONPATH=src $(PYTHON_BIN)/pytest tests/ -v --cov=src --cov-report=term-missing
 
 # ---------------------------------------------------------------------------
 # Local stack
