@@ -8,14 +8,26 @@ The repo is a runnable artifact, not a demo session. The smoke test in [§ Initi
 
 ---
 
+## Service Contract
+
+```
+POST /primes → 202 + {execution_id}  |  GET /primes/{id} → {status, result?}
+range cap: end - start ≤ 10⁷  |  overload: 503 + Retry-After: 60
+cache hit < 100 ms  |  compute miss up to 60 s  |  NOT for sub-100 ms SLA
+```
+
+Full specification: [`docs/design_doc.md` § 4.0](docs/design_doc.md#40-service-specification).
+
 ## What's inside
 
 | Concern | This repo |
 |---|---|
-| **Service** | FastAPI prime-number generator, three endpoints, VPN-only access |
-| **Database** | PostgreSQL container, single tenant, execution audit table |
+| **Service** | FastAPI prime-number generator, async POST → queue → worker, VPN-only access |
+| **Queue + worker** | SQS (ElasticMQ locally) + ECS Fargate worker pool; auto-scaling on queue depth |
+| **Cache** | ElastiCache Serverless Valkey; ZSET schema + Lua range-coalescing; bootstrap one-shot ECS task |
+| **Database** | PostgreSQL container, single tenant, execution audit table with status state machine |
 | **Local verification harness** | Docker Compose stack with in-container test-client; WireGuard gateway here is a self-contained local fixture for the security-boundary test, not part of the deployment architecture |
-| **Cloud target (AWS)** | Terraform with community modules — VPC, ECS Fargate behind internal ALB, RDS, **AWS Client VPN endpoint**, Secrets Manager, ECR |
+| **Cloud target (AWS)** | Terraform with community modules — VPC, ECS Fargate behind internal ALB, RDS, SQS, ElastiCache Serverless, **AWS Client VPN endpoint**, Secrets Manager, ECR |
 | **Cloud migration (e.g., IONOS / sovereign)** | Agent-executable runbook with service-mapping table; recommends self-hosted **NetBird** where managed VPN doesn't exist |
 | **Operations** | Mermaid smoke-test sequence, capability-gated agent execution, scope-honest reliability targets |
 
@@ -39,13 +51,21 @@ aegis-enclave/
 ├── pyproject.toml                     # ruff + mypy + pytest config
 ├── src/
 │   └── prime_service/
-│       ├── main.py                    # FastAPI app
-│       ├── primes.py                  # prime logic (sieve / 6k±1)
+│       ├── main.py                    # FastAPI app (async POST 202 + backpressure)
+│       ├── primes.py                  # prime logic (sieve / 6k±1 / SIGALRM budget)
 │       ├── db.py                      # SQLAlchemy + asyncpg
-│       └── schemas.py                 # Pydantic models
+│       ├── schemas.py                 # Pydantic models (Status enum + ExecutionResponse)
+│       ├── queue.py                   # SQS abstraction (boto3, endpoint-url injectable)
+│       ├── cache.py                   # Valkey abstraction (redis-py, ZSET + Lua merge)
+│       ├── worker.py                  # SQS consumer loop (SIGALRM 60s, idempotency)
+│       └── bootstrap.py              # one-shot cache pre-warm (idempotent)
 ├── tests/
-│   ├── test_primes.py                 # unit tests for prime logic
-│   └── test_api.py                    # API integration tests
+│   ├── test_primes.py                 # unit tests for prime logic (BVA at _SIEVE_THRESHOLD, _RANGE_CEILING)
+│   ├── test_api.py                    # API integration tests
+│   ├── test_queue.py                  # queue abstraction tests
+│   ├── test_cache.py                  # cache ZSET overlap matrix + Lua merge BVA
+│   ├── test_worker.py                 # worker idempotency + SIGALRM tests
+│   └── test_bootstrap.py             # bootstrap idempotency tests
 ├── wireguard/
 │   ├── wg0.conf.template              # peer config skeleton (no key material)
 │   └── README.md                      # how to generate keys + run locally
@@ -87,11 +107,20 @@ flowchart LR
     subgraph Local[Docker Compose Environment]
         WG[WireGuard Gateway<br/>10.13.13.1]
         API[Prime API<br/>FastAPI :8000]
+        SQS[ElasticMQ<br/>:9324]
+        WK[Worker<br/>SQS consumer]
+        VK[(Valkey<br/>:6379)]
         DB[(PostgreSQL<br/>executions table)]
+        BS[Bootstrap<br/>one-shot]
         TC[Test-Client Container<br/>verification only]
 
         WG --> API
         API --> DB
+        API --> SQS
+        SQS --> WK
+        WK --> VK
+        WK --> DB
+        BS -.seed.-> VK
         TC -.peer.-> WG
         TC --> API
     end
@@ -102,7 +131,11 @@ flowchart LR
 
     style WG fill:#e1f5fe,color:#000
     style API fill:#e8f5e9,color:#000
+    style SQS fill:#fff9c4,color:#000
+    style WK fill:#fce4ec,color:#000
+    style VK fill:#e8f5e9,color:#000
     style DB fill:#fff3e0,color:#000
+    style BS fill:#f3e5f5,color:#000
     style TC fill:#f3e5f5,color:#000
 ```
 
@@ -168,8 +201,8 @@ The deliverable supports **two** acceptance gates that exercise different surfac
 
 | Gate | What it proves | When |
 |---|---|---|
-| **Local stack acceptance** (below) | Security-boundary correctness — host can't reach app/DB; only the in-VPN test-client can. Five commands, two minutes, no cloud account required. | Today, against the running Docker Compose stack |
-| **Cloud deployment acceptance** ([§ Cloud deployment acceptance](#cloud-deployment-acceptance-phase-23-pending)) | End-to-end path: macOS → AWS Client VPN tunnel → internal ALB → ECS Fargate `/primes` endpoint returns a list. Confirms the deployment architecture itself works against real AWS. | Phase 2.3 (pending real `terraform apply`) |
+| **Local stack acceptance** (below) | Security-boundary correctness — host can't reach app/DB; only the in-VPN test-client can. Six commands, two minutes, no cloud account required. | Today, against the running Docker Compose stack |
+| **Cloud deployment acceptance** ([§ Cloud deployment acceptance](#cloud-deployment-acceptance-phase-25-pending)) | End-to-end path: macOS → AWS Client VPN tunnel → internal ALB → ECS Fargate `/primes` endpoint returns a list. Confirms the deployment architecture itself works against real AWS. | Phase 2.5 (pending real `terraform apply`) |
 
 ### Local stack acceptance
 
@@ -181,6 +214,9 @@ sequenceDiagram
     participant TC as Test-Client Container
     participant WG as WireGuard Gateway
     participant API as Prime API
+    participant SQS as ElasticMQ
+    participant WK as Worker
+    participant VK as Valkey
     participant DB as PostgreSQL
 
     Note over TC,DB: Pre-condition: WG keypair pre-exchanged via .env
@@ -193,16 +229,32 @@ sequenceDiagram
     DB-->>API: ok
     API-->>TC: 200 {"status":"ok","db":"reachable"}
 
-    TC->>API: POST /primes {start:1, end:100}
-    API->>API: compute primes (own logic — sieve / 6k±1)
-    API->>DB: INSERT execution record
-    DB-->>API: row_id=N
-    API-->>TC: 200 {primes:[2,3,5,...,97], execution_id:N}
+    TC->>API: POST /primes {start:2, end:100}
+    API->>DB: INSERT status=queued
+    API->>SQS: SendMessage(execution_id)
+    API-->>TC: 202 {execution_id, status:"queued"}
 
-    TC->>API: GET /executions/N
-    API->>DB: SELECT WHERE id=N
-    DB-->>API: row
-    API-->>TC: 200 {start:1, end:100, count:25, ts:...}
+    TC->>TC: poll GET /primes/{id} every 1s
+    WK->>SQS: ReceiveMessage
+    SQS-->>WK: execution_id
+    WK->>VK: ZRANGEBYSCORE (overlap lookup)
+    VK-->>WK: miss
+    WK->>WK: sieve [2,100]
+    WK->>VK: Lua merge_or_put
+    WK->>DB: UPDATE status=done, result=...
+    WK->>SQS: DeleteMessage
+    TC->>API: GET /primes/{id}
+    API->>DB: SELECT WHERE id={id}
+    DB-->>API: done, primes=[2..97]
+    API-->>TC: 200 {status:"done", result:[2,3,5,...,97]}
+
+    Note over TC: Step 4: repeat same range — cache hit
+    TC->>API: POST /primes {start:2, end:100}
+    API->>SQS: enqueue
+    WK->>VK: ZRANGEBYSCORE → HIT
+    WK->>DB: UPDATE status=done (no recompute)
+    TC->>API: GET /primes/{id}
+    API-->>TC: 200 {status:"done"} — faster (cache hit)
 
     Note over Op,API: Negative test (security boundary)
     Op->>API: GET /health (without WG, from outside Docker network)
@@ -221,29 +273,45 @@ docker compose exec test-client \
   curl -sf http://api.enclave.local:8000/health
 # Expected: {"status":"ok","db":"reachable"}
 
-# 3. Submit a range
+# 3. Submit a range (async POST → poll until done)
 docker compose exec test-client \
   curl -sf -X POST http://api.enclave.local:8000/primes \
     -H "Content-Type: application/json" \
-    -d '{"start":1,"end":100}'
-# Expected: 200, primes array length 25, execution_id present
+    -d '{"start":2,"end":100}'
+# Expected: 202, {execution_id, status:"queued"}
 
-# 4. Audit lookup (use execution_id from step 3)
+# 3b. Poll until done (smoke.sh handles this automatically)
 docker compose exec test-client \
-  curl -sf http://api.enclave.local:8000/executions/<id>
-# Expected: 200, {start, end, count, timestamp}
+  curl -sf http://api.enclave.local:8000/primes/<execution_id>
+# Expected: status "done", primes array length 25
 
-# 5. Negative test — bypass VPN
+# 4. Repeat same range — verify cache hit (latency < first call)
+docker compose exec test-client \
+  curl -sf -X POST http://api.enclave.local:8000/primes \
+    -H "Content-Type: application/json" \
+    -d '{"start":2,"end":100}'
+# then poll until done — should resolve faster (Valkey cache hit)
+
+# 5. Out-of-bounds → schema rejection
+docker compose exec test-client \
+  curl -sf -X POST http://api.enclave.local:8000/primes \
+    -H "Content-Type: application/json" \
+    -d '{"start":2,"end":10000002}'
+# Expected: 422 validation error
+
+# 6. Negative test — bypass VPN
 curl -m 5 http://localhost:8000/health
 # Expected: connection refused / timeout
 # (Proves API is not reachable outside the VPN network)
 ```
 
-Five steps. Two minutes. Pass = system meets the brief's security boundary requirement.
+Six steps. Two minutes. Pass = system meets the brief's security boundary + async + cache requirements.
 
-### Cloud deployment acceptance (Phase 2.3 — pending)
+The `smoke.sh` script inside the test-client container runs all six steps automatically (including the polling loop) and exits 0 on full pass.
 
-This gate exercises the **deployment-architecture VPN** (AWS Client VPN endpoint) end-to-end from a developer laptop. It only runs after Phase 2.3 completes a real `terraform apply` against a personal AWS account.
+### Cloud deployment acceptance (Phase 2.5 — pending)
+
+This gate exercises the **deployment-architecture VPN** (AWS Client VPN endpoint) end-to-end from a developer laptop. It only runs after Phase 2.5 completes a real `terraform apply` against a personal AWS account.
 
 ```text
 [macOS Tunnelblick / native OpenVPN client]
@@ -306,7 +374,9 @@ The deliverable is staged into numbered phases (decimals allowed for sub-progres
 | **1.5** | ✅ done | Phase 1 smoke test passes | Verified on 2026-04-25: OrbStack docker daemon, `docker compose up --build` healthy, smoke test 5/5 (test-client → API → DB), negative test confirms host-side `:8000` + `:5432` both `Connection refused` — VPN-only boundary proven. Initial Acceptance achieved. Two real bugs caught and fixed during this gate (`.dockerignore` over-excluded README.md; Dockerfile's editable install path mismatched runtime layout) |
 | **2.1** | ✅ done | Cross-cloud migration runbook | `docs/migration_runbook.md` — agent-executable spec, two tracks (Application + VPN modernisation) |
 | **2.2** | ✅ done | Multi-region scaling runbook | `docs/scaling_runbook.md` — same format, single-region → multi-region axis |
-| **2.3** | ⏳ pending | Cloud deployment live + AWS Client VPN end-to-end verified from local | `make tf-bootstrap` (state backend + GHA OIDC per ADR-0025/0026) → `make ts-bootstrap-certs OPERATOR=…` (Client VPN certs into ACM per ADR-0024) → uncomment `backend "s3"` + auto-scaling in `terraform/main.tf` → paste cert ARNs into gitignored `terraform.tfvars` → `make tf-apply` (6-step pre-flight per `scripts/ts_apply.sh`) → connect via Client VPN client from macOS → `curl https://<alb-private>/primes` returns prime list → evidence captured per `docs/design_doc.md` § 3 (Observability posture) into `docs/deployment_guide.md`. ADR-0015 plan-only stance was superseded for this phase (see ADR-0015 supersession block). Cost: **< $2 for the 3-hour acceptance window** (RDS Multi-AZ + Client VPN endpoint + ALB billed by hour, not by month); stack torn down immediately after evidence captured |
+| **2.3** | ✅ done | Async implementation (L1-L3) | `src/prime_service/queue.py`, `worker.py`, `bootstrap.py`; SQS + ElasticMQ local parity; POST → 202 + poll; backpressure middleware (503 + Retry-After); SIGALRM 60s per job; ADR-0029, ADR-0030, ADR-0032, ADR-0033 |
+| **2.4** | ✅ done | Distributed cache (L4) | `src/prime_service/cache.py`; ElastiCache Serverless Valkey + ZSET + Lua range-coalescing; bootstrap ECS task; Valkey local parity; ADR-0031, ADR-0034; smoke test 6/6 passes (cache miss → done, cache hit logged, backpressure 503) |
+| **2.5** | ⏳ pending | Cloud deployment live + AWS Client VPN end-to-end verified from local | `make tf-bootstrap` (state backend + GHA OIDC per ADR-0025/0026) → `make ts-bootstrap-certs OPERATOR=…` (Client VPN certs into ACM per ADR-0024) → uncomment `backend "s3"` + auto-scaling in `terraform/main.tf` → paste cert ARNs into gitignored `terraform.tfvars` → `make tf-apply` → connect via Client VPN client from macOS → `curl https://<alb-private>/primes` returns prime list → evidence captured per `docs/design_doc.md` § 3 + § 5 into `docs/deployment_guide.md`. ADR-0015 plan-only stance superseded for this phase. Cost: **< $2 for the 3-hour acceptance window**; stack torn down immediately after evidence captured |
 | **3.0** | ⏳ pending | Polish + cover note | Final README pass, `cover_note.md` (gitignored) drafted |
 | **3.1** | ⏳ pending | Repo published to private remote | Pre-push leak guard clean, repo invitation sent to recipient |
 | **3.2** | ⏳ pending | Submission email sent | End of cycle |
@@ -325,15 +395,18 @@ See [ADR-0012](docs/ADR/0012-migration-runbook-agent-executable.md) for the agen
 
 ## Cloud deployment
 
-The cloud target is a Terraform composition built entirely from `terraform-aws-modules/*` community modules:
+The cloud target is a Terraform composition built from `terraform-aws-modules/*` community modules and direct provider resources:
 
 - **Private-only VPC** across two AZs (per [ADR-0019](docs/ADR/0019-private-only-vpc-architecture.md)) — no IGW, no NAT, no public subnets; egress to AWS APIs via 8 interface VPC Endpoints + 1 S3 gateway endpoint
-- ECS Fargate behind **internal** ALB (private subnets only)
+- ECS Fargate behind **internal** ALB (private subnets only) — API service + worker service (auto-scaling on queue depth)
+- **SQS** queue (`aegis-enclave-primes`, visibility timeout 90s) for async job dispatch
+- **ElastiCache Serverless Valkey** for distributed prime-range cache (ZSET + Lua merge)
+- **Bootstrap ECS task** (one-shot, Terraform `null_resource`) to pre-warm Valkey with `[1, 100,000]`
 - RDS PostgreSQL Multi-AZ standby
 - AWS Client VPN endpoint with mutual-TLS authentication (ingress)
 - Secrets Manager + ECR + CloudWatch Logs (all reached via PrivateLink)
 
-**The Terraform code is `plan`-only by default** — the brief accepts a deployment guide as sufficient (Task 3 of the source brief — gitignored under `case_study/`). For Phase 2.3 of this delivery, ADR-0015's plan-only stance is superseded so the AWS Client VPN end-to-end path can be verified from a developer laptop against a real personal AWS account; see the supersession block at the bottom of [ADR-0015](docs/ADR/0015-no-k8s-no-real-apply.md) and [§ Cloud deployment acceptance](#cloud-deployment-acceptance-phase-23-pending) above for the gate that consumes it.
+**The Terraform code is `plan`-only by default** — the brief accepts a deployment guide as sufficient (Task 3 of the source brief — gitignored under `case_study/`). For Phase 2.5 of this delivery, ADR-0015's plan-only stance is superseded so the AWS Client VPN end-to-end path can be verified from a developer laptop against a real personal AWS account; see the supersession block at the bottom of [ADR-0015](docs/ADR/0015-no-k8s-no-real-apply.md) and [§ Cloud deployment acceptance](#cloud-deployment-acceptance-phase-25-pending) above for the gate that consumes it.
 
 For the full architectural walkthrough (Mermaid diagram, component table, network flow, plan walkthrough) see [`docs/deployment_guide.md`](docs/deployment_guide.md).
 
