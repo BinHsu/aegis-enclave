@@ -402,7 +402,7 @@ module "ecs" {
             { name = "POSTGRES_DB", value = "primes" },
           ]
           secrets = [
-            { name = "POSTGRES_PASSWORD", valueFrom = module.rds.db_instance_master_user_secret_arn },
+            { name = "POSTGRES_PASSWORD", valueFrom = "${module.rds.db_instance_master_user_secret_arn}:password::" },
           ]
 
           # ADR-0022 — Drain semantics. ECS sends SIGTERM, waits stop_timeout,
@@ -721,7 +721,7 @@ resource "aws_ecs_task_definition" "worker" {
     ]
 
     secrets = [
-      { name = "POSTGRES_PASSWORD", valueFrom = module.rds.db_instance_master_user_secret_arn },
+      { name = "POSTGRES_PASSWORD", valueFrom = "${module.rds.db_instance_master_user_secret_arn}:password::" },
     ]
 
     logConfiguration = {
@@ -774,7 +774,7 @@ resource "aws_ecs_task_definition" "cache_bootstrap" {
     ]
 
     secrets = [
-      { name = "POSTGRES_PASSWORD", valueFrom = module.rds.db_instance_master_user_secret_arn },
+      { name = "POSTGRES_PASSWORD", valueFrom = "${module.rds.db_instance_master_user_secret_arn}:password::" },
     ]
 
     logConfiguration = {
