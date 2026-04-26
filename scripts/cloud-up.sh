@@ -207,29 +207,37 @@ image_tag = "$IMAGE_TAG"
 EOF
 ok "wrote $TF_DIR/image-tag.auto.tfvars (image_tag=$IMAGE_TAG)"
 
-info "Building image (--platform linux/amd64 for Fargate; --provenance=false for deterministic digest)"
-# --provenance=false + --sbom=false: BuildKit attestation embeds build-time
-# metadata into the manifest, making same-content rebuilds produce different
-# digests. Without these, even cached re-builds would push a 'different' image.
-(cd "$REPO_ROOT" && docker build --platform linux/amd64 --provenance=false --sbom=false -t "$ECR_URL:$IMAGE_TAG" .)
+# Pre-check: does this tag already exist in ECR? Skip build+push entirely if yes.
+# With content-derived tags (git-sha or git-sha+content-hash), tag-exists ⇒ same
+# content. No need to rebuild, no need to push, no IMMUTABLE conflict.
+info "Checking if $IMAGE_TAG already in ECR..."
+if aws ecr describe-images --region "$REGION" --repository-name aegis-enclave \
+     --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+    ok "ECR tag '$IMAGE_TAG' already exists — skipping build + push (no-op)"
+    ok "Image already in ECR: $ECR_URL:$IMAGE_TAG"
+else
+    info "Tag '$IMAGE_TAG' not in ECR — building + pushing"
+    info "Building image (--platform linux/amd64 for Fargate; --provenance=false for deterministic digest)"
+    # --provenance=false + --sbom=false: BuildKit attestation embeds build-time
+    # metadata into the manifest, making same-content rebuilds produce different
+    # digests. Without these, the pre-check above couldn't be content-correct.
+    (cd "$REPO_ROOT" && docker build --platform linux/amd64 --provenance=false --sbom=false -t "$ECR_URL:$IMAGE_TAG" .)
 
-info "Pushing image: $ECR_URL:$IMAGE_TAG"
-PUSH_RC=0
-PUSH_RAW=$(docker push "$ECR_URL:$IMAGE_TAG" 2>&1) || PUSH_RC=$?
-if [[ "$PUSH_RC" -ne 0 ]]; then
-    if echo "$PUSH_RAW" | grep -qiE 'tag.*already exists.*immutable|cannot be overwritten'; then
-        # Should be very rare with content-derived tags; means dirty content hash collided
-        printf "\n--- docker push hit IMMUTABLE tag conflict on tag '%s' ---\n%s\n--- end ---\n" "$IMAGE_TAG" "$PUSH_RAW" >&2
-        printf "Same tag exists in ECR with different content. Either:\n" >&2
-        printf "  - aws ecr batch-delete-image --region %s --repository-name aegis-enclave --image-ids imageTag=%s\n" "$REGION" "$IMAGE_TAG" >&2
-        printf "  - or commit your changes (clean tree → git-sha-only tag, no dirty hash)\n" >&2
-        fail "ECR push blocked by IMMUTABLE on tag $IMAGE_TAG"
-    else
+    info "Pushing image: $ECR_URL:$IMAGE_TAG"
+    PUSH_RC=0
+    PUSH_RAW=$(docker push "$ECR_URL:$IMAGE_TAG" 2>&1) || PUSH_RC=$?
+    if [[ "$PUSH_RC" -ne 0 ]]; then
         printf "\n--- docker push failed ---\n%s\n--- end ---\n" "$PUSH_RAW" >&2
-        fail "ECR push failed for unexpected reason"
+        if echo "$PUSH_RAW" | grep -qiE 'tag.*already exists.*immutable|cannot be overwritten'; then
+            # Race: tag created between describe-images and push. Or content hash
+            # collision (extremely rare). Either way, drop the tag and retry.
+            printf "\nTag was created between pre-check and push (race), or content hash collision.\n" >&2
+            printf "Recovery: aws ecr batch-delete-image --region %s --repository-name aegis-enclave --image-ids imageTag=%s\n" "$REGION" "$IMAGE_TAG" >&2
+        fi
+        fail "ECR push failed"
     fi
+    ok "Image pushed: $ECR_URL:$IMAGE_TAG"
 fi
-ok "Image pushed: $ECR_URL:$IMAGE_TAG"
 
 # ─── Phase 3: Full terraform apply ─────────────────────────────────────────
 section "6/6 — Full terraform apply (Phase 2.5 cost timer starts now)"
