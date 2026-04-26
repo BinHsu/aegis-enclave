@@ -541,6 +541,40 @@ resource "aws_sqs_queue" "primes_dlq" {
   receive_wait_time_seconds = 0
 }
 
+# ─── DLQ depth alarm — operator-actionable signal (ADR-0038) ──────────────
+# Auto-retry workers polling DLQ are an anti-pattern (failed messages
+# thrash main ↔ DLQ indefinitely). Production-shape DLQ pattern is:
+#   alarm on depth > 0 → operator notified → manual triage via
+#   scripts/dlq-triage.sh → optional selective replay after root-cause fix.
+#
+# This alarm fires on any DLQ depth > 0 (zero-tolerance: a message in DLQ
+# means worker exhausted maxReceiveCount=3 retries on the main queue, which
+# is a real failure, not transient noise).
+#
+# alarm_actions intentionally empty for the case-study PoC: ADR-0038 records
+# this as an operator-add (forker provisions an SNS topic + email/Slack
+# subscription per their existing alerting infrastructure). The ALARM state
+# transition is still observable in CloudWatch console + EventBridge.
+resource "aws_cloudwatch_metric_alarm" "dlq_depth" {
+  alarm_name          = "aegis-enclave-primes-dlq-depth"
+  alarm_description   = "DLQ has at least one message - worker exhausted maxReceiveCount=3 retries on main queue. Triage with scripts/dlq-triage.sh per ADR-0038."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 60 # 1-minute granularity
+  statistic           = "Maximum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching" # zero-depth = OK, missing data = OK
+
+  dimensions = {
+    QueueName = aws_sqs_queue.primes_dlq.name
+  }
+
+  # alarm_actions = [] — case-study PoC; production add: SNS topic ARN here.
+  # ok_actions = []    — same; alarms transition to OK silently.
+}
+
 resource "aws_sqs_queue" "primes" {
   name                       = "aegis-enclave-primes"
   visibility_timeout_seconds = var.sqs_visibility_timeout
