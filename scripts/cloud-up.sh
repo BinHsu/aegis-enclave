@@ -171,14 +171,26 @@ EOF
     ok "Wrote $CERT_TFVARS"
 fi
 
-# ─── Phase 2: ECR + image push (chicken-and-egg break) ─────────────────────
-section "5/6 — ECR build + image push"
+# ─── Phase 2: Pre-deps apply + ECR + image push ────────────────────────────
+# Two reasons for the staged -target apply:
+#   1. ECR must exist before docker push (chicken-and-egg).
+#   2. ECS module's container_definitions for_each fails at plan time when
+#      module.rds + module.vpc outputs are unknown — terraform infers the
+#      whole map as 'unknown' and bails ("for_each map includes keys derived
+#      from resource attributes that cannot be determined until apply").
+#      Pre-applying VPC+RDS+ECR makes those refs resolvable, the full apply
+#      then plans cleanly.
+section "5/6 — Pre-deps apply + image push"
+warn "🚨 Cost timer starts NOW — provisioning VPC + RDS + ECR (~10-12 min first time)"
 info "terraform init"
 (cd "$TF_DIR" && terraform init -backend=false -input=false >/dev/null)
-info "terraform apply -target=module.ecr (creates registry only)"
-(cd "$TF_DIR" && terraform apply -target=module.ecr -auto-approve -input=false)
+info "terraform apply -target=module.vpc -target=module.rds -target=module.ecr -auto-approve"
+info "(VPC ~1 min, ECR ~10 sec, RDS Multi-AZ ~8-12 min for first creation)"
+(cd "$TF_DIR" && terraform apply \
+    -target=module.vpc -target=module.rds -target=module.ecr \
+    -auto-approve -input=false)
 ECR_URL=$(cd "$TF_DIR" && terraform output -raw ecr_repository_url)
-ok "ECR repository: $ECR_URL"
+ok "Pre-deps applied. ECR repository: $ECR_URL"
 
 info "Logging into ECR ($REGION)"
 aws ecr get-login-password --region "$REGION" | \
@@ -239,9 +251,10 @@ else
     ok "Image pushed: $ECR_URL:$IMAGE_TAG"
 fi
 
-# ─── Phase 3: Full terraform apply ─────────────────────────────────────────
-section "6/6 — Full terraform apply (Phase 2.5 cost timer starts now)"
-info "Running 'make tf-apply' (= scripts/ts_apply.sh wrapper with 6 pre-flight checks)"
+# ─── Phase 3: Full terraform apply (remaining ~70 resources) ───────────────
+section "6/6 — Full terraform apply (remaining resources)"
+info "Pre-deps already applied above. ts_apply.sh will plan + prompt for the rest"
+info "(Client VPN, ALB, ECS service, Valkey, SQS, IAM, autoscaling, VPC endpoints)"
 "$SCRIPT_DIR/ts_apply.sh"
 
 # ─── Print operator next-steps ─────────────────────────────────────────────
