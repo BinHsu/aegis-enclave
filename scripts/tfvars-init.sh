@@ -91,33 +91,47 @@ if [[ -z "${AWS_PROFILE:-}" ]]; then
 fi
 info "Using AWS_PROFILE=$AWS_PROFILE"
 
-if ! AUTH_RAW=$(aws sts get-caller-identity 2>&1); then
-    printf "\n--- aws sts get-caller-identity --profile %s failed ---\n%s\n--- end ---\n" \
-        "$AWS_PROFILE" "$AUTH_RAW" >&2
+AUTH_RAW=""
+AUTH_RC=0
+AUTH_RAW=$(aws sts get-caller-identity 2>&1) || AUTH_RC=$?
+
+if [[ "$AUTH_RC" -ne 0 ]]; then
+    printf "\n--- aws sts get-caller-identity --profile %s failed (exit %d) ---\n%s\n--- end ---\n" \
+        "$AWS_PROFILE" "$AUTH_RC" "$AUTH_RAW" >&2
 
     if ! aws configure list-profiles 2>/dev/null | grep -qx "$AWS_PROFILE"; then
         printf "\nProfile '%s' is NOT in 'aws configure list-profiles'. Available:\n" "$AWS_PROFILE" >&2
         aws configure list-profiles 2>/dev/null | sed 's/^/  - /' >&2
-        printf "\nNote: SSO sessions ([sso-session NAME]) are NOT profiles. Pick a profile name.\n" >&2
+        printf "\nSSO sessions in your config:\n" >&2
+        (grep -E '^\[sso-session ' ~/.aws/config 2>/dev/null | sed 's/^\[sso-session \(.*\)\]/  - \1/' || echo "  (none)") >&2
         fail "Profile '$AWS_PROFILE' does not exist"
     fi
 
     if (( IS_BATCH )); then
-        fail "AWS auth failed for profile '$AWS_PROFILE' (batch mode — cannot run 'aws sso login' interactively).
-Refresh creds in the calling environment before running --batch."
-    fi
-    if aws configure get sso_session --profile "$AWS_PROFILE" >/dev/null 2>&1 \
-       || aws configure get sso_start_url --profile "$AWS_PROFILE" >/dev/null 2>&1; then
-        info "profile is SSO-configured — running 'aws sso login --profile $AWS_PROFILE'"
-        aws sso login --profile "$AWS_PROFILE" || fail "SSO login failed"
+        if [[ -n "${SSO_SESSION:-}" ]]; then
+            info "Refreshing SSO (SSO_SESSION=$SSO_SESSION env var, batch mode)"
+            aws sso login --sso-session "$SSO_SESSION" || fail "SSO login failed"
+        else
+            fail "AWS auth failed (batch mode — cannot prompt). Set SSO_SESSION env var or refresh creds before retrying."
+        fi
     else
-        fail "Profile '$AWS_PROFILE' has no SSO config and creds are invalid.
-Recommended: 'aws configure sso --profile $AWS_PROFILE' (SSO is the recommended path).
-Or: check ~/.aws/credentials for valid long-term keys."
+        printf "SSO session name to refresh token (Enter to skip): "
+        read -r SSO_SESSION_INPUT
+        if [[ -n "$SSO_SESSION_INPUT" ]]; then
+            info "Running: aws sso login --sso-session $SSO_SESSION_INPUT"
+            aws sso login --sso-session "$SSO_SESSION_INPUT" || fail "SSO login failed"
+        fi
+    fi
+
+    AUTH_RC=0
+    AUTH_RAW=$(aws sts get-caller-identity 2>&1) || AUTH_RC=$?
+    if [[ "$AUTH_RC" -ne 0 ]]; then
+        printf "\n--- aws sts STILL fails (exit %d) ---\n%s\n--- end ---\n" "$AUTH_RC" "$AUTH_RAW" >&2
+        fail "AWS auth still failing"
     fi
 fi
 
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+ACCOUNT_ID=$( ( printf '%s' "$AUTH_RAW" | grep -oE '"Account":[[:space:]]*"[0-9]+"' | grep -oE '[0-9]+' | head -1 ) 2>/dev/null || echo "?" )
 ok "AWS account: $ACCOUNT_ID"
 
 # ─── Helpers ───────────────────────────────────────────────────────────────

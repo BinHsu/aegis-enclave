@@ -72,44 +72,52 @@ if [[ -z "${AWS_PROFILE:-}" ]]; then
 fi
 info "Using AWS_PROFILE=$AWS_PROFILE"
 
-# Verify creds; auto-trigger SSO login on expired token (no-op for long-term creds)
-if ! AUTH_RAW=$(aws sts get-caller-identity 2>&1); then
+# Try sts. If fails, prompt for SSO session to refresh (Enter = skip + retry as-is).
+AUTH_RAW=""
+AUTH_RC=0
+AUTH_RAW=$(aws sts get-caller-identity 2>&1) || AUTH_RC=$?
+
+if [[ "$AUTH_RC" -ne 0 ]]; then
     # Print raw AWS CLI error first (per feedback_aws_creds_agnostic.md rule #4)
-    printf "\n--- aws sts get-caller-identity --profile %s failed ---\n%s\n--- end ---\n" \
-        "$AWS_PROFILE" "$AUTH_RAW" >&2
+    printf "\n--- aws sts get-caller-identity --profile %s failed (exit %d) ---\n%s\n--- end ---\n" \
+        "$AWS_PROFILE" "$AUTH_RC" "$AUTH_RAW" >&2
 
     # Distinguish: profile doesn't exist vs profile exists but creds bad
     if ! aws configure list-profiles 2>/dev/null | grep -qx "$AWS_PROFILE"; then
         printf "\nProfile '%s' is NOT in 'aws configure list-profiles'.\n" "$AWS_PROFILE" >&2
         printf "Available profiles:\n" >&2
         aws configure list-profiles 2>/dev/null | sed 's/^/  - /' >&2
-        printf "\nNote: SSO sessions ([sso-session NAME] in ~/.aws/config) are NOT profiles.\n" >&2
-        printf "      A profile is [profile NAME] and may reference 'sso_session = NAME'.\n" >&2
-        printf "      If 'aegis' is your sso-session, you need a profile that uses it.\n" >&2
-        fail "Profile '$AWS_PROFILE' does not exist — pick one from the list above (or 'aws configure sso --profile <new-name>')"
+        printf "\nNote: SSO sessions ([sso-session NAME]) are NOT profiles. SSO sessions in your config:\n" >&2
+        (grep -E '^\[sso-session ' ~/.aws/config 2>/dev/null | sed 's/^\[sso-session \(.*\)\]/  - \1/' || echo "  (none)") >&2
+        fail "Profile '$AWS_PROFILE' does not exist — pick one from the list above"
     fi
 
-    # Profile exists — check SSO config and auto-login
-    if aws configure get sso_session --profile "$AWS_PROFILE" >/dev/null 2>&1 \
-       || aws configure get sso_start_url --profile "$AWS_PROFILE" >/dev/null 2>&1; then
-        info "profile is SSO-configured (recommended) — running 'aws sso login --profile $AWS_PROFILE'"
-        aws sso login --profile "$AWS_PROFILE" || fail "SSO login failed for profile $AWS_PROFILE"
+    # Profile exists. Prompt for SSO session refresh (Enter = skip).
+    printf "SSO session name to refresh token (Enter to skip if you already have a valid token): "
+    read -r SSO_SESSION_INPUT
+    if [[ -n "$SSO_SESSION_INPUT" ]]; then
+        info "Running: aws sso login --sso-session $SSO_SESSION_INPUT"
+        aws sso login --sso-session "$SSO_SESSION_INPUT" || fail "SSO login failed for session $SSO_SESSION_INPUT"
     else
-        fail "Profile '$AWS_PROFILE' exists but has no SSO config (no sso_session / sso_start_url).
-If using long-term creds: add aws_access_key_id + aws_secret_access_key to ~/.aws/credentials.
-If using SSO: re-run 'aws configure sso --profile $AWS_PROFILE'."
+        info "Skipping SSO refresh; will retry sts as-is"
+    fi
+
+    # Retry sts after refresh attempt
+    AUTH_RC=0
+    AUTH_RAW=$(aws sts get-caller-identity 2>&1) || AUTH_RC=$?
+    if [[ "$AUTH_RC" -ne 0 ]]; then
+        printf "\n--- aws sts STILL fails after SSO refresh attempt (exit %d) ---\n%s\n--- end ---\n" \
+            "$AUTH_RC" "$AUTH_RAW" >&2
+        fail "AWS auth still failing. Check profile config (~/.aws/config) or refresh creds manually."
     fi
 fi
 
-CALLER_JSON=$(aws sts get-caller-identity 2>&1) || {
-    printf "\n--- aws sts get-caller-identity failed ---\n%s\n--- end ---\n" "$CALLER_JSON" >&2
-    if echo "$CALLER_JSON" | grep -qE 'UnauthorizedOperation|AccessDenied'; then
-        printf "Hint: looks like missing IAM permission sts:GetCallerIdentity (very rare — usually default).\n" >&2
-    fi
-    fail "AWS auth still failed after auth attempt — see raw output above"
-}
-ACCOUNT_ID=$(echo "$CALLER_JSON" | grep -oE '"Account":[^,}]*' | sed -E 's/.*"([0-9]+)".*/\1/')
-ARN=$(echo "$CALLER_JSON" | grep -oE '"Arn":"[^"]*"' | sed -E 's/"Arn":"(.+)"/\1/')
+# Parse account info — defensive (set -e + pipefail would silently abort on grep no-match).
+# Use a subshell with explicit fallback so an unexpected sts JSON shape can't kill the script.
+ACCOUNT_ID=$( ( printf '%s' "$AUTH_RAW" | grep -oE '"Account":[[:space:]]*"[0-9]+"' | grep -oE '[0-9]+' | head -1 ) 2>/dev/null || echo "?" )
+ARN=$( ( printf '%s' "$AUTH_RAW" | grep -oE '"Arn":[[:space:]]*"[^"]+"' | sed -E 's/.*"(arn:[^"]+)".*/\1/' | head -1 ) 2>/dev/null || echo "?" )
+[[ -z "$ACCOUNT_ID" ]] && ACCOUNT_ID="?"
+[[ -z "$ARN" ]] && ARN="?"
 ok "AWS account: $ACCOUNT_ID"
 ok "AWS caller:  $ARN"
 info "Tip: to run 'aws ...' directly in this terminal (outside make targets), set:"
