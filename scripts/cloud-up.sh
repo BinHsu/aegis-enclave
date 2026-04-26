@@ -276,24 +276,16 @@ cat <<EOF
   AWS_PROFILE export inside this script is subshell-only and doesn't carry
   back to your terminal):
 
-    1. Download VPN client config:
-       aws ec2 export-client-vpn-client-configuration \\
-           --profile $AWS_PROFILE \\
-           --region $REGION \\
-           --client-vpn-endpoint-id $VPN_ID \\
-           --output text > pki/$OPERATOR.ovpn
+    1. Download VPN client config (single-line, copy-paste safe):
+       aws ec2 export-client-vpn-client-configuration --profile $AWS_PROFILE --region $REGION --client-vpn-endpoint-id $VPN_ID --output text > pki/$OPERATOR.ovpn
        Append the operator's client cert + key (in pki/$OPERATOR/) into the .ovpn
 
     2. Connect via Tunnelblick or 'sudo openvpn --config pki/$OPERATOR.ovpn'
 
-    3. Run smoke test (the make target reads terraform outputs; it inherits
-       AWS_PROFILE if set in your shell, otherwise prompts):
+    3. Run smoke test:
          AWS_PROFILE=$AWS_PROFILE make cloud-smoke
-       (or manually:
-         ALB_IP=\$(dig +short \$(cd terraform && terraform output -raw alb_dns_name) | head -1)
-         cd terraform && terraform output -raw alb_self_signed_ca_pem > /tmp/alb-ca.pem
-         CURL="curl --cacert /tmp/alb-ca.pem --resolve api.enclave.internal:443:\$ALB_IP"
-         \$CURL https://api.enclave.internal/health)
+       (or manually, single-line:
+         CA=/tmp/alb-ca.pem; cd terraform && terraform output -raw alb_self_signed_ca_pem > \$CA && ALB_IP=\$(dig +short \$(terraform output -raw alb_dns_name) | head -1) && cd .. && curl --cacert \$CA --resolve api.enclave.internal:443:\$ALB_IP https://api.enclave.internal/health)
 
     4. CloudWatch evidence capture (per memory feedback_phase25_screenshot_evidence.md):
          AWS_PROFILE=$AWS_PROFILE make cloud-evidence
