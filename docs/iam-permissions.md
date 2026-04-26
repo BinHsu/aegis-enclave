@@ -110,11 +110,13 @@ Long-term keys also work (placed in `~/.aws/credentials`), but SSO is preferred 
 
 ## CI runner usage
 
-Pre-create the IAM policy as a customer managed policy:
+Pre-create the IAM policy as a customer managed policy. Two JSON files live in `docs/`:
+- `docs/iam-policy-tier1.json` — pre-flight / validation perms (read-only)
+- `docs/iam-policy-tier2.json` — IAM-role provisioning scope (pair with AWS managed `PowerUserAccess` for full deploy)
 
 ```bash
 aws iam create-policy \
-  --policy-name AegisEnclaveCaseStudy \
+  --policy-name AegisEnclaveCaseStudyIAM \
   --policy-document file://docs/iam-policy-tier2.json
 ```
 
