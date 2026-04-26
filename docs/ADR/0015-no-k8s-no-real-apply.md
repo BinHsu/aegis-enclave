@@ -51,7 +51,7 @@ The Phase-1 stance above remains in force for the **case-study deliverable cycle
 
 The order of operations is documented in ADR-0023 § Future direction: bootstrap state backend → import certs → first apply → connect via VPN → verify drain semantics (ADR-0022) end-to-end.
 
-**The case-study artefact still does not include screenshots, deployed URLs, or any output of a real apply.** Personal Phase-2 deployment is for the operator's own validation and demo capability, not for the buyer's review surface. Anything the operator captures from a real deployment is kept out of the repo (per the same "no AWS account exposure" hygiene that motivated the original Phase-1 decision).
+**Phase 2.5 evidence capture changes this posture for the cloud-acceptance window.** After the Phase 2.5 `terraform apply` and VPN end-to-end verification run against the operator's personal AWS account, redacted evidence (CloudWatch dashboards, per-endpoint curl/log pairs, VPN handshake, `terraform output`, bootstrap task logs) is committed to `docs/deployment_guide.md`. The evidence is captured before `terraform destroy` and partially redacted (account IDs, ARNs, ALB DNS) per `make pre-push-check` hygiene. The stack is torn down immediately after evidence capture; the acceptance window is bounded to ≤ 3 hours, < $2 total cost. For the Phase 2.5 window and after, the case-study artefact includes that captured evidence as a receipt of the real deployment.
 
 ## Related ADRs
 - ADR-0002 (15h time budget — superseded by ADR-0028 raising cap to 22h; the constraint this decision protects)

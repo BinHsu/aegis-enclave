@@ -1,7 +1,7 @@
 # ADR-0028: Time budget revised — 15 hours → 22 hours
 
 ## Status
-Accepted (2026-04-25) — supersedes ADR-0002
+Superseded by ADR-0034 (2026-04-26) — supersedes ADR-0002. The 22h cap is further revised to 24h to accommodate L4 range-coalescing expansion (ElastiCache Serverless Valkey + ZSET + Lua atomicity, +2h).
 
 ## Context
 
