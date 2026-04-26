@@ -324,33 +324,42 @@ This gate exercises the **deployment-architecture VPN** (AWS Client VPN endpoint
 ```
 
 ```bash
-# 1. (one-off) Bootstrap state backend + GHA OIDC role per ADR-0025/0026
-make tf-bootstrap
+# Pre-req (operator-side, one-time): AWS account, SSO configured, AWS_PROFILE exported,
+# Docker Desktop running, terraform + aws CLI installed.
+aws sso login --sso-session <name>
+export AWS_PROFILE=<sso-profile>
+aws sts get-caller-identity   # verify
 
-# 2. (one-off) Generate Client VPN server + client certs and import to ACM (ADR-0024)
-make ts-bootstrap-certs OPERATOR=<your-handle>
+# Phase 2.5 deploy — one-shot orchestrator (cert + ECR + image push + apply):
+make cloud-up   # ~15-20 min; idempotent if cert-arns.auto.tfvars already exists
 
-# 3. Uncomment `backend "s3"` and the auto-scaling block in terraform/main.tf,
-#    paste cert ARNs into gitignored terraform/terraform.tfvars, then:
-make tf-apply
+# Operator next-steps (printed by cloud-up at the end):
+#   - Download VPN config and connect via Tunnelblick / openvpn
+#   - Run smoke (constructed curl with --cacert + --resolve per ADR-0027 HTTPS)
+#   - Capture CloudWatch evidence BEFORE teardown (per memory feedback_phase25_screenshot_evidence.md)
 
-# 4. Import the operator .ovpn package into Tunnelblick (or `openvpn3 session-start`)
-#    and connect.
+# Phase 2.5 teardown — one-shot (drains ECR + destroys + cleans ACM-imported certs + verifies):
+make cloud-down
+# Collateral-free: only resources tagged owner=bin.hsu / managed by this terraform/ are touched.
 
-# 5. From macOS, with the VPN tunnel active — pre-flight curl plumbing per ADR-0027
-#    (HTTPS on internal ALB via self-signed ACM-imported cert):
+# Low-level / surgical alternatives (cloud-up + cloud-down call these internally):
+#   make ts-bootstrap-certs OPERATOR=<name>  # VPN PKI provisioning only
+#   make tf-apply                            # surgical apply (skips cert + image push)
+#   make tf-destroy                          # surgical destroy (skips ECR drain + ACM cleanup)
+#   make tf-bootstrap                        # state backend (production adoption only — case-study uses local state)
+```
+
+Sample smoke (HTTPS via self-signed ACM-imported cert per ADR-0027):
+
+```bash
 ALB_DNS=$(terraform -chdir=terraform output -raw alb_dns_name)
 ALB_IP=$(dig +short $ALB_DNS | head -1)
 terraform -chdir=terraform output -raw alb_self_signed_ca_pem > /tmp/alb-ca.pem
+CURL="curl --cacert /tmp/alb-ca.pem --resolve api.enclave.internal:443:${ALB_IP}"
+$CURL https://api.enclave.internal/primes -X POST -H 'Content-Type: application/json' -d '{"start":2,"end":100}'
+# Expected: 202 + execution_id; poll GET /primes/{id} until status="done".
 
-curl --cacert /tmp/alb-ca.pem \
-     --resolve api.enclave.internal:443:${ALB_IP} \
-     https://api.enclave.internal/primes \
-     -X POST -H 'Content-Type: application/json' \
-     -d '{"start":2,"end":100}'
-# Expected: 200, primes array length 25, execution_id present.
-
-# 6. Negative test — disconnect VPN, repeat the curl:
+# Negative test — disconnect VPN, repeat:
 # Expected: timeout (ALB is in private subnets only — see ADR-0019).
 ```
 
@@ -376,7 +385,7 @@ The deliverable is staged into numbered phases (decimals allowed for sub-progres
 | **2.2** | ✅ done | Multi-region scaling runbook | `docs/scaling_runbook.md` — same format, single-region → multi-region axis |
 | **2.3** | ✅ done | Async implementation (L1-L3) | `src/prime_service/queue.py`, `worker.py`, `bootstrap.py`; SQS + ElasticMQ local parity; POST → 202 + poll; backpressure middleware (503 + Retry-After); SIGALRM 60s per job; ADR-0029, ADR-0030, ADR-0032, ADR-0033 |
 | **2.4** | ✅ done | Distributed cache (L4) | `src/prime_service/cache.py`; ElastiCache Serverless Valkey + ZSET + Lua range-coalescing; bootstrap ECS task; Valkey local parity; ADR-0031, ADR-0034; smoke test 6/6 passes (cache miss → done, cache hit logged, backpressure 503) |
-| **2.5** | ⏳ pending | Cloud deployment live + AWS Client VPN end-to-end verified from local | `make tf-bootstrap` (state backend + GHA OIDC per ADR-0025/0026) → `make ts-bootstrap-certs OPERATOR=…` (Client VPN certs into ACM per ADR-0024) → uncomment `backend "s3"` + auto-scaling in `terraform/main.tf` → paste cert ARNs into gitignored `terraform.tfvars` → `make tf-apply` → connect via Client VPN client from macOS → `curl https://<alb-private>/primes` returns prime list → evidence captured per `docs/design_doc.md` § 3 + § 5 into `docs/deployment_guide.md`. ADR-0015 plan-only stance superseded for this phase. Cost: **< $2 for the 3-hour acceptance window**; stack torn down immediately after evidence captured |
+| **2.5** | ⏳ pending | Cloud deployment live + AWS Client VPN end-to-end verified from local | `make cloud-up` (one-shot orchestrator: pre-flight + cert provisioning per ADR-0024 + ECR build/push + full `terraform apply` per ADR-0034 superseding ADR-0015 plan-only stance) → connect via Client VPN client from macOS → smoke 6/6 via `curl https://<alb-private>/primes` → evidence captured per `docs/design_doc.md` § 3 + § 5 into `docs/deployment_guide.md` → `make cloud-down` (drains ECR + `terraform destroy` + ACM cert cleanup + collateral-free verify). Cost: **< $2 for the 3-hour acceptance window**; stack torn down immediately after evidence captured |
 | **3.0** | ⏳ pending | Polish + cover note | Final README pass, `cover_note.md` (gitignored) drafted |
 | **3.1** | ⏳ pending | Repo published to private remote | Pre-push leak guard clean, repo invitation sent to recipient |
 | **3.2** | ⏳ pending | Submission email sent | End of cycle |
