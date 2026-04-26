@@ -12,7 +12,7 @@ The local Docker Compose layout is documented in [`README.md` § Architecture](.
 
 This guide assumes you have completed the README's Prerequisites and run `make install`. Additionally, for the cloud-acceptance gate (Phase 2.5):
 
-- AWS account with the IAM permissions listed in `terraform/iam-bootstrap-readme.md` (or equivalent — check `terraform/` for the bootstrap policy)
+- AWS account with the IAM permissions listed in [`docs/iam-permissions.md`](iam-permissions.md) (two-tier policy: pre-flight read-only + full deploy with `PowerUserAccess` + IAM-scoped) — covers all `make cloud-up` / `make cloud-down` / `make cloud-smoke` / `make cloud-evidence` targets, plus a CI runner section with a GitHub Actions OIDC sketch
 - AWS region selected (default `eu-central-1` — see `terraform/variables.tf`)
 - VPC quotas sufficient for one VPC + 2 private subnets + 2 public subnets + 1 NAT gateway + 1 ALB + 1 ECS cluster + 1 ElastiCache Serverless cache + 1 Client VPN endpoint
 - Cost ceiling awareness: a 3h apply window typically costs **< $2** at us-east-1 / eu-central-1 rates; verify in AWS Pricing Calculator before apply if your account has unusual pricing
