@@ -59,11 +59,33 @@ command -v docker >/dev/null 2>&1    || fail "docker not found in PATH"
 docker info >/dev/null 2>&1          || fail "docker daemon not running (start Docker Desktop?)"
 ok "terraform / aws / docker all present and ready"
 
-# ─── Pre-flight: AWS authentication ────────────────────────────────────────
+# ─── Pre-flight: AWS authentication (source-agnostic; SSO recommended) ────
+# We don't care if the profile is SSO-configured or uses long-term creds —
+# we only care that 'aws sts get-caller-identity' works. SSO is recommended
+# (refreshable, short-lived tokens, audit trail) but long-term creds also work.
+# See memory feedback_aws_creds_agnostic.md.
 section "2/6 — AWS authentication"
-CALLER_JSON=$(aws sts get-caller-identity 2>&1) || fail "aws sts get-caller-identity failed:
-$CALLER_JSON
-Hint: 'aws sso login --sso-session <name>' + 'export AWS_PROFILE=<profile>'"
+if [[ -z "${AWS_PROFILE:-}" ]]; then
+    printf "AWS_PROFILE not set. Enter profile name [default]: "
+    read AWS_PROFILE_INPUT
+    export AWS_PROFILE="${AWS_PROFILE_INPUT:-default}"
+fi
+info "Using AWS_PROFILE=$AWS_PROFILE"
+
+# Verify creds; auto-trigger SSO login on expired token (no-op for long-term creds)
+if ! aws sts get-caller-identity >/dev/null 2>&1; then
+    if aws configure get sso_session --profile "$AWS_PROFILE" >/dev/null 2>&1 \
+       || aws configure get sso_start_url --profile "$AWS_PROFILE" >/dev/null 2>&1; then
+        info "profile is SSO-configured (recommended) — running 'aws sso login --profile $AWS_PROFILE'"
+        aws sso login --profile "$AWS_PROFILE" || fail "SSO login failed for profile $AWS_PROFILE"
+    else
+        fail "Long-term creds invalid/missing for profile '$AWS_PROFILE'.
+Recommended fix: configure SSO via 'aws configure sso --profile $AWS_PROFILE'.
+Or: check ~/.aws/credentials for valid long-term access keys."
+    fi
+fi
+
+CALLER_JSON=$(aws sts get-caller-identity 2>&1) || fail "aws sts get-caller-identity still failed after auth attempt"
 ACCOUNT_ID=$(echo "$CALLER_JSON" | grep -oE '"Account":[^,}]*' | sed -E 's/.*"([0-9]+)".*/\1/')
 ARN=$(echo "$CALLER_JSON" | grep -oE '"Arn":"[^"]*"' | sed -E 's/"Arn":"(.+)"/\1/')
 ok "AWS account: $ACCOUNT_ID"

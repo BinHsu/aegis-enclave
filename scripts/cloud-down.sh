@@ -56,8 +56,25 @@ section "1/6 — Pre-flight"
 command -v terraform >/dev/null 2>&1 || fail "terraform not found in PATH"
 command -v aws >/dev/null 2>&1       || fail "aws CLI not found in PATH"
 
-CALLER_JSON=$(aws sts get-caller-identity 2>&1) || fail "aws sts get-caller-identity failed:
-$CALLER_JSON"
+# AWS auth: source-agnostic (SSO recommended). See memory feedback_aws_creds_agnostic.md.
+if [[ -z "${AWS_PROFILE:-}" ]]; then
+    printf "AWS_PROFILE not set. Enter profile name [default]: "
+    read AWS_PROFILE_INPUT
+    export AWS_PROFILE="${AWS_PROFILE_INPUT:-default}"
+fi
+info "Using AWS_PROFILE=$AWS_PROFILE"
+
+if ! aws sts get-caller-identity >/dev/null 2>&1; then
+    if aws configure get sso_session --profile "$AWS_PROFILE" >/dev/null 2>&1 \
+       || aws configure get sso_start_url --profile "$AWS_PROFILE" >/dev/null 2>&1; then
+        info "profile is SSO-configured — running 'aws sso login --profile $AWS_PROFILE'"
+        aws sso login --profile "$AWS_PROFILE" || fail "SSO login failed for profile $AWS_PROFILE"
+    else
+        fail "Long-term creds invalid for profile '$AWS_PROFILE'. Check ~/.aws/credentials."
+    fi
+fi
+
+CALLER_JSON=$(aws sts get-caller-identity 2>&1) || fail "aws sts get-caller-identity still failed"
 ACCOUNT_ID=$(echo "$CALLER_JSON" | grep -oE '"Account":[^,}]*' | sed -E 's/.*"([0-9]+)".*/\1/')
 ARN=$(echo "$CALLER_JSON" | grep -oE '"Arn":"[^"]*"' | sed -E 's/"Arn":"(.+)"/\1/')
 ok "AWS account: $ACCOUNT_ID"

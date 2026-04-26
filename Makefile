@@ -148,6 +148,27 @@ cloud-up: ## Phase 2.5 one-shot deploy — pre-flight + cert + ECR + image push 
 cloud-down: ## Phase 2.5 one-shot teardown — drain ECR + destroy + ACM cleanup + collateral-free verify
 	@./scripts/cloud-down.sh
 
+.PHONY: cloud-smoke
+cloud-smoke: ## Phase 2.5 cloud-side 6-step smoke (POST + poll + cache hit + 422 + backpressure)
+	@./scripts/cloud-smoke.sh
+
+.PHONY: cloud-evidence
+cloud-evidence: ## Phase 2.5 evidence capture — CloudWatch metric widgets + worker/bootstrap logs + tf output
+	@./scripts/cloud-evidence.sh
+
+# ---------------------------------------------------------------------------
+# Supply-chain audit (rubric P1 — pip-audit; install via 'brew install pip-audit')
+# ---------------------------------------------------------------------------
+
+.PHONY: audit
+audit: _ensure-venv ## Run pip-audit against current venv deps for known CVEs (rubric P1)
+	@command -v pip-audit >/dev/null 2>&1 || { echo "pip-audit not installed. Run 'brew install pip-audit'"; exit 1; }
+	@TMPFILE=$$(mktemp -t aegis-audit.XXXXXX); \
+	 $(PYTHON_BIN)/pip freeze > $$TMPFILE; \
+	 pip-audit -r $$TMPFILE; RC=$$?; \
+	 rm -f $$TMPFILE; \
+	 exit $$RC
+
 .PHONY: tf-bootstrap
 tf-bootstrap: ## OPERATOR USE ONLY — provision Phase-2 prerequisites (state backend + GHA OIDC role)
 	@cd terraform/bootstrap && terraform init && terraform apply
