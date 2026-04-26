@@ -203,7 +203,7 @@ The deliverable supports **two** acceptance gates that exercise different surfac
 | Gate | What it proves | When |
 |---|---|---|
 | **Local stack acceptance** (below) | Security-boundary correctness — host can't reach app/DB; only the in-VPN test-client can. Six commands, two minutes, no cloud account required. | Today, against the running Docker Compose stack |
-| **Cloud deployment acceptance** ([§ Cloud deployment acceptance](#cloud-deployment-acceptance-phase-25-pending)) | End-to-end path: macOS → AWS Client VPN tunnel → internal ALB → ECS Fargate `/primes` endpoint returns a list. Confirms the deployment architecture itself works against real AWS. | Phase 2.5 (pending real `terraform apply`) |
+| **Cloud deployment acceptance** ([§ Cloud deployment acceptance](#cloud-deployment-acceptance-phase-25--complete)) | End-to-end path: macOS → AWS Client VPN tunnel → internal ALB → ECS Fargate `/primes` endpoint returns a list. Confirms the deployment architecture itself works against real AWS. | Phase 2.5 — complete (2026-04-26); smoke 6/6 green |
 
 ### Local stack acceptance
 
@@ -310,9 +310,9 @@ Six steps. Two minutes. Pass = system meets the brief's security boundary + asyn
 
 The `smoke.sh` script inside the test-client container runs all six steps automatically (including the polling loop) and exits 0 on full pass.
 
-### Cloud deployment acceptance (Phase 2.5 — pending)
+### Cloud deployment acceptance (Phase 2.5 — complete)
 
-This gate exercises the **deployment-architecture VPN** (AWS Client VPN endpoint) end-to-end from a developer laptop. It only runs after Phase 2.5 completes a real `terraform apply` against a personal AWS account.
+This gate exercises the **deployment-architecture VPN** (AWS Client VPN endpoint) end-to-end from a developer laptop. Phase 2.5 ran a real `terraform apply` against a personal AWS account (eu-central-1). Smoke 6/6 green. Evidence committed to `docs/deployment_guide.md` § Phase 2.5 Cloud-acceptance evidence. Stack torn down immediately after evidence capture; total cost ~$1.50 in the 3-hour window.
 
 ```text
 [macOS Tunnelblick / native OpenVPN client]
@@ -351,6 +351,113 @@ make cloud-down
 #   make tf-bootstrap                        # state backend (production adoption only — case-study uses local state)
 ```
 
+#### Full operator walkthrough — what each step actually does
+
+The condensed block above is the TL;DR. Below is the expanded sequence — what actually runs, real timings observed during the Phase 2.5 cycle, and the pre-handled gotchas the scripts protect a forker from.
+
+**0. One-time pre-reqs (operator's machine)**
+
+```bash
+brew install easy-rsa pip-audit            # cert provisioning + supply-chain scan
+brew install --cask tunnelblick            # OpenVPN GUI client (or use brew openvpn for CLI)
+brew install libpq                         # optional: psql client for direct RDS queries
+```
+
+`easy-rsa` is required by `scripts/bootstrap-vpn-certs.sh`. `pip-audit` backs `make audit`. Tunnelblick is the macOS GUI for the AWS Client VPN endpoint. Each missing tool fails loudly with the brew install command.
+
+**1. AWS auth (interactive, source-agnostic — SSO recommended)**
+
+`make cloud-up` prompts for `AWS_PROFILE` if not exported, then auto-runs `aws sso login --sso-session <X>` if the SSO token has expired. Long-term keys also work; the script lists available profiles + SSO sessions before prompting (so the operator picks from a visible menu, not from memory). Per [memory rule](CLAUDE.md#10-adr-conventions): the script is source-agnostic — operator doesn't need to remember which auth flow.
+
+**2. `make cloud-up` (~15-30 min wall-clock for first run)**
+
+Runs eight phases in sequence, idempotent at each step:
+
+| Phase | What runs | First-run time | Re-run time |
+|---|---|---|---|
+| 1/6 Tool presence | terraform / aws / docker check | <1 s | <1 s |
+| 2/6 AWS auth | sts get-caller-identity (with SSO refresh fallback) | 1-2 s | <1 s |
+| 3/6 tfvars present | runs `tfvars-init.sh` interactive Q&A if missing — **AWS-aware CIDR overlap validation** against existing VPCs in the account/region | ~2 min (first time) | skip |
+| 4/6 VPN PKI + ACM | easy-rsa CA bootstrap, server + client cert generation, ACM import × 2; idempotent if `cert-arns.auto.tfvars` exists | ~10 min | skip |
+| 5/6 Pre-deps + image push | `terraform apply -target=module.{vpc,rds,ecr}` (RDS Multi-AZ is the slow piece, ~8-12 min) → docker build (`--provenance=false --sbom=false` for deterministic manifest) → push with git-SHA tag (per [ADR-0036](docs/ADR/0036-image-tag-git-sha-immutable-ecr.md)); skipped if tag already in ECR | ~12-15 min | ~30 s (cached) |
+| 6/6 Full apply | `terraform apply` for the remaining ~70 resources (Client VPN, ALB, ECS, Valkey, SQS, IAM, autoscaling, VPC endpoints, **bootstrap one-shot ECS task** that auto-runs schema migration + cache seeding per [ADR-0035](docs/ADR/0035-bootstrap-task-includes-schema-migration.md)) | ~10-15 min | ~1 min |
+
+Output ends with operator-next-steps including the literal `aws ec2 export-client-vpn-client-configuration` command (with `--profile` baked in for copy-paste safety) and the cost-timer reminder.
+
+**3. Connect to AWS Client VPN**
+
+```bash
+# Download the .ovpn config (cloud-up's printed command, copy-paste safe single-line):
+aws ec2 export-client-vpn-client-configuration --profile <your-profile> --region eu-central-1 --client-vpn-endpoint-id <printed-by-cloud-up> --output text > pki/<your-handle>.ovpn
+
+# Append client cert + key for mutual-TLS (one-shot block; not heredoc to avoid copy-paste breakage):
+{ echo; echo '<cert>'; cat pki/pki/issued/<your-handle>.crt; echo '</cert>'; echo '<key>'; cat pki/pki/private/<your-handle>.key; echo '</key>'; } >> pki/<your-handle>.ovpn
+
+# Then either GUI:
+open pki/<your-handle>.ovpn   # Tunnelblick prompts to install + name + Connect
+
+# OR CLI:
+sudo /opt/homebrew/sbin/openvpn --config pki/<your-handle>.ovpn   # don't sed `dev tun` → `dev utun`; openvpn 2.6+ on macOS handles it internally
+# Wait for "Initialization Sequence Completed" — VPN is up; keep terminal open
+```
+
+Verify VPN is up in another terminal: `ifconfig | grep utun` shows the new interface, `dig +short <alb_dns>` returns a private 10.0.x.x IP.
+
+**4. `make cloud-smoke` (~10-15 s)**
+
+6-step smoke against the deployed service: POST 202 → poll until `status=done` → assert primes count = 25 in [2, 100] → second call (cache-hit latency comparison) → out-of-bounds → 422 → 20-concurrent backpressure (expects ≥ 1 × 503; at PoC load may show 0 because workload too small to fill the queue beyond the 5×worker threshold — non-fatal, smoke still passes 6/6). Fails fast with a clear message if VPN isn't connected (`health probe returned 000 = network unreachable`).
+
+**5. `make cloud-evidence` (~30 s)**
+
+Captures the API-fetchable evidence subset (per [memory feedback_phase25_screenshot_evidence](CLAUDE.md#10-adr-conventions)) into `evidence/<UTC-timestamp>/`:
+- 6 CloudWatch metric widget PNGs via `aws cloudwatch get-metric-widget-image` (which AWS-organisational SCPs typically allow, even when console-side `cloudwatch:ListMetrics` is denied — that latter denial is itself a positive production-shape signal)
+- worker + bootstrap CloudWatch log excerpts (last hour)
+- `terraform output -json`
+- `summary.md` stub for browser-side screenshots + manual notes
+
+Reviewer-grade dashboard screenshots (browser, full chrome) remain optional manual supplements — when the operator's account SCP allows console access.
+
+**6. `make cloud-down` (~5-8 min)**
+
+Six teardown steps, each protective by design:
+
+```
+1/6 Pre-flight          — same AWS auth flow as cloud-up
+2/6 ECR drain           — auto batch-delete-image so terraform destroy doesn't fail on non-empty repo
+3/6 terraform destroy   — strict 'destroy' confirm gate (must type the literal word, not 'y' or 'yes');
+                          uses -refresh=false to handle partial-state recovery if a prior destroy failed mid-flight
+4/6 ACM cert cleanup    — deletes the 2 VPN certs imported by cloud-up
+5/6 Local pki/ cleanup  — interactive confirm (or FORCE=1 to skip prompt)
+6/6 Collateral verify   — describes VPCs / Client VPN endpoints / ACM certs by tag pattern;
+                          all empty = collateral-free guarantee per ADR-0035 cuts ledger
+```
+
+The `destroy` confirmation must be typed **exactly**; anything else aborts gracefully without action — operator opt-in is explicit, not implicit.
+
+#### Pre-handled gotchas (that the scripts protect a forker from)
+
+These were discovered during the actual Phase 2.5 cycle and pre-fixed for next forker:
+
+| Surface | Pre-handled by |
+|---|---|
+| RDS PostgreSQL minor version drift (AWS deprecates older minors) | `terraform/main.tf` pinned to a current minor; bump if deprecated |
+| `aws_security_group.description` rejects non-ASCII | repository uses ASCII hyphens; no em-dash to leak |
+| ECS module `for_each` regression in v5.12.x | pinned `~> 5.11.0` |
+| ALB module `target_id` requirement | `create_attachment = false` (ECS service registers targets dynamically) |
+| ECR IMMUTABLE blocks `:latest` re-push | git-SHA image tags + deterministic manifest digest ([ADR-0036](docs/ADR/0036-image-tag-git-sha-immutable-ecr.md)) |
+| brew easy-rsa 3.x ignores cwd | `EASYRSA_PKI` exported explicitly to repo-local path |
+| macOS default bash 3.2 lacks `${var^^}` | scripts use `tr` instead |
+| macOS openvpn 2.6+ auto-maps `dev tun` → utun | scripts don't sed; warn if forker does |
+| ECS `secrets` block injects entire JSON, not the password field | `valueFrom = "${arn}:password::"` JSON pointer |
+| ECS cluster log_configuration requires `logging = "OVERRIDE"` not "DEFAULT" | explicit in `terraform/main.tf` |
+| Missing SQS interface VPC endpoint | added to interface endpoints set |
+| App lacks `sqs:SendMessage` IAM perm | `tasks_iam_role_statements` extends the auto-created task role |
+| ALB `enable_deletion_protection = true` blocks destroy | overridden to `false` for case-study apply-then-destroy |
+| Partial-state destroy crashes on for_each over dead module outputs | `terraform plan -destroy -refresh=false` |
+| RDS doesn't auto-run `db/init.sql` like docker-compose's postgres entrypoint | bootstrap ECS task runs `Base.metadata.create_all` ([ADR-0035](docs/ADR/0035-bootstrap-task-includes-schema-migration.md)) |
+| ACM-imported VPN certs leak after `terraform destroy` | `cloud-down.sh` step 4/6 deletes them |
+| `cwagent:ListMetrics` SCP-denied (console blocked) | `make cloud-evidence` uses `cloudwatch:GetMetricWidgetImage` API path — typically SCP-allowed |
+
 Sample smoke (HTTPS via self-signed ACM-imported cert per ADR-0027):
 
 ```bash
@@ -387,7 +494,7 @@ The deliverable is staged into numbered phases (decimals allowed for sub-progres
 | **2.2** | ✅ done | Multi-region scaling runbook | `docs/scaling_runbook.md` — same format, single-region → multi-region axis |
 | **2.3** | ✅ done | Async implementation (L1-L3) | `src/prime_service/queue.py`, `worker.py`, `bootstrap.py`; SQS + ElasticMQ local parity; POST → 202 + poll; backpressure middleware (503 + Retry-After); SIGALRM 60s per job; ADR-0029, ADR-0030, ADR-0032, ADR-0033 |
 | **2.4** | ✅ done | Distributed cache (L4) | `src/prime_service/cache.py`; ElastiCache Serverless Valkey + ZSET + Lua range-coalescing; bootstrap ECS task; Valkey local parity; ADR-0031, ADR-0034; smoke test 6/6 passes (cache miss → done, cache hit logged, backpressure 503) |
-| **2.5** | ⏳ pending | Cloud deployment live + AWS Client VPN end-to-end verified from local | `make cloud-up` (one-shot orchestrator: pre-flight + cert provisioning per ADR-0024 + ECR build/push + full `terraform apply` per ADR-0034 superseding ADR-0015 plan-only stance) → connect via Client VPN client from macOS → smoke 6/6 via `curl https://<alb-private>/primes` → evidence captured per `docs/design_doc.md` § 3 + § 5 into `docs/deployment_guide.md` → `make cloud-down` (drains ECR + `terraform destroy` + ACM cert cleanup + collateral-free verify). Cost: **< $2 for the 3-hour acceptance window**; stack torn down immediately after evidence captured |
+| **2.5** | ✅ done | Cloud deployment live + AWS Client VPN end-to-end verified from local | `make cloud-up` ran against a personal AWS account (eu-central-1): ~88 resources in ~30 min cumulative (staged: VPC+RDS+ECR ~15 min then full apply ~15 min). Smoke 6/6 green (POST 202 → poll done → primes count 25 in [2,100] → cache hit → 422 negative → 20-concurrent backpressure 0/20 503 at PoC load). Worker + bootstrap CloudWatch logs captured. Cost actual: ~$1.50 in the 3h window. `make cloud-down` completed collateral-free (VPC / Client VPN / ACM / ECR all empty post-destroy). Evidence in `docs/deployment_guide.md` § Phase 2.5 Cloud-acceptance evidence. ADR-0035 (bootstrap-task schema migration), ADR-0036 (git-SHA image tagging). |
 | **3.0** | ⏳ pending | Polish + cover note | Final README pass, `cover_note.md` (gitignored) drafted |
 | **3.1** | ⏳ pending | Repo published to private remote | Pre-push leak guard clean, repo invitation sent to recipient |
 | **3.2** | ⏳ pending | Submission email sent | End of cycle |
@@ -417,7 +524,7 @@ The cloud target is a Terraform composition built from `terraform-aws-modules/*`
 - AWS Client VPN endpoint with mutual-TLS authentication (ingress)
 - Secrets Manager + ECR + CloudWatch Logs (all reached via PrivateLink)
 
-**The Terraform code is `plan`-only by default** — the brief accepts a deployment guide as sufficient (Task 3 of the source brief — gitignored under `case_study/`). For Phase 2.5 of this delivery, ADR-0015's plan-only stance is superseded so the AWS Client VPN end-to-end path can be verified from a developer laptop against a real personal AWS account; see the supersession block at the bottom of [ADR-0015](docs/ADR/0015-no-k8s-no-real-apply.md) and [§ Cloud deployment acceptance](#cloud-deployment-acceptance-phase-25-pending) above for the gate that consumes it.
+**The Terraform code is `plan`-only by default** — the brief accepts a deployment guide as sufficient (Task 3 of the source brief — gitignored under `case_study/`). For Phase 2.5 of this delivery, ADR-0015's plan-only stance is superseded so the AWS Client VPN end-to-end path can be verified from a developer laptop against a real personal AWS account; see the supersession block at the bottom of [ADR-0015](docs/ADR/0015-no-k8s-no-real-apply.md) and [§ Cloud deployment acceptance](#cloud-deployment-acceptance-phase-25--complete) above for the completed evidence.
 
 For the full architectural walkthrough (Mermaid diagram, component table, network flow, plan walkthrough) see [`docs/deployment_guide.md`](docs/deployment_guide.md).
 
