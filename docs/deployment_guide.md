@@ -2,9 +2,9 @@
 
 ## Scope of this guide
 
-This guide describes the Terraform composition under [`terraform/`](../terraform/). The composition was developed **plan-only** through Phase 1 (ADR-0015 — the brief's Task 3 reads "A list of clear instructions would suffice"), then runs through **one bounded cloud-acceptance window in Phase 2.3** — `terraform apply` against a personal AWS account, ≤ 3 hours, evidence captured into [§ Phase 2.3 Cloud-acceptance evidence](#phase-23-cloud-acceptance-evidence) below, then `terraform destroy`. ADR-0015's plan-only stance is partially superseded for that one window (see ADR-0015's supersession block) — outside the window, the composition remains code + plan, no sustained live state.
+This guide describes the Terraform composition under [`terraform/`](../terraform/). The composition was developed **plan-only** through Phase 1 (ADR-0015 — the brief's Task 3 reads "A list of clear instructions would suffice"), then runs through **one bounded cloud-acceptance window in Phase 2.5** — `terraform apply` against a personal AWS account, ≤ 3 hours, evidence captured into [§ Phase 2.5 Cloud-acceptance evidence](#phase-25-cloud-acceptance-evidence) below, then `terraform destroy`. ADR-0015's plan-only stance is partially superseded for that one window (see ADR-0015's supersession block) — outside the window, the composition remains code + plan, no sustained live state.
 
-If the buyer asks "could you actually deploy this?" — the Phase 2.3 evidence section is the answer to "yes, and we did, end-to-end with VPN-from-laptop". If the buyer asks "could we run this in production?" — the runbook (ADR-0012) carries the cross-cloud architectural differentiator and the design doc carries the observability + reliability sketches.
+If the buyer asks "could you actually deploy this?" — the Phase 2.5 evidence section is the answer to "yes, and we did, end-to-end with VPN-from-laptop". If the buyer asks "could we run this in production?" — the runbook (ADR-0012) carries the cross-cloud architectural differentiator and the design doc carries the observability + reliability sketches.
 
 The local Docker Compose layout is documented in [`README.md` § Architecture](../README.md#architecture); the diagram below is the cloud-side companion.
 
@@ -32,6 +32,7 @@ graph TB
 
     subgraph AWS[AWS — eu-central-1]
         CVPN[Client VPN Endpoint<br/>10.20.0.0/16 client CIDR]
+        SQS[SQS — aegis-enclave-primes<br/>visibility 90s]
 
         subgraph VPC[VPC 10.0.0.0/16 — private only · no IGW · no NAT]
             subgraph AZ1[AZ eu-central-1a]
@@ -43,12 +44,15 @@ graph TB
                 Db2[Database subnet<br/>10.0.202.0/24]
             end
 
-            ALB[Internal ALB<br/>HTTP :80]
-            ECS[ECS Fargate<br/>app service :8000]
+            ALB[Internal ALB<br/>HTTPS :443]
+            ECS_API[ECS Fargate<br/>app service :8000]
+            ECS_WK[ECS Fargate<br/>worker service<br/>min=1 max=3]
+            ECS_BS[ECS Fargate<br/>bootstrap task<br/>one-shot]
+            VALKEY[(ElastiCache Serverless<br/>Valkey — ZSET cache)]
             RDS[(RDS PostgreSQL<br/>Multi-AZ standby)]
 
             subgraph VPCE[VPC Endpoints — PrivateLink]
-                VEP[Interface endpoints<br/>ecr.api · ecr.dkr · secretsmanager<br/>logs · ecs · ecs-agent · ecs-telemetry · sts]
+                VEP[Interface endpoints<br/>ecr.api · ecr.dkr · secretsmanager<br/>logs · ecs · ecs-agent · ecs-telemetry · sts · sqs]
                 S3GW[S3 Gateway Endpoint<br/>ECR layer storage]
             end
         end
@@ -64,19 +68,29 @@ graph TB
 
     Op -. mTLS tunnel .-> CVPN
     CVPN --> ALB
-    ALB --> ECS
-    ECS --> RDS
-    ECS -.via PrivateLink.-> VEP
+    ALB --> ECS_API
+    ECS_API --> RDS
+    ECS_API --> SQS
+    SQS --> ECS_WK
+    ECS_WK --> VALKEY
+    ECS_WK --> RDS
+    ECS_BS -.seed on deploy.-> VALKEY
+    ECS_API -.via PrivateLink.-> VEP
+    ECS_WK -.via PrivateLink.-> VEP
     VEP --> SM
     VEP --> ECR
     VEP --> CWL
-    ECS -.layer pull.-> S3GW
+    ECS_API -.layer pull.-> S3GW
     Pri1 -.failover.-> Pri2
     Db1 -.sync replication.-> Db2
 
     style CVPN fill:#e1f5fe,color:#000
+    style SQS fill:#fff9c4,color:#000
     style ALB fill:#fff3e0,color:#000
-    style ECS fill:#e8f5e9,color:#000
+    style ECS_API fill:#e8f5e9,color:#000
+    style ECS_WK fill:#e8f5e9,color:#000
+    style ECS_BS fill:#f3e5f5,color:#000
+    style VALKEY fill:#e8f5e9,color:#000
     style RDS fill:#fff3e0,color:#000
     style VEP fill:#fce4ec,color:#000
     style S3GW fill:#fce4ec,color:#000
@@ -94,17 +108,22 @@ graph TB
 
 | Component | Purpose | Module / resource | ADR |
 |---|---|---|---|
-| VPC + private subnets only(no NAT,no IGW) | Two-AZ private network — runtime egress via PrivateLink | `terraform-aws-modules/vpc/aws ~> 5.8` | ADR-0007, ADR-0016, ADR-0019 |
-| VPC Endpoints — 8 interface(`ecr.api`/`ecr.dkr`/`secretsmanager`/`logs`/`ecs`/`ecs-agent`/`ecs-telemetry`/`sts`) + 1 S3 gateway | PrivateLink routes for AWS API egress;data plane never on public internet | `aws_vpc_endpoint` (direct provider) + `terraform-aws-modules/security-group/aws ~> 5.2` for endpoint SG | ADR-0019, ADR-0018 |
-| Internal ALB | Private HTTP load balancer; not internet-facing | `terraform-aws-modules/alb/aws ~> 9.9` | ADR-0011, ADR-0016 |
-| ECS Fargate service | App compute; managed, no control-plane fee | `terraform-aws-modules/ecs/aws ~> 5.11` | ADR-0015, ADR-0016 |
-| RDS PostgreSQL Multi-AZ | Audit-table store with synchronous standby | `terraform-aws-modules/rds/aws ~> 6.7` | ADR-0009, ADR-0008 |
+| VPC + private subnets only (no NAT, no IGW) | Two-AZ private network — runtime egress via PrivateLink | `terraform-aws-modules/vpc/aws ~> 5.8` | ADR-0007, ADR-0016, ADR-0019 |
+| VPC Endpoints — 8 interface (`ecr.api`/`ecr.dkr`/`secretsmanager`/`logs`/`ecs`/`ecs-agent`/`ecs-telemetry`/`sts`) + 1 S3 gateway | PrivateLink routes for AWS API egress; data plane never on public internet | `aws_vpc_endpoint` (direct provider) + `terraform-aws-modules/security-group/aws ~> 5.2` for endpoint SG | ADR-0019, ADR-0018 |
+| Internal ALB | Private HTTPS load balancer; not internet-facing; self-signed ACM cert | `terraform-aws-modules/alb/aws ~> 9.9` | ADR-0011, ADR-0016, ADR-0027 |
+| ECS Fargate — API service | HTTP tier; no compute; async POST + GET polling | `terraform-aws-modules/ecs/aws ~> 5.11` | ADR-0015, ADR-0016, ADR-0029 |
+| ECS Fargate — worker service | SQS consumer; prime compute + cache write; auto-scaling min=1 max=3 | `aws_ecs_service.worker` + `aws_appautoscaling_policy` (direct provider) | ADR-0029, ADR-0033 |
+| ECS Fargate — bootstrap task | One-shot: seeds Valkey with primes `[1, 100_000]` on first deploy | `aws_ecs_task_definition.cache_bootstrap` + `null_resource.run_cache_bootstrap` | ADR-0031 |
+| SQS queue (`aegis-enclave-primes`) | Job dispatch; visibility timeout 90s; DLQ skeleton | `aws_sqs_queue` (direct provider) | ADR-0029, ADR-0030 |
+| ElastiCache Serverless Valkey | Distributed prime-range cache; ZSET + Lua range-coalescing; scales to zero at idle | `aws_elasticache_serverless_cache` (direct provider) | ADR-0031 |
+| RDS PostgreSQL Multi-AZ | Audit-table store with synchronous standby; status state machine | `terraform-aws-modules/rds/aws ~> 6.7` | ADR-0009, ADR-0008 |
 | ECR repository | Image registry, IMMUTABLE tags, scan-on-push | `terraform-aws-modules/ecr/aws ~> 2.3` | ADR-0016 |
 | AWS Client VPN endpoint | Cloud-side VPN gateway, mTLS-authenticated | `aws_ec2_client_vpn_endpoint` (direct provider — no mature module) | ADR-0006, ADR-0010 |
 | Secrets Manager (RDS-managed) | RDS master password, no plaintext in code | `manage_master_user_password = true` on RDS module | ADR-0016 |
 | ALB security group | Ingress only from VPC CIDR (Client VPN clients arrive via VPC routes) | `terraform-aws-modules/security-group/aws ~> 5.2` | ADR-0011 |
 | App security group | Accept :8000 only from ALB SG | `terraform-aws-modules/security-group/aws ~> 5.2` | ADR-0011 |
-| RDS security group | Accept :5432 only from app SG | `terraform-aws-modules/security-group/aws ~> 5.2` | ADR-0011 |
+| Worker security group | Accept outbound to Valkey :6379 + RDS :5432 + SQS (via VPC Endpoint) | `terraform-aws-modules/security-group/aws ~> 5.2` | ADR-0011 |
+| RDS security group | Accept :5432 only from app + worker SG | `terraform-aws-modules/security-group/aws ~> 5.2` | ADR-0011 |
 
 ## Network flow
 
@@ -158,9 +177,9 @@ Cross-cloud migration to alternative providers (the brief names IONOS as one suc
 
 Single-region → multi-region scaling lives in [`docs/scaling_runbook.md`](scaling_runbook.md) as a second instance of the same agent-executable schema. The triggers that would move multi-region from Phase 2 plan to Phase 1 implementation are recorded in ADR-0007. Two instances make the runbook format credible as a portfolio template; one would just be a one-off. See ADR-0012 for the full agent-executable spec design.
 
-## Phase 2.3 Cloud-acceptance evidence
+## Phase 2.5 Cloud-acceptance evidence
 
-> **STATUS: not yet captured — skeleton section pre-baked.** Replace `<TBD>` markers and empty blocks with real artefacts when the cloud-acceptance window runs. Bounded to ≤ 3 hours, < $2 total cost, then `terraform destroy`. Spec lives in [`docs/design_doc.md` § 3 (Observability posture)](design_doc.md); operational checklist lives in `strategy.md` § 3 Phase 2.3 sequence (gitignored); irreversible-destroy reminder lives in the `feedback_phase23_screenshot_evidence.md` memory rule.
+> **STATUS: not yet captured — skeleton section pre-baked.** Replace `<TBD>` markers and empty blocks with real artefacts when the cloud-acceptance window runs. Bounded to ≤ 3 hours, < $2 total cost, then `terraform destroy`. Spec lives in [`docs/design_doc.md` § 3 (Observability posture)](design_doc.md) and § 5 (Cache distribution); operational checklist lives in `strategy.md` § 3 Phase 2.5 sequence (gitignored); irreversible-destroy reminder lives in the `feedback_phase25_screenshot_evidence.md` memory rule.
 >
 > **Redaction discipline before commit:** AWS account ID, full ARNs, full Client VPN endpoint IDs, ALB DNS, RDS endpoint hostnames, and any operator PII must be partially redacted (e.g., `123456789012` → `XXXXXXX89012`, `arn:aws:.../i-0abc...` → `arn:aws:.../i-XXXX...`). Re-run `make pre-push-check` before commit; visually grep the diff for 12-digit numeric strings and `arn:aws:` prefixes.
 
@@ -250,12 +269,12 @@ aws s3 cp s3://<TBD-alb-logs-bucket>/AWSLogs/<TBD-acct>/elasticloadbalancing/eu-
   --recursive | gunzip | grep -E '/health|/primes|/executions'
 ```
 
-### ECS application logs (CloudWatch)
+### ECS API application logs (CloudWatch)
 
 FastAPI structured log lines emitted while serving the three `curl` requests. CloudWatch log group: `/aws/ecs/aegis-enclave-app-<TBD-env>`.
 
 ```
-<TBD: 3 structured log lines correlating to the curl timestamps>
+<TBD: 3 structured log lines correlating to the curl timestamps (POST enqueue, GET queued, GET done)>
 ```
 
 Pull command for reference:
@@ -266,22 +285,58 @@ aws logs filter-log-events \
   --end-time <TBD-curl-window-end-epoch-ms>
 ```
 
+### ECS worker logs (CloudWatch)
+
+Worker structured log lines showing SQS receive, cache lookup (miss/hit), sieve compute, Lua merge, DB audit write, and SQS ack for the smoke-test jobs. CloudWatch log group: `/aws/ecs/aegis-enclave-worker-<TBD-env>`.
+
+```
+<TBD: worker log lines — expected: receive job, cache MISS, sieve start, sieve done, Lua merge, DB update status=done, SQS ack>
+<TBD: second job same range — expected: receive job, cache HIT, DB update status=done, SQS ack (no sieve compute)>
+```
+
+Pull command for reference:
+```bash
+aws logs filter-log-events \
+  --log-group-name /aws/ecs/aegis-enclave-worker-<TBD-env> \
+  --start-time <TBD-window-start-epoch-ms> \
+  --end-time <TBD-window-end-epoch-ms>
+```
+
+### Bootstrap task logs (CloudWatch)
+
+One-shot bootstrap ECS task log output. Should show Valkey seed success (or idempotent skip). CloudWatch log group: `/aws/ecs/aegis-enclave-bootstrap-<TBD-env>`.
+
+```
+<TBD: bootstrap log — expected: "seeding primes [1, 100000]... done" or "cache already seeded, skipping">
+```
+
+Pull command for reference:
+```bash
+# Find the bootstrap task's log stream (task ID visible in `aws ecs list-tasks`)
+aws logs get-log-events \
+  --log-group-name /aws/ecs/aegis-enclave-bootstrap-<TBD-env> \
+  --log-stream-name <TBD-stream-name>
+```
+
 ### Aggregate metric dashboards (CloudWatch screenshots)
 
-Per [`docs/design_doc.md` § 3.1](design_doc.md) — four dashboards captured during the live window before teardown. Screenshots land under `docs/evidence/phase23/`.
+Per [`docs/design_doc.md` § 3.1](design_doc.md) and § 5 — dashboards captured during the live window before teardown. Screenshots land under `docs/evidence/phase25/`.
 
 | Dashboard | Metrics shown | Screenshot |
 |---|---|---|
-| ALB | `RequestCount` / `TargetResponseTime` p50/p90/p99 / 5xx counts / `HealthyHostCount` | `<TBD: docs/evidence/phase23/alb-metrics.png>` |
-| ECS service | per-task `CPUUtilization` / `MemoryUtilization` | `<TBD: docs/evidence/phase23/ecs-task-health.png>` |
-| RDS | `CPUUtilization` / `DatabaseConnections` / `FreeableMemory` / `ReplicaLag` | `<TBD: docs/evidence/phase23/rds-metrics.png>` |
-| Client VPN endpoint | `ActiveConnectionsCount` / `AuthenticationFailures` / `IngressBytes` / `EgressBytes` | `<TBD: docs/evidence/phase23/client-vpn-metrics.png>` |
+| ALB | `RequestCount` / `TargetResponseTime` p50/p90/p99 / 5xx counts / `HealthyHostCount` | `<TBD: docs/evidence/phase25/alb-metrics.png>` |
+| ECS API service | per-task `CPUUtilization` / `MemoryUtilization` | `<TBD: docs/evidence/phase25/ecs-api-health.png>` |
+| ECS worker service | `DesiredCount` (auto-scaling graph) / per-task `CPUUtilization` / `MemoryUtilization` | `<TBD: docs/evidence/phase25/ecs-worker-health.png>` |
+| SQS queue | `ApproximateNumberOfMessagesVisible` (queue depth) / `NumberOfMessagesSent` / `NumberOfMessagesDeleted` | `<TBD: docs/evidence/phase25/sqs-queue-depth.png>` |
+| ElastiCache Serverless Valkey | `BytesUsedForCache` / `ElastiCacheProcessingUnits` (ECPU consumption) / `CacheHits` / `CacheMisses` | `<TBD: docs/evidence/phase25/valkey-cache-metrics.png>` |
+| RDS | `CPUUtilization` / `DatabaseConnections` / `FreeableMemory` / `ReplicaLag` | `<TBD: docs/evidence/phase25/rds-metrics.png>` |
+| Client VPN endpoint | `ActiveConnectionsCount` / `AuthenticationFailures` / `IngressBytes` / `EgressBytes` | `<TBD: docs/evidence/phase25/client-vpn-metrics.png>` |
 
 ### VPN handshake
 
 Tunnelblick (or `openvpn3`) connection-status pane showing successful mTLS handshake and connect timestamp.
 
-`<TBD: docs/evidence/phase23/vpn-handshake.png>`
+`<TBD: docs/evidence/phase25/vpn-handshake.png>`
 
 ### Stack teardown confirmation
 
@@ -302,8 +357,8 @@ $ aws ec2 describe-client-vpn-endpoints --region eu-central-1
 
 ## What this guide is NOT
 
-- **Not a continuous-operations record.** Phase 2.3 above captures one bounded acceptance window (≤ 3h, then `terraform destroy`) — not a record of a sustained production deployment. Ongoing live state is not committed.
+- **Not a continuous-operations record.** Phase 2.5 above captures one bounded acceptance window (≤ 3h, then `terraform destroy`) — not a record of a sustained production deployment. Ongoing live state is not committed.
 - **Not an operations runbook for a live service.** That would need an observability stack (on-call rotations, alerting, incident runbooks) — all out of scope per ADR-0003. The Observability posture section in `docs/design_doc.md` § 3 sketches the architectural extension; this guide does not implement it.
-- **Not a cost projection.** The `default_tags` set up the cost-attribution scaffold; a real cost model needs production traffic data. Phase 2.3's < $2 acceptance window is a one-shot bounded number, not a sustained-cost extrapolation.
+- **Not a cost projection.** The `default_tags` set up the cost-attribution scaffold; a real cost model needs production traffic data. Phase 2.5's < $2 acceptance window is a one-shot bounded number, not a sustained-cost extrapolation.
 
-This is a deployment guide for a Terraform composition that is reviewable as code, planned to verify shape, and exercised once end-to-end against real AWS via the Phase 2.3 acceptance window. The brief asks for a deployment guide and accepts a guide as sufficient. This is that guide, with one bounded real-run receipt attached.
+This is a deployment guide for a Terraform composition that is reviewable as code, planned to verify shape, and exercised once end-to-end against real AWS via the Phase 2.5 acceptance window. The brief asks for a deployment guide and accepts a guide as sufficient. This is that guide, with one bounded real-run receipt attached.
