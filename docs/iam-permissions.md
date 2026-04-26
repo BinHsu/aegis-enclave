@@ -92,11 +92,18 @@ For **production adoption** outside the case-study window, derive a tighter poli
 Bin recommends SSO over long-term IAM access keys (per `feedback_aws_creds_agnostic.md`). Quick SSO setup:
 
 ```bash
+# One-time setup (per profile):
 aws configure sso --profile aegis
 # Follow the prompts: SSO start URL, region, account, role
+
+# First-time login + shell export (also one-time per shell session):
 aws sso login --profile aegis
 export AWS_PROFILE=aegis
-make cloud-up   # cloud-up auto-detects expired SSO tokens and re-runs sso login
+
+# From here on, only this:
+make cloud-up   # cloud-up auto-detects expired SSO tokens and re-runs 'aws sso login --profile $AWS_PROFILE'
+                # AWS_PROFILE unset? cloud-up prompts for it. Already set? cloud-up uses it.
+                # No more manual 'aws sso login' / 'export' needed for the make-target flow.
 ```
 
 Long-term keys also work (placed in `~/.aws/credentials`), but SSO is preferred for: short-lived tokens, audit trail in CloudTrail, multi-account role assumption, no key rotation overhead.

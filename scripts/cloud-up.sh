@@ -96,6 +96,8 @@ ACCOUNT_ID=$(echo "$CALLER_JSON" | grep -oE '"Account":[^,}]*' | sed -E 's/.*"([
 ARN=$(echo "$CALLER_JSON" | grep -oE '"Arn":"[^"]*"' | sed -E 's/"Arn":"(.+)"/\1/')
 ok "AWS account: $ACCOUNT_ID"
 ok "AWS caller:  $ARN"
+info "Tip: to run 'aws ...' directly in this terminal (outside make targets), set:"
+info "     export AWS_PROFILE=$AWS_PROFILE"
 
 # ─── Pre-flight: tfvars present (interactive Q&A if missing) ──────────────
 section "3/6 — tfvars present"
