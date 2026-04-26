@@ -68,9 +68,9 @@ echo "Terraform:  $TF_DIR"
 echo "tfvars:     $TFVARS"
 [[ $PLAN_ONLY -eq 1 ]] && echo "Mode:       PLAN ONLY (no apply)"
 echo
-echo "${BOLD}Note:${RESET} This script is for operator adoption (docs/production_adoption.md)."
-echo "      The case-study cycle itself is plan-only per ADR-0015 — do NOT run this"
-echo "      in production without first reviewing the plan output."
+echo "${BOLD}Note:${RESET} Phase 2.5 case-study window apply (ADR-0034 supersedes ADR-0015 plan-only)."
+echo "      Bounded ≤ 3h apply-then-destroy with evidence capture, < \$2 cost ceiling."
+echo "      Prefer 'make cloud-up' which orchestrates this script + cert + ECR + image push."
 
 # ─── Tool presence ─────────────────────────────────────────────────────────
 section "1/6 — Tool presence"
@@ -113,22 +113,44 @@ ok "AWS account: $ACCOUNT_ID"
 ok "AWS caller:  $ARN"
 
 # ─── ACM certs exist ───────────────────────────────────────────────────────
+# Reads from BOTH terraform.tfvars (operator-managed) and *.auto.tfvars
+# (e.g. cert-arns.auto.tfvars written by cloud-up.sh). Defensive: '|| echo ""'
+# avoids silent set -e + pipefail exit when grep finds no match.
 section "5/6 — ACM certificates reachable"
-REGION=$(grep -E '^region[[:space:]]*=' "$TFVARS" | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
-SERVER_CERT=$(grep -E '^server_cert_arn[[:space:]]*=' "$TFVARS" | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
-CLIENT_CERT=$(grep -E '^client_cert_arn[[:space:]]*=' "$TFVARS" | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
 
-[[ -n "$REGION" ]] || fail "could not parse region from $TFVARS"
-[[ -n "$SERVER_CERT" ]] || fail "could not parse server_cert_arn from $TFVARS"
-[[ -n "$CLIENT_CERT" ]] || fail "could not parse client_cert_arn from $TFVARS"
+# Helper: grep a var across all tfvars + auto.tfvars files in $TF_DIR
+parse_tfvar() {
+    local name="$1"
+    local match=""
+    for f in "$TF_DIR"/terraform.tfvars "$TF_DIR"/*.auto.tfvars; do
+        [[ -f "$f" ]] || continue
+        match=$(grep -E "^${name}[[:space:]]*=" "$f" 2>/dev/null | tail -1 | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/' || true)
+        [[ -n "$match" ]] && { echo "$match"; return 0; }
+    done
+    return 1
+}
 
-aws acm describe-certificate --region "$REGION" --certificate-arn "$SERVER_CERT" >/dev/null 2>&1 \
-    || fail "server_cert_arn not reachable: $SERVER_CERT
-      Verify the cert exists in region $REGION and the caller has acm:DescribeCertificate."
+REGION=$(parse_tfvar "region" || echo "")
+SERVER_CERT=$(parse_tfvar "server_cert_arn" || echo "")
+CLIENT_CERT=$(parse_tfvar "client_cert_arn" || echo "")
+
+[[ -n "$REGION" ]] || fail "could not parse region from $TF_DIR/{terraform,*.auto}.tfvars"
+[[ -n "$SERVER_CERT" ]] || fail "could not parse server_cert_arn from $TF_DIR/{terraform,*.auto}.tfvars (run 'make cloud-up' to bootstrap certs)"
+[[ -n "$CLIENT_CERT" ]] || fail "could not parse client_cert_arn from $TF_DIR/{terraform,*.auto}.tfvars (run 'make cloud-up' to bootstrap certs)"
+
+info "server_cert_arn=$SERVER_CERT"
+info "client_cert_arn=$CLIENT_CERT"
+
+ACM_RAW=$(aws acm describe-certificate --region "$REGION" --certificate-arn "$SERVER_CERT" 2>&1) || {
+    printf "\n--- aws acm describe-certificate (server) failed ---\n%s\n--- end ---\n" "$ACM_RAW" >&2
+    fail "server_cert_arn not reachable in region $REGION. Check IAM perm acm:DescribeCertificate or ARN validity."
+}
 ok "server_cert_arn reachable"
 
-aws acm describe-certificate --region "$REGION" --certificate-arn "$CLIENT_CERT" >/dev/null 2>&1 \
-    || fail "client_cert_arn not reachable: $CLIENT_CERT"
+ACM_RAW=$(aws acm describe-certificate --region "$REGION" --certificate-arn "$CLIENT_CERT" 2>&1) || {
+    printf "\n--- aws acm describe-certificate (client) failed ---\n%s\n--- end ---\n" "$ACM_RAW" >&2
+    fail "client_cert_arn not reachable in region $REGION."
+}
 ok "client_cert_arn reachable"
 
 # ─── Terraform initialised ─────────────────────────────────────────────────
