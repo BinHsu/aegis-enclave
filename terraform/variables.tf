@@ -53,6 +53,12 @@ variable "alb_internal_hostname" {
 
 # ─── Phase 2.3/2.4 — Async worker + distributed cache ────────────────────────
 
+variable "image_tag" {
+  description = "Container image tag (typically git short SHA, e.g. 'abc12345' or 'abc12345-dirty-7e33ff10' for uncommitted changes). Written by scripts/cloud-up.sh into image-tag.auto.tfvars. Default 'latest' is for backwards-compat; production paths should always pass an explicit tag for IMMUTABLE ECR + audit trail."
+  type        = string
+  default     = "latest"
+}
+
 variable "worker_min_count" {
   description = "Minimum number of worker ECS tasks (SQS consumer)."
   type        = number

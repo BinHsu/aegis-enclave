@@ -367,7 +367,7 @@ module "ecs" {
 
       container_definitions = {
         app = {
-          image = "${module.ecr.repository_url}:latest"
+          image = "${module.ecr.repository_url}:${var.image_tag}"
           port_mappings = [{
             containerPort = 8000
             protocol      = "tcp"
@@ -680,7 +680,7 @@ resource "aws_ecs_task_definition" "worker" {
 
   container_definitions = jsonencode([{
     name  = "worker"
-    image = "${module.ecr.repository_url}:latest"
+    image = "${module.ecr.repository_url}:${var.image_tag}"
 
     # Override the Dockerfile CMD to start the worker consumer loop.
     command = ["python", "-m", "prime_service.worker"]
@@ -741,7 +741,7 @@ resource "aws_ecs_task_definition" "cache_bootstrap" {
 
   container_definitions = jsonencode([{
     name    = "bootstrap"
-    image   = "${module.ecr.repository_url}:latest"
+    image   = "${module.ecr.repository_url}:${var.image_tag}"
     command = ["python", "-m", "prime_service.bootstrap"]
 
     environment = [
