@@ -1,7 +1,7 @@
 # ADR-0020: Unified monotonic prime cache + cost-aware pre-flight reject + three-layer timeout
 
 ## Status
-Accepted (2026-04-25). Partially supersedes ADR-0017 (the immutable-tuple `_PRIME_TABLE` posture; lock-protected mutability is required for monotonic cache extension).
+Superseded by ADR-0032 (2026-04-26). The cost-estimator component is removed; schema cap + backpressure + worker timeout provide equivalent defence without the estimator's complexity. The unified monotonic cache decision is itself superseded by the distributed Valkey cache (ADR-0031). Partially supersedes ADR-0017 (the immutable-tuple `_PRIME_TABLE` posture; lock-protected mutability is required for monotonic cache extension).
 
 ## Context
 ADR-0017 documented the original prime-computation strategy: a static `_PRIME_TABLE` tuple pre-built at module load, with sieve and trial-division fallbacks for ranges above the table. The tuple was deliberately immutable — accidental `.append` / `.sort` / item-assignment would raise `TypeError` instead of silently corrupting subsequent lookups.

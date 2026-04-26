@@ -1,7 +1,7 @@
 # ADR-0022: Four-tier drain semantics — uvicorn + ECS task + ALB target group
 
 ## Status
-Accepted (2026-04-25)
+Superseded by ADR-0033 (2026-04-26). The async architecture replaces synchronous drain semantics: SIGALRM 60s replaces the synchronous compute timeout; SQS visibility timeout 90s provides message redelivery on worker failure; the distinction between message recovery (queue redelivery) and worker recovery (explicit signal) is formalised in ADR-0033.
 
 ## Context
 "Graceful shutdown" is not a single Python feature. When ECS scheduler decides to terminate a task — for a rolling deploy, scale-in event, or Fargate Spot reclaim — four independent timers must align so an in-flight request can finish without the client seeing a connection reset:
