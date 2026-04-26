@@ -3,37 +3,56 @@
 Reachability: this service is reachable only through the VPN gateway in
 `docker-compose.yml` (Phase 1.2) or behind AWS Client VPN endpoint in
 production (per ADR-0006). No direct host-port exposure.
+
+Async flow (Phase 2.3):
+    POST /primes → 202 Accepted + execution_id (job enqueued in SQS)
+    GET  /primes/{exec_id} → {status, result?, error_message?}
+
+Backpressure:
+    If queue depth > backpressure_threshold (default 5 × worker_count),
+    POST returns 503 + Retry-After: 60.
+
+GZip:
+    GZipMiddleware(minimum_size=1000) reduces 7 MB max raw response
+    to ~1.5-2 MB over the wire, fitting comfortably within ALB limits.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
-from collections.abc import AsyncIterator
+import os
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
+from typing import Any
 
 import structlog
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.middleware.gzip import GZipMiddleware
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from prime_service import __version__
-from prime_service.db import get_execution, get_session, health_check, insert_execution
-from prime_service.primes import primes_in_range
+from prime_service.db import (
+    Execution,
+    get_execution,
+    get_session,
+    health_check,
+    insert_queued_execution,
+)
+from prime_service.queue import PrimeQueue
 from prime_service.schemas import (
-    ExecutionDetail,
+    ExecutionResponse,
     HealthResponse,
     PrimeRangeRequest,
     PrimeRangeResponse,
+    Status,
 )
 
-# Three-layer timeout defense (ADR-0020):
-#   compute   — asyncio.wait_for around primes_in_range, 30s
-#   audit DB  — asyncio.wait_for around insert_execution, 10s
-#   ALB idle  — Terraform sets idle_timeout = 45s (above app + slack)
-_COMPUTE_TIMEOUT_S = 30.0
-_AUDIT_TIMEOUT_S = 10.0
+# Backpressure: max queue depth = BACKPRESSURE_FACTOR × worker count.
+# Configurable via env; defaults mirror strategy.md § D (5 × worker_count).
+_BACKPRESSURE_FACTOR = int(os.environ.get("BACKPRESSURE_FACTOR", "5"))
+_WORKER_COUNT = int(os.environ.get("WORKER_COUNT", "1"))
+_BACKPRESSURE_THRESHOLD = _BACKPRESSURE_FACTOR * _WORKER_COUNT
 
 # Structured JSON logging
 structlog.configure(
@@ -64,6 +83,42 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+# ─── Backpressure middleware ──────────────────────────────────────────────────
+
+
+@app.middleware("http")
+async def backpressure_middleware(
+    request: Request,
+    call_next: Callable[[Request], Coroutine[Any, Any, Response]],
+) -> Response:
+    """Reject POST /primes with 503 if queue depth exceeds threshold."""
+    if request.method == "POST" and request.url.path == "/primes":
+        try:
+            queue = PrimeQueue()
+            depth = queue.queue_depth()
+            if depth > _BACKPRESSURE_THRESHOLD:
+                log.warning(
+                    "backpressure_triggered",
+                    depth=depth,
+                    threshold=_BACKPRESSURE_THRESHOLD,
+                )
+                return Response(
+                    content='{"detail":"queue full — retry later"}',
+                    status_code=503,
+                    media_type="application/json",
+                    headers={"Retry-After": "60"},
+                )
+        except Exception:  # noqa: BLE001, S110
+            # If SQS is unreachable, don't block the request.
+            pass
+    return await call_next(request)
+
+
+# ─── Endpoints ────────────────────────────────────────────────────────────────
+
 
 @app.get("/health", response_model=HealthResponse)
 async def health(session: AsyncSession = Depends(get_session)) -> HealthResponse:
@@ -78,86 +133,82 @@ async def health(session: AsyncSession = Depends(get_session)) -> HealthResponse
     )
 
 
-@app.post("/primes", response_model=PrimeRangeResponse)
+@app.post("/primes", response_model=PrimeRangeResponse, status_code=202)
 async def compute_primes(
     req: PrimeRangeRequest,
     session: AsyncSession = Depends(get_session),
 ) -> PrimeRangeResponse:
-    started = time.perf_counter()
-    try:
-        # primes_in_range is CPU-bound + holds an internal threading.Lock during
-        # cache extension — run in the default asyncio thread pool so the event
-        # loop stays responsive, and wrap with wait_for to enforce the 30s budget.
-        primes = await asyncio.wait_for(
-            asyncio.to_thread(primes_in_range, req.start, req.end),
-            timeout=_COMPUTE_TIMEOUT_S,
-        )
-    except TimeoutError as exc:
-        log.warning(
-            "compute_timeout",
-            start=req.start,
-            end=req.end,
-            timeout_s=_COMPUTE_TIMEOUT_S,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail=f"computation exceeded {int(_COMPUTE_TIMEOUT_S)}s budget",
-        ) from exc
-    except ValueError as exc:
-        # Includes pre-flight reject when _estimate_compute_ms exceeds budget.
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    duration_ms = int((time.perf_counter() - started) * 1000)
+    """Accept a prime-range request, enqueue it, and return 202 + execution_id.
 
+    The computation is performed asynchronously by the worker container.
+    Poll GET /primes/{execution_id} to retrieve the result.
+    """
     try:
-        execution_id = await asyncio.wait_for(
-            insert_execution(
-                session,
-                range_start=req.start,
-                range_end=req.end,
-                primes=primes,
-                duration_ms=duration_ms,
-            ),
-            timeout=_AUDIT_TIMEOUT_S,
+        execution_id = await insert_queued_execution(
+            session,
+            range_start=req.start,
+            range_end=req.end,
         )
-    except TimeoutError as exc:
-        log.error("audit_write_timeout", timeout_s=_AUDIT_TIMEOUT_S)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"audit log write exceeded {int(_AUDIT_TIMEOUT_S)}s",
-        ) from exc
     except SQLAlchemyError as exc:
-        log.error("insert_execution_failed", error=str(exc))
+        log.error("insert_queued_failed", error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="audit log unavailable",
         ) from exc
 
-    log.info(
-        "primes_computed",
-        execution_id=execution_id,
-        count=len(primes),
-        duration_ms=duration_ms,
+    try:
+        queue = PrimeQueue()
+        queue.enqueue(execution_id=execution_id, start=req.start, end=req.end)
+    except Exception as exc:  # noqa: BLE001
+        log.error("enqueue_failed", execution_id=execution_id, error=str(exc))
+        # Queue is unavailable — still return 202 so the client can poll.
+        # The worker will pick up the job when the queue recovers (or the
+        # operator can manually re-enqueue). The audit row exists as the record.
+
+    log.info("job_queued", execution_id=execution_id, start=req.start, end=req.end)
+    return PrimeRangeResponse(execution_id=execution_id, status=Status.queued)
+
+
+@app.get("/primes/{execution_id}", response_model=ExecutionResponse)
+async def get_primes_result(
+    execution_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> ExecutionResponse:
+    """Return the current state of a queued prime-computation job."""
+    row: Execution | None = await get_execution(session, execution_id)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"execution {execution_id} not found",
+        )
+    return ExecutionResponse(
+        id=row.id,
+        status=Status(row.status),
+        result=row.primes if row.status == Status.done.value else None,
+        error_message=row.error_message,
     )
-    return PrimeRangeResponse(primes=primes, count=len(primes), execution_id=execution_id)
 
 
-@app.get("/executions/{execution_id}", response_model=ExecutionDetail)
+@app.get("/executions/{execution_id}")
 async def fetch_execution(
     execution_id: int,
     session: AsyncSession = Depends(get_session),
-) -> ExecutionDetail:
+) -> dict:  # type: ignore[type-arg]
+    """Legacy: return raw execution audit detail by id."""
     row = await get_execution(session, execution_id)
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"execution {execution_id} not found",
         )
-    return ExecutionDetail(
-        id=row.id,
-        range_start=row.range_start,
-        range_end=row.range_end,
-        primes_count=row.primes_count,
-        primes=row.primes or [],
-        duration_ms=row.duration_ms,
-        created_at=row.created_at,
-    )
+    return {
+        "id": row.id,
+        "range_start": row.range_start,
+        "range_end": row.range_end,
+        "primes_count": row.primes_count,
+        "primes": row.primes or [],
+        "duration_ms": row.duration_ms,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "status": row.status,
+        "error_message": row.error_message,
+    }

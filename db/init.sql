@@ -12,6 +12,9 @@
 --   - Index on created_at DESC supports the typical "show recent executions"
 --     query pattern. Index on (range_start, range_end) supports dedupe-style
 --     lookups if ever needed.
+--   - status/started_at/completed_at/error_message added for async worker
+--     state machine (queued → running → done | failed). Index on status
+--     enables backpressure queue-depth proxy queries (Phase 2.3).
 
 CREATE TABLE IF NOT EXISTS executions (
     id            BIGSERIAL PRIMARY KEY,
@@ -21,10 +24,15 @@ CREATE TABLE IF NOT EXISTS executions (
     primes        JSONB,
     duration_ms   INTEGER     NOT NULL,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    status        TEXT        NOT NULL DEFAULT 'done',
+    started_at    TIMESTAMPTZ,
+    completed_at  TIMESTAMPTZ,
+    error_message TEXT,
 
     CONSTRAINT executions_range_valid    CHECK (range_start <= range_end),
     CONSTRAINT executions_range_positive CHECK (range_start >= 2),
-    CONSTRAINT executions_count_nonneg   CHECK (primes_count >= 0)
+    CONSTRAINT executions_count_nonneg   CHECK (primes_count >= 0),
+    CONSTRAINT executions_status_valid   CHECK (status IN ('queued', 'running', 'done', 'failed'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_executions_created_at
@@ -32,3 +40,6 @@ CREATE INDEX IF NOT EXISTS idx_executions_created_at
 
 CREATE INDEX IF NOT EXISTS idx_executions_range
     ON executions (range_start, range_end);
+
+CREATE INDEX IF NOT EXISTS idx_executions_status
+    ON executions (status);

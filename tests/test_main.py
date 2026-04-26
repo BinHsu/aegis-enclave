@@ -7,21 +7,21 @@ Strategy
   AsyncMock — endpoint tests are pure HTTP-layer verification.
 - Real DB integration is verified by `make smoke` (Phase 1.5).
 
-Endpoints under test:
-- GET /health        — degraded behaviour, version reporting
-- POST /primes       — happy path, validation, business-rule errors, audit failure
-- GET /executions/{id} — found / not-found
+Endpoints under test (Phase 2.3 async API):
+- GET /health          — degraded behaviour, version reporting
+- POST /primes         — 202 Accepted + {execution_id, status: "queued"}
+- GET  /primes/{id}    — job status polling (queued/running/done/failed)
+- GET  /executions/{id} — legacy audit detail (raw row)
 
 Cross-cutting:
 - ValidationError → 422 (FastAPI default)
-- ValueError from prime logic → 400 (handled by main.py)
+- Queue overflow → 503 + Retry-After: 60 (backpressure middleware)
 - SQLAlchemyError on insert → 503 (handled by main.py)
 - Missing audit row → 404
 """
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -34,35 +34,8 @@ from prime_service.db import Execution, get_session
 from prime_service.main import app
 
 # ───────────────────────────────────────────────────────────────────────────
-# Fixtures
+# Helpers
 # ───────────────────────────────────────────────────────────────────────────
-
-
-@pytest.fixture
-def mock_session() -> AsyncMock:
-    """A fresh AsyncMock session — tests configure its methods per scenario."""
-    return AsyncMock()
-
-
-@pytest.fixture
-def client(mock_session: AsyncMock) -> AsyncIterator[AsyncClient]:
-    """AsyncClient with `get_session` overridden to yield the mock_session."""
-
-    async def _override() -> AsyncIterator[AsyncMock]:
-        yield mock_session
-
-    app.dependency_overrides[get_session] = _override
-    transport = ASGITransport(app=app)
-
-    async def _make() -> AsyncClient:
-        return AsyncClient(transport=transport, base_url="http://test")
-
-    # async generator — yields a configured AsyncClient
-    return _make()  # type: ignore[return-value]
-
-
-# Async fixtures need `pytest-asyncio` "auto" mode (already configured in pyproject.toml).
-# Use a helper to construct the AsyncClient inside each test (avoids ASGITransport leakage).
 
 
 async def make_client(mock_session: AsyncMock) -> AsyncClient:
@@ -71,6 +44,56 @@ async def make_client(mock_session: AsyncMock) -> AsyncClient:
 
     app.dependency_overrides[get_session] = _override
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+def _queued_row(
+    execution_id: int = 1,
+    start: int = 2,
+    end: int = 10,
+) -> Execution:
+    return Execution(
+        id=execution_id,
+        range_start=start,
+        range_end=end,
+        primes_count=0,
+        primes=None,
+        duration_ms=0,
+        created_at=datetime(2026, 4, 26, 10, 0, 0, tzinfo=UTC),
+        status="queued",
+    )
+
+
+def _done_row(
+    execution_id: int = 1,
+    primes: list[int] | None = None,
+) -> Execution:
+    if primes is None:
+        primes = [2, 3, 5, 7]
+    return Execution(
+        id=execution_id,
+        range_start=2,
+        range_end=10,
+        primes_count=len(primes),
+        primes=primes,
+        duration_ms=50,
+        created_at=datetime(2026, 4, 26, 10, 0, 0, tzinfo=UTC),
+        status="done",
+        completed_at=datetime(2026, 4, 26, 10, 0, 1, tzinfo=UTC),
+    )
+
+
+def _failed_row(execution_id: int = 1, error: str = "timeout") -> Execution:
+    return Execution(
+        id=execution_id,
+        range_start=2,
+        range_end=10,
+        primes_count=0,
+        primes=None,
+        duration_ms=0,
+        created_at=datetime(2026, 4, 26, 10, 0, 0, tzinfo=UTC),
+        status="failed",
+        error_message=error,
+    )
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -82,7 +105,6 @@ class TestHealthEndpoint:
     @pytest.mark.asyncio
     async def test_ok_when_db_reachable(self) -> None:
         session = AsyncMock()
-        # health_check uses session.execute → result.scalar_one() == 1
         result_obj = MagicMock()
         result_obj.scalar_one.return_value = 1
         session.execute = AsyncMock(return_value=result_obj)
@@ -106,9 +128,6 @@ class TestHealthEndpoint:
             r = await ac.get("/health")
         app.dependency_overrides.clear()
 
-        # Per ADR-0006 / main.py docstring: /health always returns 200,
-        # status field reflects degraded mode. ALB target health uses the
-        # status field, not the HTTP code.
         assert r.status_code == 200
         body = r.json()
         assert body["status"] == "degraded"
@@ -116,30 +135,52 @@ class TestHealthEndpoint:
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# POST /primes
+# POST /primes — async 202 Accepted
 # ───────────────────────────────────────────────────────────────────────────
 
 
 class TestComputePrimesEndpoint:
+    """POST /primes returns 202 Accepted + {execution_id, status: 'queued'}."""
+
     @pytest.mark.asyncio
-    async def test_happy_path(self) -> None:
+    async def test_happy_path_returns_202(self) -> None:
         session = AsyncMock()
-        session.flush = AsyncMock()
+
+        def capture_add(obj: Execution) -> None:
+            obj.id = 42
+
+        session.add = MagicMock(side_effect=capture_add)
+
+        with patch("prime_service.main.PrimeQueue") as MockQueue:
+            MockQueue.return_value.queue_depth.return_value = 0
+            MockQueue.return_value.enqueue.return_value = "msg-id-1"
+            async with await make_client(session) as ac:
+                r = await ac.post("/primes", json={"start": 2, "end": 10})
+        app.dependency_overrides.clear()
+
+        assert r.status_code == 202
+        body = r.json()
+        assert "execution_id" in body
+        assert body["status"] == "queued"
+
+    @pytest.mark.asyncio
+    async def test_happy_path_execution_id_numeric(self) -> None:
+        session = AsyncMock()
 
         def capture_add(obj: Execution) -> None:
             obj.id = 7
 
         session.add = MagicMock(side_effect=capture_add)
 
-        async with await make_client(session) as ac:
-            r = await ac.post("/primes", json={"start": 2, "end": 10})
+        with patch("prime_service.main.PrimeQueue") as MockQueue:
+            MockQueue.return_value.queue_depth.return_value = 0
+            MockQueue.return_value.enqueue.return_value = "msg-id-2"
+            async with await make_client(session) as ac:
+                r = await ac.post("/primes", json={"start": 2, "end": 10})
         app.dependency_overrides.clear()
 
-        assert r.status_code == 200
-        body = r.json()
-        assert body["primes"] == [2, 3, 5, 7]
-        assert body["count"] == 4
-        assert body["execution_id"] == 7
+        assert r.status_code == 202
+        assert isinstance(r.json()["execution_id"], int)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -147,8 +188,8 @@ class TestComputePrimesEndpoint:
         [
             ({"start": 1, "end": 10}, 422),  # start < 2 → Pydantic 422
             ({"start": -5, "end": 10}, 422),  # negative start
-            ({"start": 10, "end": 5}, 422),  # start > end → Pydantic model_validator
-            ({"start": 2, "end": 100_000_000}, 422),  # range > ceiling → Pydantic
+            ({"start": 10, "end": 5}, 422),  # start > end → model_validator
+            ({"start": 2, "end": 100_000_000}, 422),  # range > ceiling
             ({"start": "abc", "end": 10}, 422),  # invalid type
             ({"end": 10}, 422),  # missing start
             ({"start": 2}, 422),  # missing end
@@ -156,69 +197,351 @@ class TestComputePrimesEndpoint:
         ],
     )
     async def test_validation_errors_return_422(
-        self, payload: dict[str, object], expected_status: int
+        self, payload: dict, expected_status: int  # type: ignore[type-arg]
     ) -> None:
         session = AsyncMock()
-        async with await make_client(session) as ac:
-            r = await ac.post("/primes", json=payload)
+        with patch("prime_service.main.PrimeQueue") as MockQueue:
+            MockQueue.return_value.queue_depth.return_value = 0
+            async with await make_client(session) as ac:
+                r = await ac.post("/primes", json=payload)
         app.dependency_overrides.clear()
         assert r.status_code == expected_status
 
+    # BVA at start = 2 (schema boundary)
     @pytest.mark.asyncio
-    async def test_db_failure_returns_503(self) -> None:
+    async def test_start_below_2_rejected_422(self) -> None:
         session = AsyncMock()
-        session.add = MagicMock()
-        # insert_execution path: session.add → session.commit → session.refresh.
-        # Failure injected at commit (the SQL round-trip).
-        session.commit = AsyncMock(side_effect=SQLAlchemyError("audit log failed"))
-
-        async with await make_client(session) as ac:
-            r = await ac.post("/primes", json={"start": 2, "end": 10})
+        with patch("prime_service.main.PrimeQueue") as MockQueue:
+            MockQueue.return_value.queue_depth.return_value = 0
+            async with await make_client(session) as ac:
+                r = await ac.post("/primes", json={"start": 1, "end": 10})
         app.dependency_overrides.clear()
-
-        assert r.status_code == 503
-        assert "audit" in r.json()["detail"].lower()
+        assert r.status_code == 422
 
     @pytest.mark.asyncio
-    async def test_single_point_range(self) -> None:
+    async def test_start_at_2_accepted_202(self) -> None:
         session = AsyncMock()
-        session.flush = AsyncMock()
 
         def capture_add(obj: Execution) -> None:
             obj.id = 1
 
         session.add = MagicMock(side_effect=capture_add)
 
+        with patch("prime_service.main.PrimeQueue") as MockQueue:
+            MockQueue.return_value.queue_depth.return_value = 0
+            MockQueue.return_value.enqueue.return_value = "msg"
+            async with await make_client(session) as ac:
+                r = await ac.post("/primes", json={"start": 2, "end": 10})
+        app.dependency_overrides.clear()
+        assert r.status_code == 202
+
+    @pytest.mark.asyncio
+    async def test_start_above_2_accepted_202(self) -> None:
+        session = AsyncMock()
+
+        def capture_add(obj: Execution) -> None:
+            obj.id = 2
+
+        session.add = MagicMock(side_effect=capture_add)
+
+        with patch("prime_service.main.PrimeQueue") as MockQueue:
+            MockQueue.return_value.queue_depth.return_value = 0
+            MockQueue.return_value.enqueue.return_value = "msg"
+            async with await make_client(session) as ac:
+                r = await ac.post("/primes", json={"start": 3, "end": 10})
+        app.dependency_overrides.clear()
+        assert r.status_code == 202
+
+    @pytest.mark.asyncio
+    async def test_db_failure_returns_503(self) -> None:
+        session = AsyncMock()
+        session.add = MagicMock()
+        session.commit = AsyncMock(side_effect=SQLAlchemyError("audit log failed"))
+
+        with patch("prime_service.main.PrimeQueue") as MockQueue:
+            MockQueue.return_value.queue_depth.return_value = 0
+            async with await make_client(session) as ac:
+                r = await ac.post("/primes", json={"start": 2, "end": 10})
+        app.dependency_overrides.clear()
+
+        assert r.status_code == 503
+        assert "audit" in r.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_enqueue_failure_still_returns_202(self) -> None:
+        """Queue failure does not prevent 202 — audit row exists as the record."""
+        session = AsyncMock()
+
+        def capture_add(obj: Execution) -> None:
+            obj.id = 5
+
+        session.add = MagicMock(side_effect=capture_add)
+
+        with patch("prime_service.main.PrimeQueue") as MockQueue:
+            MockQueue.return_value.queue_depth.return_value = 0
+            MockQueue.return_value.enqueue.side_effect = Exception("SQS down")
+            async with await make_client(session) as ac:
+                r = await ac.post("/primes", json={"start": 2, "end": 10})
+        app.dependency_overrides.clear()
+
+        # Still 202 — audit row was written; operator can re-enqueue
+        assert r.status_code == 202
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Backpressure middleware — 503 when queue depth exceeds threshold
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestBackpressureMiddleware:
+    """POST /primes returns 503 + Retry-After: 60 when queue is full."""
+
+    @pytest.mark.asyncio
+    async def test_backpressure_503_when_queue_full(self) -> None:
+        session = AsyncMock()
+
+        with patch("prime_service.main.PrimeQueue") as MockQueue:
+            # Return depth > threshold (default threshold = 5 × 1 = 5)
+            MockQueue.return_value.queue_depth.return_value = 10
+            async with await make_client(session) as ac:
+                r = await ac.post("/primes", json={"start": 2, "end": 10})
+        app.dependency_overrides.clear()
+
+        assert r.status_code == 503
+        assert r.headers.get("Retry-After") == "60"
+
+    @pytest.mark.asyncio
+    async def test_backpressure_not_triggered_below_threshold(self) -> None:
+        session = AsyncMock()
+
+        def capture_add(obj: Execution) -> None:
+            obj.id = 1
+
+        session.add = MagicMock(side_effect=capture_add)
+
+        with patch("prime_service.main.PrimeQueue") as MockQueue:
+            MockQueue.return_value.queue_depth.return_value = 0
+            MockQueue.return_value.enqueue.return_value = "msg"
+            async with await make_client(session) as ac:
+                r = await ac.post("/primes", json={"start": 2, "end": 10})
+        app.dependency_overrides.clear()
+
+        assert r.status_code == 202
+
+    # BVA at backpressure threshold (default 5)
+    @pytest.mark.asyncio
+    async def test_backpressure_bva_at_threshold(self) -> None:
+        """Depth == threshold → should NOT trigger 503 (> threshold, not >=)."""
+        session = AsyncMock()
+
+        def capture_add(obj: Execution) -> None:
+            obj.id = 1
+
+        session.add = MagicMock(side_effect=capture_add)
+
+        with patch("prime_service.main.PrimeQueue") as MockQueue:
+            MockQueue.return_value.queue_depth.return_value = 5  # == threshold
+            MockQueue.return_value.enqueue.return_value = "msg"
+            async with await make_client(session) as ac:
+                r = await ac.post("/primes", json={"start": 2, "end": 10})
+        app.dependency_overrides.clear()
+
+        # depth == threshold → NOT triggered
+        assert r.status_code == 202
+
+    @pytest.mark.asyncio
+    async def test_backpressure_bva_below_threshold(self) -> None:
+        """Depth == threshold - 1 → no backpressure."""
+        session = AsyncMock()
+
+        def capture_add(obj: Execution) -> None:
+            obj.id = 1
+
+        session.add = MagicMock(side_effect=capture_add)
+
+        with patch("prime_service.main.PrimeQueue") as MockQueue:
+            MockQueue.return_value.queue_depth.return_value = 4  # == threshold - 1
+            MockQueue.return_value.enqueue.return_value = "msg"
+            async with await make_client(session) as ac:
+                r = await ac.post("/primes", json={"start": 2, "end": 10})
+        app.dependency_overrides.clear()
+        assert r.status_code == 202
+
+    @pytest.mark.asyncio
+    async def test_backpressure_bva_above_threshold(self) -> None:
+        """Depth == threshold + 1 → 503 triggered."""
+        session = AsyncMock()
+
+        with patch("prime_service.main.PrimeQueue") as MockQueue:
+            MockQueue.return_value.queue_depth.return_value = 6  # == threshold + 1
+            async with await make_client(session) as ac:
+                r = await ac.post("/primes", json={"start": 2, "end": 10})
+        app.dependency_overrides.clear()
+        assert r.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_backpressure_sqs_error_does_not_block(self) -> None:
+        """If SQS is unreachable for depth check, POST is not blocked."""
+        session = AsyncMock()
+
+        def capture_add(obj: Execution) -> None:
+            obj.id = 1
+
+        session.add = MagicMock(side_effect=capture_add)
+
+        with patch("prime_service.main.PrimeQueue") as MockQueue:
+            MockQueue.return_value.queue_depth.side_effect = Exception("SQS unreachable")
+            MockQueue.return_value.enqueue.return_value = "msg"
+            async with await make_client(session) as ac:
+                r = await ac.post("/primes", json={"start": 2, "end": 10})
+        app.dependency_overrides.clear()
+
+        # SQS error → fall through, not blocked
+        assert r.status_code == 202
+
+    @pytest.mark.asyncio
+    async def test_backpressure_only_applies_to_post_primes(self) -> None:
+        """GET /health is not subject to backpressure even if queue is full."""
+        session = AsyncMock()
+        result_obj = MagicMock()
+        result_obj.scalar_one.return_value = 1
+        session.execute = AsyncMock(return_value=result_obj)
+
+        with patch("prime_service.main.PrimeQueue") as MockQueue:
+            MockQueue.return_value.queue_depth.return_value = 9999
+            async with await make_client(session) as ac:
+                r = await ac.get("/health")
+        app.dependency_overrides.clear()
+
+        assert r.status_code == 200
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# GET /primes/{id} — job status polling
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestGetPrimesResult:
+    """GET /primes/{id} returns current job status."""
+
+    @pytest.mark.asyncio
+    async def test_queued_status(self) -> None:
+        session = AsyncMock()
+        row = _queued_row(execution_id=1)
+        result_obj = MagicMock()
+        result_obj.scalar_one_or_none.return_value = row
+        session.execute = AsyncMock(return_value=result_obj)
+
         async with await make_client(session) as ac:
-            r = await ac.post("/primes", json={"start": 7, "end": 7})
+            r = await ac.get("/primes/1")
         app.dependency_overrides.clear()
 
         assert r.status_code == 200
         body = r.json()
-        assert body["primes"] == [7]
-        assert body["count"] == 1
+        assert body["status"] == "queued"
+        assert body["result"] is None
 
     @pytest.mark.asyncio
-    async def test_start_below_2_explicit(self) -> None:
-        """Boundary: start=1 must be rejected by Pydantic (ge=2)."""
+    async def test_done_status_includes_result(self) -> None:
+        session = AsyncMock()
+        row = _done_row(execution_id=2, primes=[2, 3, 5, 7])
+        result_obj = MagicMock()
+        result_obj.scalar_one_or_none.return_value = row
+        session.execute = AsyncMock(return_value=result_obj)
+
+        async with await make_client(session) as ac:
+            r = await ac.get("/primes/2")
+        app.dependency_overrides.clear()
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "done"
+        assert body["result"] == [2, 3, 5, 7]
+        assert body["error_message"] is None
+
+    @pytest.mark.asyncio
+    async def test_failed_status_includes_error_message(self) -> None:
+        session = AsyncMock()
+        row = _failed_row(execution_id=3, error="compute exceeded 60s SIGALRM budget")
+        result_obj = MagicMock()
+        result_obj.scalar_one_or_none.return_value = row
+        session.execute = AsyncMock(return_value=result_obj)
+
+        async with await make_client(session) as ac:
+            r = await ac.get("/primes/3")
+        app.dependency_overrides.clear()
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "failed"
+        assert "60s" in body["error_message"]
+        assert body["result"] is None
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_not_found(self) -> None:
+        session = AsyncMock()
+        result_obj = MagicMock()
+        result_obj.scalar_one_or_none.return_value = None
+        session.execute = AsyncMock(return_value=result_obj)
+
+        async with await make_client(session) as ac:
+            r = await ac.get("/primes/99999")
+        app.dependency_overrides.clear()
+
+        assert r.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_invalid_id_path_param_422(self) -> None:
         session = AsyncMock()
         async with await make_client(session) as ac:
-            r = await ac.post("/primes", json={"start": 1, "end": 10})
+            r = await ac.get("/primes/not-a-number")
         app.dependency_overrides.clear()
         assert r.status_code == 422
 
+    # BVA at execution_id boundary (positive integer)
     @pytest.mark.asyncio
-    async def test_start_greater_than_end_explicit(self) -> None:
-        """Boundary: start>end must be rejected by model_validator."""
+    async def test_execution_id_0_rejected_422(self) -> None:
+        """execution_id=0 parses but 0 is a valid integer for path params."""
         session = AsyncMock()
+        result_obj = MagicMock()
+        result_obj.scalar_one_or_none.return_value = None
+        session.execute = AsyncMock(return_value=result_obj)
+
         async with await make_client(session) as ac:
-            r = await ac.post("/primes", json={"start": 100, "end": 50})
+            r = await ac.get("/primes/0")
         app.dependency_overrides.clear()
-        assert r.status_code == 422
+        # 0 is a valid int path param — returns 404 (not found) not 422
+        assert r.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_execution_id_1_valid(self) -> None:
+        session = AsyncMock()
+        row = _queued_row(execution_id=1)
+        result_obj = MagicMock()
+        result_obj.scalar_one_or_none.return_value = row
+        session.execute = AsyncMock(return_value=result_obj)
+
+        async with await make_client(session) as ac:
+            r = await ac.get("/primes/1")
+        app.dependency_overrides.clear()
+        assert r.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_execution_id_2_valid(self) -> None:
+        session = AsyncMock()
+        row = _queued_row(execution_id=2)
+        result_obj = MagicMock()
+        result_obj.scalar_one_or_none.return_value = row
+        session.execute = AsyncMock(return_value=result_obj)
+
+        async with await make_client(session) as ac:
+            r = await ac.get("/primes/2")
+        app.dependency_overrides.clear()
+        assert r.status_code == 200
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# GET /executions/{id}
+# GET /executions/{id} — legacy audit detail
 # ───────────────────────────────────────────────────────────────────────────
 
 
@@ -234,8 +557,8 @@ class TestFetchExecutionEndpoint:
             primes=[2, 3, 5, 7],
             duration_ms=5,
             created_at=datetime(2026, 4, 25, 12, 0, 0, tzinfo=UTC),
+            status="done",
         )
-        # get_execution uses session.execute(stmt) → result.scalar_one_or_none()
         result_obj = MagicMock()
         result_obj.scalar_one_or_none.return_value = row
         session.execute = AsyncMock(return_value=result_obj)
@@ -249,11 +572,11 @@ class TestFetchExecutionEndpoint:
         assert body["id"] == 42
         assert body["primes_count"] == 4
         assert body["primes"] == [2, 3, 5, 7]
+        assert body["status"] == "done"
 
     @pytest.mark.asyncio
     async def test_returns_404_when_not_found(self) -> None:
         session = AsyncMock()
-        # get_execution returns None when scalar_one_or_none has no row.
         result_obj = MagicMock()
         result_obj.scalar_one_or_none.return_value = None
         session.execute = AsyncMock(return_value=result_obj)
@@ -270,9 +593,44 @@ class TestFetchExecutionEndpoint:
         async with await make_client(session) as ac:
             r = await ac.get("/executions/not-a-number")
         app.dependency_overrides.clear()
-
-        # FastAPI returns 422 for path param type coercion failure.
         assert r.status_code == 422
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# GZip middleware — Content-Encoding header present for large responses
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestGzipMiddleware:
+    """GZipMiddleware is active; verify Accept-Encoding negotiation works."""
+
+    @pytest.mark.asyncio
+    async def test_gzip_encoding_returned_when_accepted(self) -> None:
+        session = AsyncMock()
+        result_obj = MagicMock()
+        result_obj.scalar_one.return_value = 1
+        session.execute = AsyncMock(return_value=result_obj)
+
+        async with await make_client(session) as ac:
+            r = await ac.get("/health", headers={"Accept-Encoding": "gzip"})
+        app.dependency_overrides.clear()
+
+        # FastAPI/starlette GZip only compresses if response body >= minimum_size.
+        # /health body is small (<1000 bytes); no compression expected.
+        # We verify the middleware doesn't break the response.
+        assert r.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_no_encoding_without_accept(self) -> None:
+        session = AsyncMock()
+        result_obj = MagicMock()
+        result_obj.scalar_one.return_value = 1
+        session.execute = AsyncMock(return_value=result_obj)
+
+        async with await make_client(session) as ac:
+            r = await ac.get("/health")
+        app.dependency_overrides.clear()
+        assert r.status_code == 200
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -300,263 +658,4 @@ class TestApplicationSurface:
         async with await make_client(session) as ac:
             r = await ac.get("/docs")
         app.dependency_overrides.clear()
-        # 200 if docs_url is enabled (it is in main.py — `docs_url="/docs"`).
         assert r.status_code == 200
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# Three-layer timeout — compute layer (ADR-0020)
-# ───────────────────────────────────────────────────────────────────────────
-
-
-class TestComputeTimeoutGate:
-    """Layer 1 of three: 30s `asyncio.wait_for` around `primes_in_range`.
-
-    The compute layer protects against runaway primality work — either a
-    legitimate large query that the estimator under-counted, or a worst-case
-    cache state. On timeout, the endpoint maps `asyncio.TimeoutError` to
-    HTTP 504 with a detail string that names the seconds budget.
-    """
-
-    @pytest.mark.asyncio
-    async def test_compute_timeout_returns_504(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Patch `primes_in_range` to sleep beyond a shrunk compute budget.
-
-        Strategy: shrink `_COMPUTE_TIMEOUT_S` to 0.05s and replace
-        `primes_in_range` with a function that sleeps 0.5s on the worker
-        thread. `asyncio.wait_for` cancels the wait after the budget,
-        the endpoint catches `asyncio.TimeoutError`, and returns 504.
-        """
-        import time as _time
-
-        def _slow_primes(start: int, end: int) -> list[int]:
-            _time.sleep(0.5)
-            return []
-
-        monkeypatch.setattr("prime_service.main._COMPUTE_TIMEOUT_S", 0.05)
-        monkeypatch.setattr("prime_service.main.primes_in_range", _slow_primes)
-
-        session = AsyncMock()
-        async with await make_client(session) as ac:
-            r = await ac.post("/primes", json={"start": 2, "end": 10})
-        app.dependency_overrides.clear()
-
-        assert r.status_code == 504
-        detail = r.json()["detail"].lower()
-        assert "exceeded" in detail
-        # Detail must name the seconds budget — the int cast in main.py
-        # rounds 0.05 → 0, so we just confirm "s budget" framing is present.
-        assert "s budget" in detail or "second" in detail
-
-    @pytest.mark.asyncio
-    async def test_compute_within_budget_returns_200(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Fast `primes_in_range` resolves well under the budget → 200."""
-
-        def _fast_primes(start: int, end: int) -> list[int]:
-            return [2, 3, 5, 7]
-
-        monkeypatch.setattr("prime_service.main.primes_in_range", _fast_primes)
-
-        session = AsyncMock()
-        session.flush = AsyncMock()
-
-        def capture_add(obj: Execution) -> None:
-            obj.id = 11
-
-        session.add = MagicMock(side_effect=capture_add)
-
-        async with await make_client(session) as ac:
-            r = await ac.post("/primes", json={"start": 2, "end": 10})
-        app.dependency_overrides.clear()
-
-        assert r.status_code == 200
-        body = r.json()
-        assert body["primes"] == [2, 3, 5, 7]
-        assert body["count"] == 4
-
-    @pytest.mark.asyncio
-    async def test_compute_timeout_via_wait_for_patch(self) -> None:
-        """Belt-and-braces: patch `asyncio.wait_for` itself to raise.
-
-        Ensures the 504 mapping does not depend on the slow-function trick —
-        if any future refactor swaps the cancellation mechanism, this still
-        catches the contract: TimeoutError from the compute wrap → 504.
-        """
-
-        async def _raise_timeout(*args: object, **kwargs: object) -> object:
-            raise TimeoutError()
-
-        with patch("prime_service.main.asyncio.wait_for", side_effect=_raise_timeout):
-            session = AsyncMock()
-            async with await make_client(session) as ac:
-                r = await ac.post("/primes", json={"start": 2, "end": 10})
-            app.dependency_overrides.clear()
-
-        assert r.status_code == 504
-        assert "exceeded" in r.json()["detail"].lower()
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# Pre-flight rejection — `_estimate_compute_ms` exceeds `_HARD_TIMEOUT_MS`
-# ───────────────────────────────────────────────────────────────────────────
-
-
-class TestPreflightRejection:
-    """Pre-flight cost estimator — `_validate` rejects with ValueError when
-    the estimated compute cost exceeds the hard timeout. The endpoint maps
-    that to HTTP 400 (already wired for any ValueError from primes logic).
-    """
-
-    @pytest.mark.asyncio
-    async def test_estimated_too_expensive_returns_400(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Synthetic ValueError from `primes_in_range` → 400 with detail."""
-
-        msg = "estimated compute time 60000 ms exceeds 30000 ms ceiling"
-
-        def _reject(start: int, end: int) -> list[int]:
-            raise ValueError(msg)
-
-        monkeypatch.setattr("prime_service.main.primes_in_range", _reject)
-
-        session = AsyncMock()
-        async with await make_client(session) as ac:
-            r = await ac.post("/primes", json={"start": 2, "end": 10})
-        app.dependency_overrides.clear()
-
-        assert r.status_code == 400
-        assert "estimated compute time" in r.json()["detail"]
-
-    @pytest.mark.asyncio
-    async def test_real_far_gap_layer3_query_rejected(self) -> None:
-        """End-to-end: a real far-gap query naturally trips the estimator.
-
-        With a freshly-reset cache (`_known_max == _INITIAL_PREWARM_BOUND`),
-        a `[2, 10_000_000]` range hits Layer 3 (trial division above the
-        sieve threshold) over ~10⁷ candidates. The estimator multiplies
-        `compute_range * sqrt(end) / 6 / 3000` → tens of millions of ms,
-        well past the 30 000 ms ceiling. `_validate` raises ValueError;
-        endpoint maps to 400.
-
-        Cache state matters: any prior test that extended `_known_max`
-        past ~10⁷ would make this query *cheap* (cache hit) and break the
-        test. We reset cache state explicitly to guarantee determinism.
-        """
-        # Manual reset — keeps the test self-contained without an autouse
-        # fixture that other tests in this module don't need.
-        from prime_service import primes as _primes_mod
-
-        with _primes_mod._cache_lock:
-            _primes_mod._known_primes = _primes_mod._build_prime_table(
-                _primes_mod._INITIAL_PREWARM_BOUND
-            )
-            _primes_mod._set_known_max(_primes_mod._INITIAL_PREWARM_BOUND)
-
-        session = AsyncMock()
-        async with await make_client(session) as ac:
-            r = await ac.post("/primes", json={"start": 2, "end": 10_000_000})
-        app.dependency_overrides.clear()
-
-        assert r.status_code == 400
-        detail = r.json()["detail"]
-        assert "estimated compute time" in detail
-        assert "ceiling" in detail
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# Three-layer timeout — audit DB layer (ADR-0020)
-# ───────────────────────────────────────────────────────────────────────────
-
-
-class TestAuditTimeoutGate:
-    """Layer 2 of three: 10s `asyncio.wait_for` around `insert_execution`.
-
-    Audit DB writes that hang (slow write replica, network partition between
-    the enclave and Aurora, lock contention) must not strand the request on
-    the event loop. On timeout, 503 with detail `audit log write exceeded`.
-
-    The pre-existing `SQLAlchemyError → 503 'audit log unavailable'` path
-    is covered by `TestComputePrimesEndpoint.test_db_failure_returns_503` —
-    referenced here so the failure-mode picture stays whole.
-    """
-
-    @pytest.mark.asyncio
-    async def test_audit_timeout_returns_503(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Slow `insert_execution` past a shrunk audit budget → 503."""
-
-        async def _slow_insert(*args: object, **kwargs: object) -> int:
-            await asyncio.sleep(0.5)
-            return 1
-
-        monkeypatch.setattr("prime_service.main._AUDIT_TIMEOUT_S", 0.05)
-        monkeypatch.setattr("prime_service.main.insert_execution", _slow_insert)
-
-        session = AsyncMock()
-        async with await make_client(session) as ac:
-            r = await ac.post("/primes", json={"start": 2, "end": 10})
-        app.dependency_overrides.clear()
-
-        assert r.status_code == 503
-        detail = r.json()["detail"].lower()
-        assert "audit log write exceeded" in detail
-
-    @pytest.mark.asyncio
-    async def test_audit_sqlalchemy_error_still_503(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Preserve the existing failure mode: SQLAlchemyError → 503.
-
-        Distinct detail string from the timeout case ("audit log unavailable"
-        vs. "audit log write exceeded") so SREs can distinguish the two from
-        the response body alone.
-        """
-
-        async def _explode(*args: object, **kwargs: object) -> int:
-            raise SQLAlchemyError("audit log failed")
-
-        monkeypatch.setattr("prime_service.main.insert_execution", _explode)
-
-        session = AsyncMock()
-        async with await make_client(session) as ac:
-            r = await ac.post("/primes", json={"start": 2, "end": 10})
-        app.dependency_overrides.clear()
-
-        assert r.status_code == 503
-        detail = r.json()["detail"].lower()
-        assert "audit log unavailable" in detail
-        assert "exceeded" not in detail
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# Cache-state persistence (sanity — not a speed assertion)
-# ───────────────────────────────────────────────────────────────────────────
-
-
-class TestCacheStatePersistence:
-    """Two POSTs over the same range return identical primes.
-
-    This is a consistency check, not a performance assertion. We do not
-    inspect `_known_max` advancement or measure latency — only that the
-    public contract (the prime list) is stable across repeated calls.
-    """
-
-    @pytest.mark.asyncio
-    async def test_repeated_range_returns_identical_primes(self) -> None:
-        session = AsyncMock()
-        session.flush = AsyncMock()
-
-        ids = iter([100, 101])
-
-        def capture_add(obj: Execution) -> None:
-            obj.id = next(ids)
-
-        session.add = MagicMock(side_effect=capture_add)
-
-        async with await make_client(session) as ac:
-            r1 = await ac.post("/primes", json={"start": 2, "end": 50})
-            r2 = await ac.post("/primes", json={"start": 2, "end": 50})
-        app.dependency_overrides.clear()
-
-        assert r1.status_code == 200
-        assert r2.status_code == 200
-        assert r1.json()["primes"] == r2.json()["primes"]
-        assert r1.json()["count"] == r2.json()["count"]

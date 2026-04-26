@@ -1,9 +1,22 @@
 """Pydantic v2 request/response models for the prime service API."""
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
+
+
+class Status(StrEnum):
+    """Lifecycle states for an async prime-computation job.
+
+    State machine: queued → running → done | failed.
+    """
+
+    queued = "queued"
+    running = "running"
+    done = "done"
+    failed = "failed"
 
 
 class PrimeRangeRequest(BaseModel):
@@ -22,9 +35,19 @@ class PrimeRangeRequest(BaseModel):
 
 
 class PrimeRangeResponse(BaseModel):
-    primes: list[int]
-    count: int
+    """202 Accepted response body for POST /primes (async path)."""
+
     execution_id: int
+    status: Status = Status.queued
+
+
+class ExecutionResponse(BaseModel):
+    """GET /primes/{exec_id} — current state of a job."""
+
+    id: int
+    status: Status
+    result: list[int] | None = None
+    error_message: str | None = None
 
 
 class HealthResponse(BaseModel):

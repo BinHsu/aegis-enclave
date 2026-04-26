@@ -42,9 +42,11 @@ from prime_service.db import (
     Base,
     Execution,
     Settings,
+    count_active_executions,
     get_execution,
     health_check,
     insert_execution,
+    insert_queued_execution,
 )
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -398,3 +400,266 @@ class TestHealthCheck:
 
         with pytest.raises(SQLAlchemyError, match="query failed"):
             await health_check(session)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Execution model — new status columns (Phase 2.3 async worker path)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestExecutionModelStatusColumns:
+    """Verify the new status columns added for the async worker lifecycle."""
+
+    def test_status_column_present(self) -> None:
+        column_names = {c.name for c in Execution.__table__.columns}
+        assert "status" in column_names
+
+    def test_started_at_column_present(self) -> None:
+        column_names = {c.name for c in Execution.__table__.columns}
+        assert "started_at" in column_names
+
+    def test_completed_at_column_present(self) -> None:
+        column_names = {c.name for c in Execution.__table__.columns}
+        assert "completed_at" in column_names
+
+    def test_error_message_column_present(self) -> None:
+        column_names = {c.name for c in Execution.__table__.columns}
+        assert "error_message" in column_names
+
+    def test_status_column_not_nullable(self) -> None:
+        status_col = Execution.__table__.columns["status"]
+        assert status_col.nullable is False
+
+    def test_started_at_column_is_nullable(self) -> None:
+        """started_at is NULL until the worker picks up the job."""
+        col = Execution.__table__.columns["started_at"]
+        assert col.nullable is True
+
+    def test_completed_at_column_is_nullable(self) -> None:
+        """completed_at is NULL until the job finishes."""
+        col = Execution.__table__.columns["completed_at"]
+        assert col.nullable is True
+
+    def test_error_message_column_is_nullable(self) -> None:
+        """error_message is NULL for successful executions."""
+        col = Execution.__table__.columns["error_message"]
+        assert col.nullable is True
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# insert_queued_execution — inserts row with status='queued', returns id
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestInsertQueuedExecution:
+    """Verify insert_queued_execution writes a 'queued' row and returns id."""
+
+    async def test_returns_assigned_id(self) -> None:
+        session = AsyncMock()
+        added: list[Execution] = []
+
+        def capture_add(obj: Execution) -> None:
+            added.append(obj)
+
+        async def fake_refresh(obj: Execution) -> None:
+            obj.id = 77
+
+        session.add = MagicMock(side_effect=capture_add)
+        session.commit = AsyncMock()
+        session.refresh = AsyncMock(side_effect=fake_refresh)
+
+        result = await insert_queued_execution(session, range_start=2, range_end=1000)
+
+        assert result == 77
+
+    async def test_status_is_queued(self) -> None:
+        """Inserted row must have status='queued'."""
+        session = AsyncMock()
+        added: list[Execution] = []
+
+        def capture_add(obj: Execution) -> None:
+            added.append(obj)
+
+        async def fake_refresh(obj: Execution) -> None:
+            obj.id = 1
+
+        session.add = MagicMock(side_effect=capture_add)
+        session.commit = AsyncMock()
+        session.refresh = AsyncMock(side_effect=fake_refresh)
+
+        await insert_queued_execution(session, range_start=2, range_end=1000)
+
+        assert added[0].status == "queued"
+
+    async def test_primes_is_none(self) -> None:
+        """Queued row has no primes yet (worker fills them in)."""
+        session = AsyncMock()
+        added: list[Execution] = []
+
+        def capture_add(obj: Execution) -> None:
+            added.append(obj)
+
+        async def fake_refresh(obj: Execution) -> None:
+            obj.id = 1
+
+        session.add = MagicMock(side_effect=capture_add)
+        session.commit = AsyncMock()
+        session.refresh = AsyncMock(side_effect=fake_refresh)
+
+        await insert_queued_execution(session, range_start=2, range_end=1000)
+
+        assert added[0].primes is None
+        assert added[0].primes_count == 0
+        assert added[0].duration_ms == 0
+
+    async def test_range_stored_correctly(self) -> None:
+        """Verify range_start and range_end are persisted as provided."""
+        session = AsyncMock()
+        added: list[Execution] = []
+
+        def capture_add(obj: Execution) -> None:
+            added.append(obj)
+
+        async def fake_refresh(obj: Execution) -> None:
+            obj.id = 1
+
+        session.add = MagicMock(side_effect=capture_add)
+        session.commit = AsyncMock()
+        session.refresh = AsyncMock(side_effect=fake_refresh)
+
+        await insert_queued_execution(session, range_start=100, range_end=200)
+
+        assert added[0].range_start == 100
+        assert added[0].range_end == 200
+
+    # BVA at execution_id: 0, 1, 2 (boundary of auto-assigned pk)
+    async def test_range_start_bva_at_2(self) -> None:
+        """BVA: range_start=2 (API minimum) passes through."""
+        session = AsyncMock()
+        added: list[Execution] = []
+
+        def capture_add(obj: Execution) -> None:
+            added.append(obj)
+
+        async def fake_refresh(obj: Execution) -> None:
+            obj.id = 1
+
+        session.add = MagicMock(side_effect=capture_add)
+        session.commit = AsyncMock()
+        session.refresh = AsyncMock(side_effect=fake_refresh)
+
+        await insert_queued_execution(session, range_start=2, range_end=10)
+
+        assert added[0].range_start == 2
+
+    async def test_range_start_bva_at_3(self) -> None:
+        """BVA: range_start=3 (B+1 of API minimum) passes through."""
+        session = AsyncMock()
+        added: list[Execution] = []
+
+        def capture_add(obj: Execution) -> None:
+            added.append(obj)
+
+        async def fake_refresh(obj: Execution) -> None:
+            obj.id = 1
+
+        session.add = MagicMock(side_effect=capture_add)
+        session.commit = AsyncMock()
+        session.refresh = AsyncMock(side_effect=fake_refresh)
+
+        await insert_queued_execution(session, range_start=3, range_end=10)
+
+        assert added[0].range_start == 3
+
+    async def test_propagates_commit_error(self) -> None:
+        session = AsyncMock()
+        session.add = MagicMock()
+        session.commit = AsyncMock(side_effect=SQLAlchemyError("commit failed"))
+        session.refresh = AsyncMock()
+
+        with pytest.raises(SQLAlchemyError, match="commit failed"):
+            await insert_queued_execution(session, range_start=2, range_end=100)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# count_active_executions — COUNT WHERE status IN ('queued', 'running')
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestCountActiveExecutions:
+    """Verify count_active_executions returns the scalar count."""
+
+    # BVA at count = 0, 1, 2
+    async def test_returns_zero_when_no_active(self) -> None:
+        """BVA B-1: count = 0 (no active executions)."""
+        session = AsyncMock()
+        result_obj = MagicMock()
+        result_obj.scalar_one.return_value = 0
+        session.execute = AsyncMock(return_value=result_obj)
+
+        count = await count_active_executions(session)
+
+        assert count == 0
+
+    async def test_returns_one_when_one_active(self) -> None:
+        """BVA B: count = 1 (exactly one active execution)."""
+        session = AsyncMock()
+        result_obj = MagicMock()
+        result_obj.scalar_one.return_value = 1
+        session.execute = AsyncMock(return_value=result_obj)
+
+        count = await count_active_executions(session)
+
+        assert count == 1
+
+    async def test_returns_two_when_two_active(self) -> None:
+        """BVA B+1: count = 2 (two active executions)."""
+        session = AsyncMock()
+        result_obj = MagicMock()
+        result_obj.scalar_one.return_value = 2
+        session.execute = AsyncMock(return_value=result_obj)
+
+        count = await count_active_executions(session)
+
+        assert count == 2
+
+    async def test_returns_int_not_any(self) -> None:
+        """Return type is int (no-any-return mypy requirement)."""
+        session = AsyncMock()
+        result_obj = MagicMock()
+        result_obj.scalar_one.return_value = 5
+        session.execute = AsyncMock(return_value=result_obj)
+
+        count = await count_active_executions(session)
+
+        assert isinstance(count, int)
+
+    async def test_returns_zero_on_null_scalar(self) -> None:
+        """If DB returns NULL (no rows), coerce to 0."""
+        session = AsyncMock()
+        result_obj = MagicMock()
+        result_obj.scalar_one.return_value = None
+        session.execute = AsyncMock(return_value=result_obj)
+
+        count = await count_active_executions(session)
+
+        assert count == 0
+
+    async def test_executes_query(self) -> None:
+        """Verify a SELECT query is issued (sanity check)."""
+        session = AsyncMock()
+        result_obj = MagicMock()
+        result_obj.scalar_one.return_value = 0
+        session.execute = AsyncMock(return_value=result_obj)
+
+        await count_active_executions(session)
+
+        session.execute.assert_awaited_once()
+
+    async def test_propagates_db_error(self) -> None:
+        """DB failure must propagate (caller maps to backpressure-unavailable)."""
+        session = AsyncMock()
+        session.execute = AsyncMock(side_effect=SQLAlchemyError("db down"))
+
+        with pytest.raises(SQLAlchemyError, match="db down"):
+            await count_active_executions(session)
