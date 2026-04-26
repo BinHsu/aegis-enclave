@@ -99,8 +99,25 @@ BASE="https://${ENDPOINT_HOST}"
 
 # Connectivity probe (fail fast if VPN down)
 HEALTH_CODE=$("${CURL[@]}" -o /dev/null -w '%{http_code}' "${BASE}/health" 2>/dev/null || echo "000")
-[[ "$HEALTH_CODE" == "200" ]] || fail "health probe returned $HEALTH_CODE — VPN may be disconnected
-(timeout / 000 = network unreachable). Connect VPN and retry."
+if [[ "$HEALTH_CODE" != "200" ]]; then
+    fail "health probe returned $HEALTH_CODE — VPN likely disconnected. Diagnose:
+
+    1. Resolve the ALB hostname through your DNS:
+         dig +short $ALB_DNS
+       Expected: a 10.x.x.x address (private, VPN-routed).
+       If empty / public IP / timeout → DNS not going through VPN tunnel.
+
+    2. Check that the VPN tunnel interface exists:
+         ifconfig | grep utun
+       Expected: at least one utun interface with an inet 10.20.x.x address
+       (10.20.0.0/16 is the Client VPN client CIDR per terraform/main.tf).
+       If no match → VPN client not connected.
+
+    3. Connect or reconnect via Tunnelblick / openvpn — see README §
+       'Cloud deployment acceptance' step 3 (Download VPN config + connect).
+
+    4. Re-run: make cloud-smoke"
+fi
 ok "GET /health → 200"
 
 # Helper: POST → poll → ms-precision wall time → return "<duration_ms> <exec_id>"
