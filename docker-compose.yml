@@ -1,16 +1,23 @@
-# Phase 1.2 demo stack — VPN-gated cloud microservice template.
+# Phase 2.3/2.4 demo stack — VPN-gated cloud microservice template with
+# async worker + distributed cache.
 #
 # Services:
-#   app           — FastAPI prime service (no host port published)
 #   db            — PostgreSQL 16, init.sql mounted (no host port published)
+#   valkey        — Valkey 7 (Redis-compatible cache; local parity for ElastiCache Serverless)
+#   elasticmq     — ElasticMQ (SQS-compatible local queue; parity for AWS SQS)
+#   app           — FastAPI prime service (no host port published)
+#   worker        — SQS consumer loop (reuses app image, different CMD)
+#   bootstrap     — One-shot cache pre-warm task (profiles: bootstrap — manual trigger only)
 #   wg-gateway    — WireGuard server (UDP/51820 published to host)
-#   test-client   — Verification harness with curl + wireguard-tools
+#   test-client   — Verification harness with curl + wireguard-tools + Python (sympy oracle)
 #
 # Verification (per ADR-0013): smoke test runs from test-client container.
 # Negative test (per ADR-0014): host-side curl to localhost:8000 must FAIL
 # because port 8000 is NOT published.
 
 services:
+  # ─── Data tier ───────────────────────────────────────────────────────────────
+
   db:
     image: postgres:16-alpine
     container_name: enclave-db
@@ -32,6 +39,41 @@ services:
     # Intentionally NOT publishing port 5432 — DB is reachable only inside the
     # Docker network, satisfying the "no direct access" property of the brief.
 
+  valkey:
+    image: valkey/valkey:7-alpine
+    container_name: enclave-valkey
+    restart: unless-stopped
+    # No host port published — reachable only within the Docker network.
+    # Cloud parity: ElastiCache Serverless Valkey (engine=valkey) per strategy.md § D.
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - enclave-net
+
+  elasticmq:
+    # SQS-compatible local queue. Pinned to 1.6.x per strategy.md § D.
+    # Creates the queue on first boot via the embedded config below.
+    image: softwaremill/elasticmq-native:1.6.2
+    container_name: enclave-elasticmq
+    restart: unless-stopped
+    volumes:
+      - ./elasticmq.conf:/opt/elasticmq.conf:ro
+    # Port 9324 is the SQS-compatible HTTP API used by the boto3 client.
+    # Not published to host — accessed only from within the Docker network.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9324/?Action=ListQueues || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - enclave-net
+
+  # ─── Application tier ─────────────────────────────────────────────────────
+
   app:
     build:
       context: .
@@ -41,6 +83,10 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      valkey:
+        condition: service_healthy
+      elasticmq:
+        condition: service_healthy
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-primes_app}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_local_dev_only}
@@ -48,11 +94,102 @@ services:
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # SQS / Valkey endpoints — overridden to local containers in dev.
+      AWS_SQS_ENDPOINT_URL: http://elasticmq:9324
+      AWS_DEFAULT_REGION: eu-central-1
+      # Dummy credentials required by boto3 even when talking to ElasticMQ.
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      VALKEY_ENDPOINT: valkey:6379
+      VALKEY_TLS: "false"
+      # Backpressure: 5 × worker_count = 5 × 1 = 5 (strategy.md § D)
+      BACKPRESSURE_FACTOR: "5"
+      WORKER_COUNT: "1"
     networks:
       - enclave-net
     # Intentionally NOT publishing port 8000 — the API is reachable only
     # through the VPN gateway (or, for verification, from the test-client
     # container which is on the internal network).
+
+  worker:
+    # Reuses the app image with a different entrypoint — no separate Dockerfile.
+    # The SQS consumer loop polls ElasticMQ and processes prime-computation jobs.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: enclave-worker
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      elasticmq:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-primes_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_local_dev_only}
+      POSTGRES_DB: ${POSTGRES_DB:-primes}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      AWS_SQS_ENDPOINT_URL: http://elasticmq:9324
+      AWS_DEFAULT_REGION: eu-central-1
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      VALKEY_ENDPOINT: valkey:6379
+      VALKEY_TLS: "false"
+      # NullPool avoids event-loop conflicts when asyncio.run() is called
+      # multiple times in the sync worker loop. See db.py for rationale.
+      DATABASE_POOL_CLASS: "null"
+    # Override the Dockerfile CMD to start the worker consumer loop.
+    command: ["python", "-m", "prime_service.worker"]
+    # Override the Dockerfile HEALTHCHECK — the worker process doesn't listen on
+    # HTTP, so the app-image healthcheck (curl /health) is not applicable.
+    # A simple process-alive check via kill -0 is not easily done in compose;
+    # instead we disable the image healthcheck and rely on restart: unless-stopped
+    # to recover a crashed worker. The SQS visibility timeout handles redelivery.
+    healthcheck:
+      disable: true
+    # SIGTERM grace: 60s gives in-flight compute up to the SIGALRM deadline.
+    # SQS visibility timeout (90s) handles redelivery if the worker is killed
+    # before acking — so we can be aggressive here without losing messages.
+    stop_grace_period: 60s
+    networks:
+      - enclave-net
+
+  bootstrap:
+    # One-shot cache pre-warm task. NOT started by default — run manually:
+    #   docker compose run --rm bootstrap
+    # Profiles guard prevents accidental start on `docker compose up`.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: "no"
+    depends_on:
+      valkey:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-primes_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_local_dev_only}
+      POSTGRES_DB: ${POSTGRES_DB:-primes}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      AWS_SQS_ENDPOINT_URL: http://elasticmq:9324
+      AWS_DEFAULT_REGION: eu-central-1
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      VALKEY_ENDPOINT: valkey:6379
+      VALKEY_TLS: "false"
+      DATABASE_POOL_CLASS: "null"
+    command: ["python", "-m", "prime_service.bootstrap"]
+    profiles:
+      - bootstrap
+    networks:
+      - enclave-net
+
+  # ─── VPN + verification tier ──────────────────────────────────────────────
 
   wg-gateway:
     image: linuxserver/wireguard:latest
@@ -100,10 +237,12 @@ services:
       - enclave-net
     # Stays running so `docker compose run --rm test-client ./smoke.sh` can
     # exec inside; on first start it installs verification tools.
+    # Python3 + sympy needed for prime oracle in smoke step 3.
+    # py3-sympy is in the Alpine package repository and avoids PEP 668 issues.
     entrypoint: ["sh", "-c"]
     command:
       - |
-        apk add --no-cache curl jq wireguard-tools >/dev/null 2>&1 || true
+        apk add --no-cache curl jq wireguard-tools python3 py3-sympy >/dev/null 2>&1 || true
         exec sleep infinity
 
 networks:

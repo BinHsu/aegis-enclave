@@ -21,6 +21,10 @@ terraform {
       source  = "hashicorp/tls"
       version = "~> 4.0"
     }
+    null = {
+      source  = "hashicorp/null"
+      version = "~> 3.2"
+    }
   }
 
   # ─── Phase-2 state backend (commented out; see ADR-0025) ──────────────
@@ -473,4 +477,409 @@ resource "aws_ec2_client_vpn_authorization_rule" "vpc_access" {
   target_network_cidr    = var.vpc_cidr
   authorize_all_groups   = true
   description            = "Authorize VPN clients to reach VPC services"
+}
+
+# ─── Phase 2.3 — Async job queue (SQS) ──────────────────────────────────────
+# Queue for prime-computation jobs. Visibility timeout = compute_budget × 1.5
+# so a message re-delivers if the worker crashes without acking.
+# DLQ redrive is a design-only skeleton (max_receive_count = 3 → see dead-letter
+# queue wiring below). DLQ itself is deferred to L5 per strategy.md § D.
+
+resource "aws_sqs_queue" "primes_dlq" {
+  name                      = "aegis-enclave-primes-dlq"
+  message_retention_seconds = 1209600 # 14 days — max; keeps failed messages for analysis
+  receive_wait_time_seconds = 0
+}
+
+resource "aws_sqs_queue" "primes" {
+  name                       = "aegis-enclave-primes"
+  visibility_timeout_seconds = var.sqs_visibility_timeout
+  message_retention_seconds  = 86400 # 1 day
+  receive_wait_time_seconds  = 20    # long-polling — reduces empty receive costs
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.primes_dlq.arn
+    maxReceiveCount     = 3
+  })
+}
+
+# ─── Phase 2.4 — Distributed cache (ElastiCache Serverless Valkey) ──────────
+# Serverless variant: no instance sizing, cost scales with actual usage.
+# Caps are set conservatively for the 3-hour cloud-acceptance window (< $2):
+#   data_storage.maximum = 1 GB    (well above the 100 MB floor)
+#   ecpu_per_second.maximum = 5000 (covers burst traffic at PoC scale)
+# snapshot_retention_limit = 0 → no automatic snapshots (cost + privacy guard).
+#
+# Security group: allow inbound 6379 from the worker and app task security groups.
+
+resource "aws_security_group" "valkey" {
+  name        = "aegis-enclave-valkey-sg"
+  description = "ElastiCache Serverless Valkey - accept inbound 6379 from ECS tasks only"
+  vpc_id      = module.vpc.vpc_id
+
+  # Egress: unrestricted (required for cluster-mode inter-node traffic internal to ElastiCache)
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Unrestricted egress - ElastiCache Serverless requirement"
+  }
+
+  tags = { Name = "aegis-enclave-valkey-sg" }
+}
+
+# Allow the app ECS tasks to reach Valkey.
+resource "aws_security_group_rule" "app_to_valkey" {
+  type                     = "ingress"
+  from_port                = 6379
+  to_port                  = 6379
+  protocol                 = "tcp"
+  description              = "App ECS task to Valkey 6379"
+  security_group_id        = aws_security_group.valkey.id
+  source_security_group_id = module.app_sg.security_group_id
+}
+
+# Allow the worker ECS tasks to reach Valkey.
+resource "aws_security_group_rule" "worker_to_valkey" {
+  type                     = "ingress"
+  from_port                = 6379
+  to_port                  = 6379
+  protocol                 = "tcp"
+  description              = "Worker ECS task to Valkey 6379"
+  security_group_id        = aws_security_group.valkey.id
+  source_security_group_id = aws_security_group.worker.id
+}
+
+# Allow the bootstrap ECS task to reach Valkey.
+resource "aws_security_group_rule" "bootstrap_to_valkey" {
+  type                     = "ingress"
+  from_port                = 6379
+  to_port                  = 6379
+  protocol                 = "tcp"
+  description              = "Bootstrap ECS task to Valkey 6379"
+  security_group_id        = aws_security_group.valkey.id
+  source_security_group_id = aws_security_group.worker.id
+}
+
+resource "aws_elasticache_serverless_cache" "valkey" {
+  engine = "valkey"
+  name   = "aegis-enclave-valkey"
+
+  cache_usage_limits {
+    data_storage {
+      maximum = var.valkey_max_storage_gb
+      unit    = "GB"
+    }
+    ecpu_per_second {
+      maximum = var.valkey_max_ecpu_per_sec
+    }
+  }
+
+  # No snapshots — cost guard + privacy (no residual data after destroy).
+  snapshot_retention_limit = 0
+
+  subnet_ids         = module.vpc.private_subnets
+  security_group_ids = [aws_security_group.valkey.id]
+}
+
+# ─── Phase 2.3 — IAM role for the worker ECS task ───────────────────────────
+# Permissions needed by the worker and bootstrap containers:
+#   - SQS: receive, delete, get-queue-attributes (worker poll + ack + depth)
+#   - Valkey: no IAM — authenticated by network isolation (SG) only
+#   - RDS: connect via IAM auth is not used here (Secrets Manager provides creds)
+#   - Secrets Manager: read the RDS password secret
+#   - ECR + logs: standard Fargate task role attachments
+
+data "aws_iam_policy_document" "worker_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "worker" {
+  name               = "aegis-enclave-worker"
+  assume_role_policy = data.aws_iam_policy_document.worker_assume.json
+}
+
+data "aws_iam_policy_document" "worker_policy" {
+  # SQS: receive + ack + depth-check on the primes queue.
+  statement {
+    sid = "SQSPrimes"
+    actions = [
+      "sqs:ReceiveMessage",
+      "sqs:DeleteMessage",
+      "sqs:GetQueueAttributes",
+      "sqs:GetQueueUrl",
+    ]
+    resources = [
+      aws_sqs_queue.primes.arn,
+      aws_sqs_queue.primes_dlq.arn,
+    ]
+  }
+
+  # Secrets Manager: read the RDS master-user secret (password for DB connection).
+  statement {
+    sid       = "SecretsManagerRDS"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [module.rds.db_instance_master_user_secret_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "worker_inline" {
+  name   = "aegis-enclave-worker-inline"
+  role   = aws_iam_role.worker.id
+  policy = data.aws_iam_policy_document.worker_policy.json
+}
+
+# Standard Fargate managed policies (ECR pull + CloudWatch logs).
+resource "aws_iam_role_policy_attachment" "worker_ecr" {
+  role       = aws_iam_role.worker.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+resource "aws_iam_role_policy_attachment" "worker_logs" {
+  role       = aws_iam_role.worker.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchLogsFullAccess"
+}
+
+# ─── Security group for the worker ECS service ───────────────────────────────
+
+resource "aws_security_group" "worker" {
+  name        = "aegis-enclave-worker-sg"
+  description = "Worker ECS task - egress to SQS VPC endpoint, Valkey, RDS, ECR"
+  vpc_id      = module.vpc.vpc_id
+
+  # No ingress - worker only pulls from SQS, never receives inbound traffic.
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Unrestricted egress - worker reaches SQS endpoint, Valkey, RDS, ECR via VPC endpoints"
+  }
+
+  tags = { Name = "aegis-enclave-worker-sg" }
+}
+
+# ─── ECS task definition: worker ─────────────────────────────────────────────
+
+resource "aws_ecs_task_definition" "worker" {
+  family                   = "aegis-enclave-worker"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = 512  # 0.5 vCPU — compute-bound sieve needs more than app
+  memory                   = 1024 # 1 GB — headroom for sieve memory at range ceiling
+
+  task_role_arn      = aws_iam_role.worker.arn
+  execution_role_arn = aws_iam_role.worker.arn
+
+  container_definitions = jsonencode([{
+    name  = "worker"
+    image = "${module.ecr.repository_url}:latest"
+
+    # Override the Dockerfile CMD to start the worker consumer loop.
+    command = ["python", "-m", "prime_service.worker"]
+
+    # SIGTERM grace: 65s — exceeds the 60s SIGALRM compute budget so an
+    # in-flight sieve has time to finish (or timeout) before ECS SIGKILLs.
+    stopTimeout = 65
+
+    environment = [
+      { name = "POSTGRES_HOST", value = module.rds.db_instance_address },
+      { name = "POSTGRES_PORT", value = "5432" },
+      { name = "POSTGRES_USER", value = "primes_app" },
+      { name = "POSTGRES_DB", value = "primes" },
+      { name = "VALKEY_ENDPOINT", value = "${aws_elasticache_serverless_cache.valkey.endpoint[0].address}:${aws_elasticache_serverless_cache.valkey.endpoint[0].port}" },
+      { name = "VALKEY_TLS", value = "true" },
+      # NullPool avoids event-loop conflicts when asyncio.run() is called
+      # multiple times in the sync worker loop. See db.py for rationale.
+      { name = "DATABASE_POOL_CLASS", value = "null" },
+    ]
+
+    secrets = [
+      { name = "POSTGRES_PASSWORD", valueFrom = module.rds.db_instance_master_user_secret_arn },
+    ]
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = "/ecs/aegis-enclave-worker"
+        "awslogs-region"        = var.region
+        "awslogs-stream-prefix" = "worker"
+      }
+    }
+
+    essential              = true
+    readonlyRootFilesystem = false
+  }])
+}
+
+# CloudWatch log group for the worker.
+resource "aws_cloudwatch_log_group" "worker" {
+  name              = "/ecs/aegis-enclave-worker"
+  retention_in_days = 7
+}
+
+# ─── ECS task definition: cache_bootstrap ────────────────────────────────────
+# One-shot task — triggered by null_resource after Valkey is ready.
+# 256 CPU / 512 MB — bootstrap just runs a sieve + single Redis write.
+
+resource "aws_ecs_task_definition" "cache_bootstrap" {
+  family                   = "aegis-enclave-cache-bootstrap"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = 256
+  memory                   = 512
+
+  task_role_arn      = aws_iam_role.worker.arn
+  execution_role_arn = aws_iam_role.worker.arn
+
+  container_definitions = jsonencode([{
+    name    = "bootstrap"
+    image   = "${module.ecr.repository_url}:latest"
+    command = ["python", "-m", "prime_service.bootstrap"]
+
+    environment = [
+      { name = "POSTGRES_HOST", value = module.rds.db_instance_address },
+      { name = "POSTGRES_PORT", value = "5432" },
+      { name = "POSTGRES_USER", value = "primes_app" },
+      { name = "POSTGRES_DB", value = "primes" },
+      { name = "VALKEY_ENDPOINT", value = "${aws_elasticache_serverless_cache.valkey.endpoint[0].address}:${aws_elasticache_serverless_cache.valkey.endpoint[0].port}" },
+      { name = "VALKEY_TLS", value = "true" },
+      { name = "DATABASE_POOL_CLASS", value = "null" },
+    ]
+
+    secrets = [
+      { name = "POSTGRES_PASSWORD", valueFrom = module.rds.db_instance_master_user_secret_arn },
+    ]
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = "/ecs/aegis-enclave-bootstrap"
+        "awslogs-region"        = var.region
+        "awslogs-stream-prefix" = "bootstrap"
+      }
+    }
+
+    essential              = true
+    readonlyRootFilesystem = false
+  }])
+}
+
+# CloudWatch log group for the bootstrap task.
+resource "aws_cloudwatch_log_group" "bootstrap" {
+  name              = "/ecs/aegis-enclave-bootstrap"
+  retention_in_days = 7
+}
+
+# ─── ECS service: worker ─────────────────────────────────────────────────────
+# Long-running service (not a one-shot task). Autoscales between
+# worker_min_count and worker_max_count based on SQS queue depth.
+
+resource "aws_ecs_service" "worker" {
+  name            = "aegis-enclave-worker"
+  cluster         = module.ecs.cluster_id
+  task_definition = aws_ecs_task_definition.worker.arn
+  desired_count   = var.worker_min_count
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = module.vpc.private_subnets
+    security_groups  = [aws_security_group.worker.id]
+    assign_public_ip = false
+  }
+
+  # Allow ECS to update the service during rolling deploys without
+  # destroying the old task before the new one is healthy.
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+
+  # Lifecycle: ignore desired_count changes driven by autoscaling so
+  # Terraform doesn't reset the count to var.worker_min_count on every plan.
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.worker_ecr,
+    aws_iam_role_policy_attachment.worker_logs,
+  ]
+}
+
+# ─── ECS autoscaling: worker on SQS queue depth ──────────────────────────────
+# Target tracking on ApproximateNumberOfMessagesVisible — scale out when queue
+# depth exceeds target_value × worker_count. Target value 5 per Q7 (strategy.md § C).
+
+resource "aws_appautoscaling_target" "worker" {
+  max_capacity       = var.worker_max_count
+  min_capacity       = var.worker_min_count
+  resource_id        = "service/${module.ecs.cluster_name}/${aws_ecs_service.worker.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+
+  depends_on = [aws_ecs_service.worker]
+}
+
+resource "aws_appautoscaling_policy" "target_tracking" {
+  name               = "aegis-enclave-worker-sqs-depth"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.worker.resource_id
+  scalable_dimension = aws_appautoscaling_target.worker.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.worker.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    customized_metric_specification {
+      metric_name = "ApproximateNumberOfMessagesVisible"
+      namespace   = "AWS/SQS"
+      statistic   = "Sum"
+
+      dimensions {
+        name  = "QueueName"
+        value = aws_sqs_queue.primes.name
+      }
+    }
+
+    target_value       = var.backpressure_threshold_factor
+    scale_in_cooldown  = 300 # 5 min — conservative scale-in to avoid flapping
+    scale_out_cooldown = 60  # 1 min — aggressive scale-out when queue builds up
+  }
+}
+
+# ─── Bootstrap one-shot (null_resource local-exec) ───────────────────────────
+# Triggers once after Valkey is ready and the cache_bootstrap task definition
+# is registered. The bootstrap task writes primes[1..100000] if absent
+# (idempotent — second run exits 0 immediately).
+#
+# OPERATOR NOTE: `aws ecs run-task` requires the operator to have AWS CLI
+# configured with permissions to run ECS tasks. This runs in the Phase 2.5
+# cloud-acceptance window where `aws configure` is set. It is a no-op during
+# `terraform plan` (local-exec only runs at apply time).
+
+resource "null_resource" "run_cache_bootstrap" {
+  triggers = {
+    # Re-run if the task definition revision changes (e.g. new image).
+    task_definition_arn = aws_ecs_task_definition.cache_bootstrap.arn
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      aws ecs run-task \
+        --cluster "${module.ecs.cluster_name}" \
+        --task-definition "${aws_ecs_task_definition.cache_bootstrap.arn}" \
+        --launch-type FARGATE \
+        --network-configuration "awsvpcConfiguration={subnets=[${join(",", module.vpc.private_subnets)}],securityGroups=[${aws_security_group.worker.id}],assignPublicIp=DISABLED}" \
+        --region "${var.region}"
+    EOT
+  }
+
+  depends_on = [
+    aws_elasticache_serverless_cache.valkey,
+    aws_ecs_task_definition.cache_bootstrap,
+  ]
 }

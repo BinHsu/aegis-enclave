@@ -50,3 +50,47 @@ variable "alb_internal_hostname" {
   type        = string
   default     = "api.enclave.internal"
 }
+
+# ─── Phase 2.3/2.4 — Async worker + distributed cache ────────────────────────
+
+variable "worker_min_count" {
+  description = "Minimum number of worker ECS tasks (SQS consumer)."
+  type        = number
+  default     = 1
+}
+
+variable "worker_max_count" {
+  description = "Maximum number of worker ECS tasks (autoscaling ceiling)."
+  type        = number
+  default     = 3
+}
+
+variable "compute_budget_seconds" {
+  description = "Worker SIGALRM compute budget in seconds. Must match prime_service.primes._SIGALRM_SECONDS."
+  type        = number
+  default     = 60
+}
+
+variable "backpressure_threshold_factor" {
+  description = "Backpressure = factor × worker_count. Matches BACKPRESSURE_FACTOR env var default."
+  type        = number
+  default     = 5
+}
+
+variable "sqs_visibility_timeout" {
+  description = "SQS message visibility timeout in seconds (1.5 × compute_budget_seconds = 90)."
+  type        = number
+  default     = 90
+}
+
+variable "valkey_max_storage_gb" {
+  description = "ElastiCache Serverless Valkey maximum data storage in GB. Caps cost within the 3h acceptance window."
+  type        = number
+  default     = 1
+}
+
+variable "valkey_max_ecpu_per_sec" {
+  description = "ElastiCache Serverless Valkey maximum eCPU per second. Caps cost within the 3h acceptance window."
+  type        = number
+  default     = 5000
+}

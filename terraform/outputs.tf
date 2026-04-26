@@ -64,3 +64,26 @@ output "s3_gateway_endpoint_id" {
   description = "S3 gateway VPC endpoint identifier"
   value       = aws_vpc_endpoint.s3.id
 }
+
+# ─── Phase 2.3/2.4 — Async worker + distributed cache ────────────────────────
+
+output "valkey_endpoint" {
+  description = "ElastiCache Serverless Valkey endpoint (host:port) for the worker and app containers."
+  value       = "${aws_elasticache_serverless_cache.valkey.endpoint[0].address}:${aws_elasticache_serverless_cache.valkey.endpoint[0].port}"
+  sensitive   = true
+}
+
+output "sqs_primes_url" {
+  description = "SQS queue URL for the aegis-enclave-primes job queue."
+  value       = aws_sqs_queue.primes.url
+}
+
+output "worker_service_arn" {
+  description = "ARN of the ECS service running the SQS consumer worker."
+  value       = aws_ecs_service.worker.id
+}
+
+output "bootstrap_task_arn" {
+  description = "ARN of the ECS task definition for the cache bootstrap one-shot task."
+  value       = aws_ecs_task_definition.cache_bootstrap.arn
+}
