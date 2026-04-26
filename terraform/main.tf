@@ -320,6 +320,13 @@ module "alb" {
       port        = 8000
       target_type = "ip"
 
+      # ECS service registers targets dynamically (load_balancer block in
+      # module.ecs.services["app"]). Without this, alb >=9.x tries to create
+      # a static target group attachment per target_groups entry and demands
+      # an each.value.target_id field — which doesn't apply when ECS owns
+      # the target lifecycle.
+      create_attachment = false
+
       # ADR-0022 — Drain semantics. Default 300s drains existing connections
       # for 5 minutes after deregister, which is wildly long for a case-study
       # PoC (and means rolling deploys block on the slowest in-flight request
@@ -340,8 +347,15 @@ module "alb" {
 
 # ─── Compute (ADR-0015: ECS Fargate over EKS — no K8s control-plane fee) ───
 module "ecs" {
-  source  = "terraform-aws-modules/ecs/aws"
-  version = "~> 5.11"
+  source = "terraform-aws-modules/ecs/aws"
+  # Pinned to 5.11.x explicitly: 5.12.x introduced a regression in
+  # modules/service/main.tf where 'for_each = {... : k => v if try(v.create, true)}'
+  # over container_definitions returns unknown when any inner value (image,
+  # secrets) references another module's output. for_each then errors with
+  # 'var.container_definitions will be known only after apply'.
+  # See https://github.com/terraform-aws-modules/terraform-aws-ecs/issues
+  # 5.11.x predates that change and accepts our standard module-output references.
+  version = "~> 5.11.0"
 
   cluster_name = "aegis-enclave"
 
