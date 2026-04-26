@@ -179,6 +179,14 @@ else
     info "no $CERT_TFVARS — nothing to clean (skipping)"
 fi
 
+# Also remove image-tag.auto.tfvars (written by cloud-up.sh; tracks the git-sha
+# tag deployed). Out-of-tfstate, gitignored, no AWS dependency.
+IMAGE_TAG_TFVARS="$TF_DIR/image-tag.auto.tfvars"
+if [[ -f "$IMAGE_TAG_TFVARS" ]]; then
+    rm -f "$IMAGE_TAG_TFVARS"
+    ok "removed $IMAGE_TAG_TFVARS"
+fi
+
 # ─── Step 5: Optionally wipe local PKI ─────────────────────────────────────
 section "5/6 — Local PKI cleanup"
 if [[ -d "$PKI_DIR" ]]; then
