@@ -28,6 +28,26 @@ from prime_service.worker import (
     handle_message,
 )
 
+
+def _close_coro_and_return(value: Any = None) -> Any:
+    """Mock side_effect factory: closes the unawaited coroutine, returns value.
+
+    The worker calls _run_async(_get_exec(...)). When _run_async is patched,
+    the inner coroutine _get_exec(...) is created (since async-def returns a
+    coroutine just by being called) and passed to the mock. A naive mock
+    returning a fixed value never awaits the coroutine — GC later raises
+    RuntimeWarning: coroutine never awaited. This factory closes the coroutine
+    explicitly to suppress the warning while preserving the desired return value.
+    """
+
+    def inner(coro: Any) -> Any:
+        if hasattr(coro, "close"):
+            coro.close()
+        return value
+
+    return inner
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Constants BVA
 # ───────────────────────────────────────────────────────────────────────────
@@ -108,7 +128,7 @@ class TestHandleMessageIdempotency:
         cache = _mock_cache()
         msg = _make_message(execution_id=999)
 
-        with patch("prime_service.worker._run_async", return_value=None):
+        with patch("prime_service.worker._run_async", side_effect=_close_coro_and_return(None)):
             handle_message(msg, queue, cache)
 
         queue.ack.assert_called_once()
@@ -123,6 +143,8 @@ class TestHandleMessageIdempotency:
         call_count = 0
 
         def fake_run_async(coro: Any) -> Any:
+            if hasattr(coro, "close"):
+                coro.close()
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -147,6 +169,8 @@ class TestHandleMessageIdempotency:
         call_idx = 0
 
         def fake_run_async(coro: Any) -> Any:
+            if hasattr(coro, "close"):
+                coro.close()
             nonlocal call_idx
             result = call_results[call_idx] if call_idx < len(call_results) else None
             call_idx += 1
@@ -178,7 +202,7 @@ class TestHandleMessageStaleRunning:
         started_at = datetime.now(UTC) - timedelta(seconds=_RUNNING_STALE_THRESHOLD_S - 1)
         row = _make_execution(status="running", started_at=started_at)
 
-        with patch("prime_service.worker._run_async", return_value=row):
+        with patch("prime_service.worker._run_async", side_effect=_close_coro_and_return(row)):
             handle_message(msg, queue, cache)
 
         queue.ack.assert_not_called()
@@ -201,7 +225,7 @@ class TestHandleMessageStaleRunning:
             def now(tz: Any = None) -> datetime:
                 return frozen_now
 
-        with patch("prime_service.worker._run_async", return_value=row):
+        with patch("prime_service.worker._run_async", side_effect=_close_coro_and_return(row)):
             with patch("prime_service.worker.datetime", _FrozenDatetime):
                 handle_message(msg, queue, cache)
 
@@ -219,6 +243,8 @@ class TestHandleMessageStaleRunning:
         call_idx = 0
 
         def fake_run_async(coro: Any) -> Any:
+            if hasattr(coro, "close"):
+                coro.close()
             nonlocal call_idx
             result = call_results[call_idx] if call_idx < len(call_results) else None
             call_idx += 1
@@ -244,6 +270,8 @@ class TestHandleMessageStaleRunning:
         call_idx = 0
 
         def fake_run_async(coro: Any) -> Any:
+            if hasattr(coro, "close"):
+                coro.close()
             nonlocal call_idx
             result = call_results[call_idx] if call_idx < len(call_results) else None
             call_idx += 1
@@ -276,6 +304,8 @@ class TestHandleMessageCacheHit:
         call_idx = 0
 
         def fake_run_async(coro: Any) -> Any:
+            if hasattr(coro, "close"):
+                coro.close()
             nonlocal call_idx
             result = call_results[call_idx] if call_idx < len(call_results) else None
             call_idx += 1
@@ -300,6 +330,8 @@ class TestHandleMessageCacheHit:
         call_idx = 0
 
         def fake_run_async(coro: Any) -> Any:
+            if hasattr(coro, "close"):
+                coro.close()
             nonlocal call_idx
             result = call_results[call_idx] if call_idx < len(call_results) else None
             call_idx += 1
@@ -336,6 +368,8 @@ class TestHandleMessageComputeErrors:
         call_idx = 0
 
         def fake_run_async(coro: Any) -> Any:
+            if hasattr(coro, "close"):
+                coro.close()
             nonlocal call_idx
             result = call_results[call_idx] if call_idx < len(call_results) else None
             call_idx += 1
@@ -358,6 +392,8 @@ class TestHandleMessageComputeErrors:
         call_idx = 0
 
         def fake_run_async(coro: Any) -> Any:
+            if hasattr(coro, "close"):
+                coro.close()
             nonlocal call_idx
             result = call_results[call_idx] if call_idx < len(call_results) else None
             call_idx += 1
@@ -380,6 +416,8 @@ class TestHandleMessageComputeErrors:
         call_idx = 0
 
         def fake_run_async(coro: Any) -> Any:
+            if hasattr(coro, "close"):
+                coro.close()
             nonlocal call_idx
             result = call_results[call_idx] if call_idx < len(call_results) else None
             call_idx += 1
@@ -403,6 +441,8 @@ class TestHandleMessageComputeErrors:
         call_idx = 0
 
         def fake_run_async(coro: Any) -> Any:
+            if hasattr(coro, "close"):
+                coro.close()
             nonlocal call_idx
             result = call_results[call_idx] if call_idx < len(call_results) else None
             call_idx += 1
@@ -430,7 +470,7 @@ class TestHandleMessageBodyBVA:
         cache = _mock_cache()
         msg = _make_message(execution_id=0)
 
-        with patch("prime_service.worker._run_async", return_value=None):
+        with patch("prime_service.worker._run_async", side_effect=_close_coro_and_return(None)):
             handle_message(msg, queue, cache)
 
         queue.ack.assert_called_once()
@@ -446,6 +486,8 @@ class TestHandleMessageBodyBVA:
         call_idx = 0
 
         def fake_run_async(coro: Any) -> Any:
+            if hasattr(coro, "close"):
+                coro.close()
             nonlocal call_idx
             result = call_results[call_idx] if call_idx < len(call_results) else None
             call_idx += 1
@@ -467,6 +509,8 @@ class TestHandleMessageBodyBVA:
         call_idx = 0
 
         def fake_run_async(coro: Any) -> Any:
+            if hasattr(coro, "close"):
+                coro.close()
             nonlocal call_idx
             result = call_results[call_idx] if call_idx < len(call_results) else None
             call_idx += 1
@@ -489,6 +533,8 @@ class TestHandleMessageBodyBVA:
         call_idx = 0
 
         def fake_run_async(coro: Any) -> Any:
+            if hasattr(coro, "close"):
+                coro.close()
             nonlocal call_idx
             result = call_results[call_idx] if call_idx < len(call_results) else None
             call_idx += 1
@@ -513,6 +559,8 @@ class TestHandleMessageBodyBVA:
         call_idx = 0
 
         def fake_run_async(coro: Any) -> Any:
+            if hasattr(coro, "close"):
+                coro.close()
             nonlocal call_idx
             result = call_results[call_idx] if call_idx < len(call_results) else None
             call_idx += 1
@@ -537,6 +585,8 @@ class TestHandleMessageBodyBVA:
         call_idx = 0
 
         def fake_run_async(coro: Any) -> Any:
+            if hasattr(coro, "close"):
+                coro.close()
             nonlocal call_idx
             result = call_results[call_idx] if call_idx < len(call_results) else None
             call_idx += 1
