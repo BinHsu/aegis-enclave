@@ -1,0 +1,97 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make help)",
+      "Bash(make install)",
+      "Bash(make lint)",
+      "Bash(make typecheck)",
+      "Bash(make check)",
+      "Bash(make test)",
+      "Bash(make test-ci)",
+      "Bash(make test-cov)",
+      "Bash(make pre-push-check)",
+      "Bash(make smoke)",
+      "Bash(make negative)",
+      "Bash(make tf-fmt)",
+      "Bash(make tf-validate)",
+      "Bash(make tf-plan)",
+      "Bash(make up)",
+      "Bash(make down)",
+      "Bash(make logs)",
+      "Bash(terraform fmt -check *)",
+      "Bash(terraform fmt -check -recursive *)",
+      "Bash(terraform validate *)",
+      "Bash(terraform version)",
+      "Bash(terraform -chdir=* fmt -check *)",
+      "Bash(terraform -chdir=* fmt -check -recursive *)",
+      "Bash(terraform -chdir=* validate *)",
+      "Bash(terraform -chdir=* version)",
+      "Bash(terraform -chdir=* output -raw *)",
+      "Bash(terraform -chdir=* output)",
+      "Bash(docker compose config *)",
+      "Bash(docker compose config)",
+      "Bash(docker compose ps *)",
+      "Bash(docker compose ps)",
+      "Bash(docker compose logs *)",
+      "Bash(./.venv-test/bin/ruff check *)",
+      "Bash(./.venv-test/bin/ruff format --check *)",
+      "Bash(./.venv-test/bin/python -m mypy *)",
+      "Bash(./.venv-test/bin/python -m pytest *)",
+      "Bash(./.venv-test/bin/pytest *)",
+      "Bash(./.venv-test/bin/pip list)",
+      "Bash(.venv/bin/ruff check *)",
+      "Bash(.venv/bin/ruff format --check *)",
+      "Bash(.venv/bin/python -m mypy *)",
+      "Bash(.venv/bin/python -m pytest *)",
+      "Bash(.venv/bin/pytest *)",
+      "Bash(.venv/bin/pip list)",
+      "Bash(aws sts get-caller-identity)",
+      "Bash(aws sts get-caller-identity *)",
+      "Bash(aws ecs list-tasks *)",
+      "Bash(aws ecs list-services *)",
+      "Bash(aws ecs describe-tasks *)",
+      "Bash(aws ecs describe-services *)",
+      "Bash(aws ecs describe-clusters *)",
+      "Bash(aws sqs get-queue-attributes *)",
+      "Bash(aws sqs list-queues *)",
+      "Bash(aws elasticache describe-* *)",
+      "Bash(aws cloudwatch get-metric-statistics *)",
+      "Bash(aws cloudwatch describe-* *)",
+      "Bash(aws logs describe-log-groups *)",
+      "Bash(aws logs filter-log-events *)",
+      "Agent(aegis-stage-1-code)",
+      "Agent(aegis-stage-2-infra)",
+      "Agent(aegis-stage-3-docs)",
+      "Agent(Explore)",
+      "Agent(general-purpose)",
+      "Agent(claude-code-guide)",
+      "Agent(Plan)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [[ \"$CLAUDE_TOOL_INPUT\" == *'git push'* ]]; then cd \"$CLAUDE_PROJECT_DIR\" && make pre-push-check 2>&1 | tail -20; fi",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [[ \"$CLAUDE_FILE_PATH\" == *'/src/'*.py ]]; then cd \"$CLAUDE_PROJECT_DIR\" && make lint 2>&1 | tail -10; fi",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
