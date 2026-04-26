@@ -9,17 +9,20 @@
     what was built + what's verifiable + the actual cycle-cost record. This
     template is the source for that PDF.
 
-  HOW TO USE (Wed-day workflow)
-    1. Copy this file to a non-gitignored working name:
-         cp docs/case_study_report_template.md /tmp/<recipient>_report.md
+  HOW TO USE (per-cycle workflow)
+    1. Copy this template to a recipient-named working file in REPO ROOT
+       (matched by .gitignore's `report_*.md` pattern — never committed):
+         cp docs/case_study_report_template.md report_<recipient>.md
+       e.g. `report_Patrick.md`. Working in repo root keeps pandoc paths
+       simple and survives a reboot (unlike /tmp).
     2. Fill in every {{PLACEHOLDER}} block with cycle-specific values
        (recipient name, account ID, evidence dates, actual cost, etc.)
     3. Render to PDF:
          brew install pandoc                          # one-off
          brew install --cask basictex                 # one-off (LaTeX engine)
          eval "$(/usr/libexec/path_helper)"           # ensure xelatex on PATH
-         pandoc /tmp/<recipient>_report.md \
-                -o /tmp/<recipient>_report.pdf \
+         pandoc report_<recipient>.md \
+                -o report_<recipient>.pdf \
                 --pdf-engine=xelatex \
                 --toc \
                 -V geometry:margin=1in \
@@ -29,8 +32,13 @@
     4. Attach the .pdf (NOT the .md) to the cycle-close email.
 
   RECIPIENT-FRAMING RULES (CLAUDE.md § 6)
-    - The .md file (with placeholder values filled in) is gitignored — do
-      NOT commit. The recipient's name + contact details land in this file.
+    - The recipient-named .md is matched by .gitignore's `report_*.md`
+      and never committed; the rendered .pdf is matched by .gitignore's
+      repo-wide `*.pdf` rule (originally there for source case-study
+      briefs; conveniently also covers per-cycle report PDFs).
+    - Both files contain the recipient's name + contact details and per-
+      cycle evidence — workspace artifacts only, never enter version
+      control.
     - The committed template (THIS file) uses generic placeholder language
       and contains zero buyer-specific framing.
     - The rendered PDF is the deliverable; the .md is workspace artifact.
