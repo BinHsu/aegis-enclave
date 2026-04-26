@@ -18,12 +18,14 @@ Bootstrap range:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 
 import structlog
 
 from prime_service.cache import _BOOTSTRAP_END, _BOOTSTRAP_START, PrimeCache
+from prime_service.db import Base, engine
 from prime_service.primes import _build_prime_table
 
 structlog.configure(
@@ -39,17 +41,43 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = structlog.get_logger()
 
 
+async def _ensure_schema() -> None:
+    """Idempotently create the executions table from SQLAlchemy models.
+
+    AWS RDS does not run db/init.sql automatically (no postgres
+    docker-entrypoint hook). Without this, the app's first INSERT into
+    executions hits UndefinedTableError. SQLAlchemy create_all uses
+    CREATE TABLE IF NOT EXISTS semantics, so re-runs are no-ops.
+
+    Trade-off: the schema is generated from the SQLAlchemy model definitions,
+    not from db/init.sql. The init.sql remains canonical for local
+    docker-compose (where Postgres entrypoint runs it). Schema drift between
+    the two is an accepted Phase 2.5 trade-off; V2 cycle should add a
+    proper migration tool (Alembic) and use init.sql as single source of truth.
+    """
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
 def run_bootstrap(cache: PrimeCache | None = None) -> int:
     """Pre-warm the cache with primes in [_BOOTSTRAP_START, _BOOTSTRAP_END].
 
+    Also ensures the RDS schema exists (idempotent CREATE TABLE IF NOT EXISTS
+    via SQLAlchemy). Schema migration runs before cache seeding so a fresh
+    RDS instance gets bootstrapped end-to-end by this single one-shot task.
+
     Returns:
-        0 on success (written or already present).
-        1 on unexpected error.
+        0 on success (written or already present, schema ensured).
+        1 on unexpected error (cache or schema).
     """
     start = _BOOTSTRAP_START
     end = _BOOTSTRAP_END
 
     try:
+        log.info("schema_ensure_start")
+        asyncio.run(_ensure_schema())
+        log.info("schema_ensured")
+
         if cache is None:
             cache = PrimeCache()
         # Check first (avoids compute if already seeded).
