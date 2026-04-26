@@ -30,12 +30,18 @@ help: ## Show this help (default)
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: install
-install: ## Install dev dependencies (uv preferred; falls back to pip + .venv)
+install: ## Install dev dependencies (uv preferred → uv.lock with hashes; pip fallback w/o lock)
 	@if command -v uv >/dev/null 2>&1; then \
-		echo "==> uv found, running 'uv sync --dev'"; \
-		uv sync --dev; \
+		if [ -f uv.lock ]; then \
+			echo "==> uv + uv.lock found, running 'uv sync --locked --extra dev' (reproducible install w/ hashes)"; \
+			uv sync --locked --extra dev; \
+		else \
+			echo "==> uv found but no uv.lock — running 'uv sync --extra dev' (will resolve fresh and write lock)"; \
+			uv sync --extra dev; \
+		fi; \
 	else \
 		echo "==> uv not found, falling back to pip + .venv"; \
+		echo "    (note: pip path skips uv.lock supply-chain pinning — install uv via 'brew install uv' for hash-verified deps)"; \
 		test -d .venv || python3 -m venv .venv; \
 		.venv/bin/pip install -e '.[dev]'; \
 	fi
