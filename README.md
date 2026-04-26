@@ -170,9 +170,10 @@ Before running this repo:
 
 For Phase 2.5 (cloud deploy / acceptance gate):
 
-- AWS CLI configured with credentials: `aws configure`
+- AWS CLI configured with SSO (recommended) or long-term credentials — see [`docs/iam-permissions.md`](docs/iam-permissions.md) for IAM perms required
 - Terraform 1.6+ (`brew install terraform` on macOS)
-- AWS Client VPN client (Tunnelblick on macOS for `.ovpn` config)
+- AWS Client VPN client (Tunnelblick on macOS for `.ovpn` config: `brew install --cask tunnelblick`)
+- System tools (one-time): `brew install easy-rsa pip-audit` — easy-rsa for VPN PKI provisioning by `scripts/bootstrap-vpn-certs.sh`; pip-audit for `make audit` supply-chain scanning
 
 For full local development (with linting + tests):
 
