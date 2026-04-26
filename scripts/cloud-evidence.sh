@@ -69,8 +69,10 @@ command -v base64 >/dev/null 2>&1    || fail "base64 not found"
 
 CALLER_JSON=$(aws sts get-caller-identity 2>&1) \
     || fail "AWS auth failed (check AWS_PROFILE / aws sso login)"
-ACCOUNT_ID=$(echo "$CALLER_JSON" | grep -oE '"Account":[^,}]*' | sed -E 's/.*"([0-9]+)".*/\1/')
-ARN=$(echo "$CALLER_JSON" | grep -oE '"Arn":"[^"]*"' | sed -E 's/"Arn":"(.+)"/\1/')
+# Use jq for robust JSON parsing (we already require jq above) instead of grep+sed
+# regexes that break on whitespace variants in the JSON output.
+ACCOUNT_ID=$(echo "$CALLER_JSON" | jq -r '.Account // "?"' 2>/dev/null || echo "?")
+ARN=$(echo "$CALLER_JSON" | jq -r '.Arn // "?"' 2>/dev/null || echo "?")
 
 REGION=$(grep -E '^region[[:space:]]*=' "$TF_DIR/terraform.tfvars" 2>/dev/null \
          | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
@@ -181,7 +183,7 @@ section "2/4 — CloudWatch log excerpts (last hour)"
 START_MS=$(( ($(date +%s) - 3600) * 1000 ))
 
 # Worker logs
-WORKER_LG="/aws/ecs/aegis-enclave-worker"
+WORKER_LG="/ecs/aegis-enclave-worker"
 if aws logs describe-log-groups --region "$REGION" --log-group-name-prefix "$WORKER_LG" \
      --query 'logGroups[0].logGroupName' --output text 2>/dev/null \
      | grep -q "$WORKER_LG"; then
@@ -198,7 +200,7 @@ else
 fi
 
 # Bootstrap logs
-BOOT_LG="/aws/ecs/aegis-enclave-cache-bootstrap"
+BOOT_LG="/ecs/aegis-enclave-bootstrap"
 if aws logs describe-log-groups --region "$REGION" --log-group-name-prefix "$BOOT_LG" \
      --query 'logGroups[0].logGroupName' --output text 2>/dev/null \
      | grep -q "$BOOT_LG"; then
