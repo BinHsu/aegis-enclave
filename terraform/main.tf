@@ -294,6 +294,11 @@ module "alb" {
   internal           = true # not internet-facing — only VPN-reachable
   load_balancer_type = "application"
 
+  # Case-study Phase 2.5 = bounded apply-then-destroy (≤ 3h). Production
+  # deployments should override to true; the community alb module defaults
+  # to true (safe), but blocks `terraform destroy` for our cycle.
+  enable_deletion_protection = false
+
   # Three-layer timeout defence (ADR-0020): app wait_for is 30s + 10s, ALB
   # sits at 45s so the client sees the application's 504 response rather
   # than a connection reset from ALB.
