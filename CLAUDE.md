@@ -293,7 +293,7 @@ Reuse is the long game. Each ADR is an asset that compounds across cycles.
 
 ## 12. Anti-patterns (don't do these)
 
-- ❌ Silently exceed the 22h budget by "adding one more thing"
+- ❌ Silently exceed the 24h budget by "adding one more thing"
 - ❌ Commit `strategy.md` or any `*_steps.md` file because "git status looks clean now"
 - ❌ Inline buyer-specific framing into committed files because "it sounds nicer"
 - ❌ Replace Mermaid diagrams with images or PDFs

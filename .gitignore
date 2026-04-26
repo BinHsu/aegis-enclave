@@ -16,6 +16,15 @@ case_study/
 cover_note.md
 cover_note_*.md
 
+# Internal evaluation reports (third-party reviewer perspective; per-cycle, contains buyer name)
+report.md
+report_*.md
+
+# Phase 2.5 cloud-acceptance evidence artifacts (per-run; AWS account IDs, ARNs,
+# private IPs, CloudWatch metric snapshots). Selected screenshots/excerpts get
+# pasted into docs/deployment_guide.md by hand; the full dump never commits.
+evidence/
+
 # Leak-guard pattern file (one regex per line of buyer-specific tokens)
 .leakguard
 
