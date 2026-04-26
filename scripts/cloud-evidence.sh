@@ -102,87 +102,119 @@ capture_metric() {
 }
 
 # ─── 1. CloudWatch metric widgets ─────────────────────────────────────────
-section "1/4 — CloudWatch metric widgets"
+section "1/5 — CloudWatch metric widgets"
 
-# Resolve resource identifiers from terraform state
-SQS_URL=$(cd "$TF_DIR" && terraform output -raw sqs_primes_url 2>/dev/null || echo "")
-SQS_NAME=""
-[[ -n "$SQS_URL" ]] && SQS_NAME=$(basename "$SQS_URL")
+# Resolve resource identifiers DIRECTLY from terraform outputs (added in
+# outputs.tf). Each output is the bare identifier CloudWatch expects in the
+# corresponding metric dimension. Reading from outputs (rather than
+# reverse-engineering from ARNs / DNS strings) avoids the parsing bugs that
+# previously made 5/6 widgets empty:
+#   - RDS used hardcoded "aegis-enclave" but actual identifier was "aegis-enclave-pg"
+#   - ElastiCache Serverless uses CacheName, NOT CacheClusterId
+#   - ALB needs "app/<name>/<id>" suffix, not the DNS-stripped name
+SQS_NAME=$(cd "$TF_DIR" && terraform output -raw sqs_primes_name 2>/dev/null || echo "")
+WORKER_SVC=$(cd "$TF_DIR" && terraform output -raw worker_service_name 2>/dev/null || echo "")
+WORKER_CLUSTER=$(cd "$TF_DIR" && terraform output -raw ecs_cluster_name 2>/dev/null || echo "")
+VALKEY_NAME=$(cd "$TF_DIR" && terraform output -raw valkey_cache_name 2>/dev/null || echo "")
+ALB_ARN_SUFFIX=$(cd "$TF_DIR" && terraform output -raw alb_arn_suffix 2>/dev/null || echo "")
+TG_ARN_SUFFIX=$(cd "$TF_DIR" && terraform output -raw alb_target_group_arn_suffix 2>/dev/null || echo "")
+RDS_ID=$(cd "$TF_DIR" && terraform output -raw rds_instance_identifier 2>/dev/null || echo "")
 
-WORKER_SVC_ARN=$(cd "$TF_DIR" && terraform output -raw worker_service_arn 2>/dev/null || echo "")
-WORKER_SVC=""
-WORKER_CLUSTER=""
-if [[ -n "$WORKER_SVC_ARN" ]]; then
-    WORKER_SVC=$(basename "$WORKER_SVC_ARN")
-    WORKER_CLUSTER=$(echo "$WORKER_SVC_ARN" | sed -E 's|.*cluster/([^/]+)/.*|\1|')
-fi
+info "Resolved dimensions:"
+info "  SQS QueueName:                 ${SQS_NAME:-MISSING}"
+info "  ECS ClusterName:               ${WORKER_CLUSTER:-MISSING}"
+info "  ECS ServiceName (worker):      ${WORKER_SVC:-MISSING}"
+info "  ElastiCache CacheName:         ${VALKEY_NAME:-MISSING}"
+info "  ALB LoadBalancer arn_suffix:   ${ALB_ARN_SUFFIX:-MISSING}"
+info "  ALB TargetGroup arn_suffix:    ${TG_ARN_SUFFIX:-MISSING}"
+info "  RDS DBInstanceIdentifier:      ${RDS_ID:-MISSING}"
 
-VALKEY_EP=$(cd "$TF_DIR" && terraform output -raw valkey_endpoint 2>/dev/null || echo "")
-VALKEY_ID=""
-[[ -n "$VALKEY_EP" ]] && VALKEY_ID=$(echo "$VALKEY_EP" | sed -E 's/^([^.]+)\..*/\1/')
+# Pre-flight discovery: list metrics that ACTUALLY exist for each namespace.
+# Helps debug empty widgets — if list-metrics returns nothing for a namespace,
+# the resource hasn't emitted metrics yet (insufficient time / no traffic),
+# distinct from a wrong-dimension bug.
+section "2/5 — Discovery dry-run (list-metrics per namespace)"
+for ns in AWS/SQS AWS/ECS AWS/ElastiCache AWS/ApplicationELB AWS/RDS; do
+    count=$(aws cloudwatch list-metrics --region "$REGION" --namespace "$ns" \
+              --query 'Metrics | length(@)' --output text 2>/dev/null || echo "?")
+    if [[ "$count" == "0" ]] || [[ "$count" == "?" ]]; then
+        warn "$ns: $count metrics published yet (resource may need warm-up traffic)"
+    else
+        ok "$ns: $count metrics published"
+    fi
+done
 
 # 01: SQS visible messages
+section "3/5 — Capture metric widgets"
 if [[ -n "$SQS_NAME" ]]; then
     capture_metric "01-sqs-visible.png" '{
       "metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","'"$SQS_NAME"'",{"label":"visible"}]],
       "period":60,"stat":"Average","width":1024,"height":400,
-      "title":"SQS — ApproximateNumberOfMessagesVisible","yAxis":{"left":{"min":0}}}'
+      "title":"SQS '"$SQS_NAME"' — ApproximateNumberOfMessagesVisible","yAxis":{"left":{"min":0}}}'
 else
-    warn "skip 01: SQS not in state"
+    warn "skip 01: sqs_primes_name output missing"
 fi
 
-# 02: ECS DesiredCount
+# 02: ECS Worker CPU + Memory utilization
 if [[ -n "$WORKER_SVC" && -n "$WORKER_CLUSTER" ]]; then
-    capture_metric "02-ecs-desired-count.png" '{
+    capture_metric "02-ecs-worker-utilization.png" '{
       "metrics":[
         ["AWS/ECS","CPUUtilization","ServiceName","'"$WORKER_SVC"'","ClusterName","'"$WORKER_CLUSTER"'",{"label":"CPU%"}],
         [".","MemoryUtilization",".","'"$WORKER_SVC"'",".","'"$WORKER_CLUSTER"'",{"label":"Mem%"}]
       ],
       "period":60,"stat":"Average","width":1024,"height":400,
-      "title":"ECS Worker Service — CPU + Memory Utilization"}'
+      "title":"ECS Worker '"$WORKER_SVC"' — CPU + Memory Utilization"}'
 else
-    warn "skip 02: ECS service not in state"
+    warn "skip 02: ecs_cluster_name / worker_service_name output missing"
 fi
 
-# 03: ElastiCache BytesUsedForCache
-if [[ -n "$VALKEY_ID" ]]; then
+# 03: ElastiCache Serverless BytesUsedForCache (uses CacheName, NOT CacheClusterId)
+if [[ -n "$VALKEY_NAME" ]]; then
     capture_metric "03-elasticache-bytes.png" '{
-      "metrics":[["AWS/ElastiCache","BytesUsedForCache","CacheClusterId","'"$VALKEY_ID"'"]],
+      "metrics":[["AWS/ElastiCache","BytesUsedForCache","CacheName","'"$VALKEY_NAME"'"]],
       "period":60,"stat":"Average","width":1024,"height":400,
-      "title":"ElastiCache Valkey — BytesUsedForCache"}'
+      "title":"ElastiCache Serverless '"$VALKEY_NAME"' — BytesUsedForCache"}'
 
-    # 04: ElastiCache ProcessingUnits
+    # 04: ElastiCache ProcessingUnits (Serverless-specific metric, CacheName dim)
     capture_metric "04-elasticache-ecpu.png" '{
-      "metrics":[["AWS/ElastiCache","ElastiCacheProcessingUnits","CacheClusterId","'"$VALKEY_ID"'"]],
+      "metrics":[["AWS/ElastiCache","ElastiCacheProcessingUnits","CacheName","'"$VALKEY_NAME"'"]],
       "period":60,"stat":"Sum","width":1024,"height":400,
-      "title":"ElastiCache Valkey — ElastiCacheProcessingUnits (eCPU)"}'
+      "title":"ElastiCache Serverless '"$VALKEY_NAME"' — ProcessingUnits (eCPU)"}'
 else
-    warn "skip 03 + 04: Valkey not in state"
+    warn "skip 03 + 04: valkey_cache_name output missing"
 fi
 
-# 05: ALB target response time
-ALB_FULL_NAME=$(cd "$TF_DIR" && terraform output -raw alb_dns_name 2>/dev/null \
-              | sed -E 's/^internal-//;s/-[0-9]+\..*//' || echo "")
-if [[ -n "$ALB_FULL_NAME" ]]; then
+# 05: ALB TargetResponseTime — needs both LoadBalancer + TargetGroup arn suffixes
+if [[ -n "$ALB_ARN_SUFFIX" && -n "$TG_ARN_SUFFIX" ]]; then
     capture_metric "05-alb-target-response-time.png" '{
-      "metrics":[["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","app/'"$ALB_FULL_NAME"'/*"]],
+      "metrics":[
+        ["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","'"$ALB_ARN_SUFFIX"'","TargetGroup","'"$TG_ARN_SUFFIX"'",{"label":"target ms"}],
+        [".","RequestCount",".",".",".",".",{"label":"requests","stat":"Sum","yAxis":"right"}]
+      ],
       "period":60,"stat":"Average","width":1024,"height":400,
-      "title":"ALB — TargetResponseTime"}'
+      "title":"ALB — TargetResponseTime + RequestCount"}'
 else
-    warn "skip 05: ALB not parseable"
+    warn "skip 05: alb_arn_suffix / alb_target_group_arn_suffix output missing"
 fi
 
-# 06: RDS CPU (typical resource sanity)
-capture_metric "06-rds-cpu.png" '{
-  "metrics":[["AWS/RDS","CPUUtilization","DBInstanceIdentifier","aegis-enclave"]],
-  "period":60,"stat":"Average","width":1024,"height":400,
-  "title":"RDS — CPUUtilization"}'
+# 06: RDS CPU (uses DBInstanceIdentifier from terraform output, not hardcoded)
+if [[ -n "$RDS_ID" ]]; then
+    capture_metric "06-rds-cpu.png" '{
+      "metrics":[
+        ["AWS/RDS","CPUUtilization","DBInstanceIdentifier","'"$RDS_ID"'",{"label":"CPU%"}],
+        [".","DatabaseConnections",".","'"$RDS_ID"'",{"label":"connections","yAxis":"right"}]
+      ],
+      "period":60,"stat":"Average","width":1024,"height":400,
+      "title":"RDS '"$RDS_ID"' — CPU + Connections"}'
+else
+    warn "skip 06: rds_instance_identifier output missing"
+fi
 
-# ─── 2. CloudWatch log excerpts ───────────────────────────────────────────
-section "2/4 — CloudWatch log excerpts (last hour)"
+# ─── 4. CloudWatch log excerpts + cache-hit ground-truth counters ─────────
+section "4/5 — CloudWatch log excerpts + cache_hit/compute_done ground truth"
 START_MS=$(( ($(date +%s) - 3600) * 1000 ))
 
-# Worker logs
+# Worker logs — full excerpt for forensic browsing
 WORKER_LG="/ecs/aegis-enclave-worker"
 if aws logs describe-log-groups --region "$REGION" --log-group-name-prefix "$WORKER_LG" \
      --query 'logGroups[0].logGroupName' --output text 2>/dev/null \
@@ -195,11 +227,35 @@ if aws logs describe-log-groups --region "$REGION" --log-group-name-prefix "$WOR
         > "$EVIDENCE_DIR/logs/worker.log" 2>/dev/null \
         && ok "worker logs: $(wc -l <"$EVIDENCE_DIR/logs/worker.log" | tr -d ' ') lines" \
         || warn "worker log fetch failed"
+
+    # Cache assertion ground truth — count cache_hit vs compute_done events.
+    # cloud-smoke.sh references this as the authoritative cache verification
+    # (smoke timer is wall-clock + network jitter; worker log is structlog
+    # event stream from inside the worker process). With the new 7-step smoke
+    # we expect ≥1 of each in a 5-min window after smoke runs.
+    SHORT_START_MS=$(( ($(date +%s) - 600) * 1000 ))  # last 10 min
+    HIT_COUNT=$(aws logs filter-log-events --region "$REGION" \
+                  --log-group-name "$WORKER_LG" \
+                  --start-time "$SHORT_START_MS" \
+                  --filter-pattern '"cache_hit"' \
+                  --query 'events | length(@)' --output text 2>/dev/null || echo "?")
+    COMPUTE_COUNT=$(aws logs filter-log-events --region "$REGION" \
+                      --log-group-name "$WORKER_LG" \
+                      --start-time "$SHORT_START_MS" \
+                      --filter-pattern '"compute_done"' \
+                      --query 'events | length(@)' --output text 2>/dev/null || echo "?")
+    ok "worker cache events (last 10min): cache_hit=$HIT_COUNT  compute_done=$COMPUTE_COUNT"
+    echo "cache_hit_count=$HIT_COUNT" > "$EVIDENCE_DIR/logs/worker-cache-counters.txt"
+    echo "compute_done_count=$COMPUTE_COUNT" >> "$EVIDENCE_DIR/logs/worker-cache-counters.txt"
+    if [[ "$HIT_COUNT" == "0" ]]; then
+        warn "0 cache_hit events — either bootstrap didn't seed, find_covering didn't match,"
+        warn "or smoke wasn't run within the last 10 min. Check bootstrap.log + worker.log."
+    fi
 else
     warn "log group $WORKER_LG not found (worker may not have logged yet)"
 fi
 
-# Bootstrap logs
+# Bootstrap logs — proves schema migration + cache pre-warm completed
 BOOT_LG="/ecs/aegis-enclave-bootstrap"
 if aws logs describe-log-groups --region "$REGION" --log-group-name-prefix "$BOOT_LG" \
      --query 'logGroups[0].logGroupName' --output text 2>/dev/null \
@@ -212,17 +268,25 @@ if aws logs describe-log-groups --region "$REGION" --log-group-name-prefix "$BOO
         > "$EVIDENCE_DIR/logs/bootstrap.log" 2>/dev/null \
         && ok "bootstrap logs: $(wc -l <"$EVIDENCE_DIR/logs/bootstrap.log" | tr -d ' ') lines" \
         || warn "bootstrap log fetch failed"
+
+    # Bootstrap idempotency proof — count schema_ensured + bootstrap_done/skip
+    SCHEMA_COUNT=$(grep -c '"schema_ensured"' "$EVIDENCE_DIR/logs/bootstrap.log" 2>/dev/null || echo "0")
+    BOOT_DONE=$(grep -c '"bootstrap_done"' "$EVIDENCE_DIR/logs/bootstrap.log" 2>/dev/null || echo "0")
+    BOOT_SKIP=$(grep -c '"bootstrap_skip"' "$EVIDENCE_DIR/logs/bootstrap.log" 2>/dev/null || echo "0")
+    ok "bootstrap events: schema_ensured=$SCHEMA_COUNT  bootstrap_done=$BOOT_DONE  bootstrap_skip=$BOOT_SKIP"
+    echo "schema_ensured_count=$SCHEMA_COUNT" > "$EVIDENCE_DIR/logs/bootstrap-counters.txt"
+    echo "bootstrap_done_count=$BOOT_DONE" >> "$EVIDENCE_DIR/logs/bootstrap-counters.txt"
+    echo "bootstrap_skip_count=$BOOT_SKIP" >> "$EVIDENCE_DIR/logs/bootstrap-counters.txt"
 else
     warn "log group $BOOT_LG not found"
 fi
 
-# ─── 3. Terraform state outputs ──────────────────────────────────────────
-section "3/4 — Terraform output JSON"
+# Terraform state outputs (folded into this section)
 (cd "$TF_DIR" && terraform output -json) > "$EVIDENCE_DIR/terraform-output.json"
 ok "terraform-output.json: $(wc -c <"$EVIDENCE_DIR/terraform-output.json" | tr -d ' ') bytes"
 
-# ─── 4. Summary stub ─────────────────────────────────────────────────────
-section "4/4 — summary.md stub"
+# ─── 5. Summary stub ─────────────────────────────────────────────────────
+section "5/5 — summary.md stub"
 cat > "$EVIDENCE_DIR/summary.md" <<EOF
 # Phase 2.5 Evidence — $TS
 
@@ -235,11 +299,26 @@ cat > "$EVIDENCE_DIR/summary.md" <<EOF
 - 6 CloudWatch metric widgets (metrics/*.png) — chrome-sparse, API-fetched
 - Worker CloudWatch logs ($([[ -f "$EVIDENCE_DIR/logs/worker.log" ]] && echo "captured" || echo "MISSING — log group not present"))
 - Bootstrap CloudWatch logs ($([[ -f "$EVIDENCE_DIR/logs/bootstrap.log" ]] && echo "captured" || echo "MISSING — log group not present"))
+- Cache assertion counters: logs/worker-cache-counters.txt (cache_hit vs compute_done)
+- Bootstrap idempotency counters: logs/bootstrap-counters.txt
 - terraform-output.json (full state surface)
+
+## Cache assertion (from worker log, last 10 min)
+- cache_hit:    ${HIT_COUNT:-N/A}
+- compute_done: ${COMPUTE_COUNT:-N/A}
+- Interpretation: with the 7-step cloud-smoke, expect ≥1 cache_hit (step 3 +
+  step 5) and ≥2 compute_done (step 1 cache-miss + step 4 partial-overlap).
+  All-zero cache_hit → bootstrap pre-warm did not complete OR find_covering
+  did not match — read bootstrap.log + worker.log for diagnosis.
+
+## Bootstrap idempotency (from bootstrap log)
+- schema_ensured:  ${SCHEMA_COUNT:-N/A}  (each apply triggers schema check)
+- bootstrap_done:  ${BOOT_DONE:-N/A}     (cache seed written)
+- bootstrap_skip:  ${BOOT_SKIP:-N/A}     (cache already seeded — re-run no-op)
 
 ## To add manually (browser-side / reviewer-grade)
 - [ ] Full CloudWatch dashboard screenshot (with chrome / titles / time range visible)
-- [ ] Smoke test 6/6 terminal output (paste into smoke.txt or screenshot)
+- [ ] cloud-smoke 7/7 terminal output (paste into smoke.txt or screenshot)
 - [ ] AWS Client VPN handshake confirmation (Tunnelblick log or 'tunnelblick status')
 - [ ] AWS Console VPC topology screenshot (showing aegis-enclave-* tagged resources)
 
