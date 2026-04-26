@@ -7,7 +7,19 @@
 
 # Auto-detect Python venv: .venv (uv default / pip canonical) preferred,
 # falls back to .venv-test (legacy hand-crafted) if .venv absent.
-PYTHON_BIN := $(shell test -d .venv && echo .venv/bin || (test -d .venv-test && echo .venv-test/bin || echo ""))
+# Lazy assignment (=, not :=) so re-evaluation happens after _ensure-venv bootstraps.
+PYTHON_BIN = $(shell test -d .venv && echo .venv/bin || (test -d .venv-test && echo .venv-test/bin || echo ""))
+
+# Internal helper: any target needing a venv depends on this. Idempotent —
+# no-op if a venv already exists; otherwise calls 'make install' which uv-or-pip
+# bootstraps .venv. Forkers running 'make test' / 'make lint' for the first time
+# get the venv created automatically (rubric P4: zero forker friction).
+.PHONY: _ensure-venv
+_ensure-venv:
+	@test -n "$(PYTHON_BIN)" || { \
+		echo "==> No venv detected (.venv or .venv-test); bootstrapping via 'make install'..."; \
+		$(MAKE) -s install; \
+	}
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -38,18 +50,15 @@ pre-commit-install: ## One-time setup of pre-commit + pre-push hooks
 # ---------------------------------------------------------------------------
 
 .PHONY: lint
-lint: ## Run ruff lint over src + tests
-	@test -n "$(PYTHON_BIN)" || { echo "ERROR: no venv found. Run 'make install' first."; exit 1; }
+lint: _ensure-venv ## Run ruff lint over src + tests
 	$(PYTHON_BIN)/ruff check src tests
 
 .PHONY: format
-format: ## Apply ruff formatter to src + tests
-	@test -n "$(PYTHON_BIN)" || { echo "ERROR: no venv found. Run 'make install' first."; exit 1; }
+format: _ensure-venv ## Apply ruff formatter to src + tests
 	$(PYTHON_BIN)/ruff format src tests
 
 .PHONY: typecheck
-typecheck: ## Run mypy over src
-	@test -n "$(PYTHON_BIN)" || { echo "ERROR: no venv found. Run 'make install' first."; exit 1; }
+typecheck: _ensure-venv ## Run mypy over src
 	$(PYTHON_BIN)/python -m mypy src
 
 .PHONY: check
@@ -60,18 +69,15 @@ check: lint typecheck ## Composite: lint + typecheck
 # ---------------------------------------------------------------------------
 
 .PHONY: test
-test: ## Run pytest
-	@test -n "$(PYTHON_BIN)" || { echo "ERROR: no venv found. Run 'make install' first."; exit 1; }
+test: _ensure-venv ## Run pytest
 	PYTHONPATH=src $(PYTHON_BIN)/pytest tests/ -v
 
 .PHONY: test-ci
-test-ci: ## Headless pytest for pre-push hook + GitHub Actions (PYTHONPATH-aware, no -v noise)
-	@test -n "$(PYTHON_BIN)" || { echo "ERROR: no venv found. Run 'make install' first."; exit 1; }
+test-ci: _ensure-venv ## Headless pytest for pre-push hook + GitHub Actions (PYTHONPATH-aware, no -v noise)
 	@PYTHONPATH=src $(PYTHON_BIN)/pytest tests/ -q --tb=short
 
 .PHONY: test-cov
-test-cov: ## Run pytest with coverage report
-	@test -n "$(PYTHON_BIN)" || { echo "ERROR: no venv found. Run 'make install' first."; exit 1; }
+test-cov: _ensure-venv ## Run pytest with coverage report
 	PYTHONPATH=src $(PYTHON_BIN)/pytest tests/ -v --cov=src --cov-report=term-missing
 
 # ---------------------------------------------------------------------------
