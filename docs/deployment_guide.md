@@ -19,6 +19,8 @@ This guide assumes you have completed the README's Prerequisites and run `make i
 - Cost ceiling awareness: a 3h apply window typically costs **< $2** at us-east-1 / eu-central-1 rates; verify in AWS Pricing Calculator before apply if your account has unusual pricing
 - (Optional, recommended) AWS Cost Explorer enabled to see the actual spend post-destroy
 
+**Apple silicon (M1/M2/M3/M4) note**: `make install` via `uv sync --locked --extra dev` resolves arm64 wheels for the only two C-extension dependencies — `lupa` (Lua bindings for the Valkey range-coalescing script, includes `lua54.cpython-XXX-darwin.so` Mach-O 64-bit bundle arm64) and `redis-py` (pure Python, no native build). No Rosetta 2 emulation, no source compilation. Verified on M4 with Python 3.14.4. The `linux/amd64` build flag in `cloud-up.sh` (`docker build --platform linux/amd64`) is for the Fargate target architecture, not the local dev machine.
+
 Local-stack acceptance (Phase 1.5) only requires the README Prerequisites — no AWS setup needed.
 
 ## Cloud architecture
@@ -297,6 +299,57 @@ The SQS metric (the one that rendered correctly) shows 0 `ApproximateNumberOfMes
   - ACM certificates (imported for Client VPN mTLS): deleted by `cloud-down` cleanup script
   - ECR repository: drained and deleted
 - No orphaned resources detected in eu-central-1
+
+---
+
+## Production hardening checklist
+
+The PoC stops at the boundary of "case-study deliverable scope". Anyone forking this composition for a production deployment should add these before going live. Each item is intentionally deferred (with an ADR explaining why) — none is missing by oversight.
+
+### 1. Secrets Manager rotation (ADR-0037)
+
+The RDS master password is provisioned via `manage_master_user_password = true` and held in Secrets Manager but **does not auto-rotate**. Compliance frameworks (SOC 2, ISO 27001, PCI-DSS) typically require 30–90 day rotation for database master credentials.
+
+**Interim manual procedure**:
+
+```bash
+SECRET_ARN=$(cd terraform && terraform output -raw rds_master_user_secret_arn)
+aws secretsmanager rotate-secret --secret-id "$SECRET_ARN"
+# Wait for rotation to complete (~30s — Secrets Manager calls RDS ModifyDBInstance):
+aws secretsmanager describe-secret --secret-id "$SECRET_ARN" \
+    --query 'RotationEnabled,LastRotatedDate'
+# Roll the ECS tasks so they pick up the new password from the secret:
+aws ecs update-service --cluster aegis-enclave \
+    --service aegis-enclave-app --force-new-deployment
+aws ecs update-service --cluster aegis-enclave \
+    --service aegis-enclave-worker --force-new-deployment
+```
+
+**V2 production path**: implement a Secrets Manager rotation Lambda (Python, AWS-provided `secrets_manager_rotation` library) running in the same VPC + private subnets as RDS. Adds ~150–250 lines of Terraform (Lambda function + IAM execution role + KMS grant + rotation schedule + CloudWatch alarm + SNS topic). Or: migrate to **IAM database authentication** (`iam_database_authentication = true`), which removes the master-password rotation requirement entirely by replacing static passwords with short-lived IAM tokens. See ADR-0037 trade-off analysis.
+
+### 2. ALB certificate path (ADR-0027)
+
+The internal ALB runs HTTPS via a self-signed certificate imported into ACM. This is correct for an enclave reachable only via Client VPN (the operator already trusts the VPN endpoint and its certificates), but it does not establish chain-of-trust outside the enclave. **Production replacement**: AWS Certificate Manager Private CA (~$400/month for the CA itself, $0.058 per cert issued) — declared in ADR-0027's Future section as the upgrade path when scale justifies the cost.
+
+### 3. Bootstrap driver — replace `null_resource` (ADR-0035 reconsidered)
+
+The cache + schema bootstrap is currently triggered by a Terraform `null_resource` running `aws ecs run-task` via `local-exec`. This works for the bounded acceptance window but is fragile (no retry semantics, sequencing only via `depends_on`, dependent on the operator's local AWS CLI). **V2**: replace with Step Functions or a CodePipeline migration stage. Per ADR-0035 reconsidered block, splitting `cache_bootstrap` into separate `db_migrate` + `cache_bootstrap` tasks should be done **together** with the driver replacement, not separately — splitting alone doubles the fragile surface for no clarity gain.
+
+### 4. Observability stack (ADR-0003)
+
+CloudWatch metrics + structured worker/bootstrap logs are emitted, but there is no dashboard, no alarm wiring, no on-call escalation, no incident runbook, no distributed tracing. Production must add Prometheus + Grafana (self-managed) or Datadog/New Relic (managed). The case-study scope explicitly excludes this per ADR-0003 PoC-vs-prod calibration.
+
+### 5. Multi-region posture (ADR-0009)
+
+Single-region (default `eu-central-1`) by design. Multi-region triggers documented in ADR-0009 and exercised by the migration runbook (`docs/migration_runbook.md`). Production deployments crossing the multi-region threshold should follow the runbook before ad-hoc resource duplication.
+
+### 6. VPC Flow Logs
+
+Not enabled in the current composition. Production should add `aws_flow_log` resources at the VPC level for both rejected and accepted traffic, written to a dedicated S3 bucket with lifecycle rules. Adds ~5 lines of Terraform, but introduces the S3 bucket + IAM scope and a non-trivial cost for active VPCs (~$0.50/GB ingest).
+
+### 7. Dependabot / Renovate for dependency updates
+
+`uv.lock` (committed) pins exact Python dependency versions for reproducibility. The Terraform module + provider versions are exact-pinned in `main.tf` per the supply-chain hardening commit. Without an automated bump tool, pinned versions go stale and miss security patches. Production should configure either Dependabot (GitHub-native) or Renovate (more flexible, supports Terraform modules natively) with weekly bump PRs.
 
 ---
 
