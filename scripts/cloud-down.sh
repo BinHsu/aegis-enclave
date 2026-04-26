@@ -64,13 +64,23 @@ if [[ -z "${AWS_PROFILE:-}" ]]; then
 fi
 info "Using AWS_PROFILE=$AWS_PROFILE"
 
-if ! aws sts get-caller-identity >/dev/null 2>&1; then
+if ! AUTH_RAW=$(aws sts get-caller-identity 2>&1); then
+    printf "\n--- aws sts get-caller-identity --profile %s failed ---\n%s\n--- end ---\n" \
+        "$AWS_PROFILE" "$AUTH_RAW" >&2
+
+    if ! aws configure list-profiles 2>/dev/null | grep -qx "$AWS_PROFILE"; then
+        printf "\nProfile '%s' is NOT in 'aws configure list-profiles'. Available:\n" "$AWS_PROFILE" >&2
+        aws configure list-profiles 2>/dev/null | sed 's/^/  - /' >&2
+        printf "\nNote: SSO sessions ([sso-session NAME]) are NOT profiles. Pick a profile name.\n" >&2
+        fail "Profile '$AWS_PROFILE' does not exist"
+    fi
+
     if aws configure get sso_session --profile "$AWS_PROFILE" >/dev/null 2>&1 \
        || aws configure get sso_start_url --profile "$AWS_PROFILE" >/dev/null 2>&1; then
         info "profile is SSO-configured — running 'aws sso login --profile $AWS_PROFILE'"
         aws sso login --profile "$AWS_PROFILE" || fail "SSO login failed for profile $AWS_PROFILE"
     else
-        fail "Long-term creds invalid for profile '$AWS_PROFILE'. Check ~/.aws/credentials."
+        fail "Profile '$AWS_PROFILE' has no SSO config and creds are invalid. Check ~/.aws/credentials."
     fi
 fi
 
