@@ -1,32 +1,27 @@
-"""Prime number generation in a bounded range — unified monotonic cache.
+"""Prime number generation in a bounded range.
 
-See ADR-0020 (`docs/ADR/0020-unified-prime-cache-and-cost-estimator.md`)
-and ADR-0021 (`docs/ADR/0021-cache-leveraging-compute-paths.md`) for the
-full rationale; ADR-0017's tuple-immutability posture for the prior
-static `_PRIME_TABLE` is partially superseded — see "Trade-offs" below.
+Architecture change (Phase 2.3/2.4): the in-process unified monotonic cache
+(`_known_primes` / `_INITIAL_PREWARM_BOUND`) is removed. Pre-warming and
+range-coalescing are now performed by the distributed Valkey cache layer
+(`cache.py`) and the one-shot bootstrap task (`bootstrap.py`). This module
+is now a pure stateless compute kernel — each call to `primes_in_range`
+runs the appropriate algorithm from scratch (segmented sieve or trial
+division) with no mutable module-level state.
 
-Algorithm:
-    A single shared `_known_primes` list, pre-warmed at module load with
-    primes up to `_INITIAL_PREWARM_BOUND` via Sieve of Eratosthenes. Each
-    incoming query either:
-      - hits the cache fully (`end <= _known_max`) — bisect-and-slice,
-        sub-millisecond
-      - extends the cache contiguously (`start <= _known_max + _GAP_THRESHOLD`)
-        — compute (`_known_max + 1`, `end`), append, return slice
-      - computes standalone (`start > _known_max + _GAP_THRESHOLD`) —
-        far-gap query that would balloon the cache; result returned but
-        not cached, keeping `_known_primes` contiguous
+Algorithm selection:
+    - end <= _SIEVE_THRESHOLD: segmented Sieve of Eratosthenes — O(n log log n)
+    - end > _SIEVE_THRESHOLD: 6k±1 trial division — correct for all n,
+      no sieve memory allocation
 
-Compute fallbacks for ranges above the cache:
-    - Sieve of Eratosthenes for `end <= _SIEVE_THRESHOLD`
-    - 6k±1 trial division for `end > _SIEVE_THRESHOLD`
-
-Cost-aware validation (`_estimate_compute_ms`):
-    `_validate` includes a compute-time estimator (in milliseconds, calibrated
-    against M4 / Fargate t4g.medium). Queries whose estimated cost exceeds
-    `_HARD_TIMEOUT_MS` are rejected at validation — before any expensive
-    compute starts. Cache state is part of the estimate: as `_known_max`
-    grows, more queries become "free", and the estimator naturally tightens.
+Compute budget:
+    - `_HARD_TIMEOUT_MS = 60_000` — pre-flight cost estimator rejects requests
+      whose estimated wall-clock cost would exceed this.
+    - `signal.alarm(60)` SIGALRM wrapper in `sieve_with_timeout` — catches
+      CPU-bound infinite loops that `asyncio.wait_for` cannot interrupt.
+      RATIONALE: queue redelivery rescues the SQS message, but NOT a stuck
+      worker (CPU-bound Python loops hold the GIL and have no OOM path).
+      Only SIGALRM interrupts a pure-Python CPU-bound loop. See the memory
+      note `feedback_safety_guard_recovery_test.md`.
 
 Bounds:
     - start >= 2 (1 is not prime; reject explicitly)
@@ -34,57 +29,31 @@ Bounds:
     - end - start <= _RANGE_CEILING (memory ceiling)
     - estimated compute time <= _HARD_TIMEOUT_MS (DoS guard)
 
-Edge cases handled:
-    - Single prime (start == end == prime): returns [prime]
-    - Single non-prime (start == end == composite): returns []
-    - Empty range (start > end): raises ValueError
-    - Half-hit (start <= _known_max < end): cache prefix + computed suffix
-    - Far-gap query (start > _known_max + _GAP_THRESHOLD): standalone compute,
-      cache untouched
-
-Trade-offs:
-    - Cache is mutable; thread safety guaranteed by `_cache_lock`.
-      ADR-0017's tuple-immutability claim is superseded by the lock +
-      module-level access discipline.
-    - Cache grows monotonically; bounded by `_RANGE_CEILING` (max ~664k
-      primes ≈ 18 MB per uvicorn worker).
-    - Lock is held during `_compute` for far-extending queries, serialising
-      concurrent extensions. Acceptable at case-study scale; cross-worker
-      shared cache (Redis) is the Phase 2 upgrade if concurrency demands it.
-    - Per-worker cache; cold on worker restart (re-pays the ~5-15ms pre-warm).
-
-Deadlock-freedom invariants (see ADR-0021):
-    - Single lock (`_cache_lock`), acquired exactly once per `primes_in_range`
-      call via the `with` statement. No code path inside the with-block
-      re-acquires it.
-    - `_compute`, `_segmented_sieve`, `_trial_division_with_known`,
-      `_slice_known`, and the legacy `_sieve_eratosthenes` / `_trial_division_6k`
-      operate on data passed in (or read directly from module state) — none
-      call back into `primes_in_range` or attempt to acquire `_cache_lock`
-      independently.
-    - Future contributors must preserve this. Adding a compute path that
-      depends on `primes_in_range` recursively requires either (a) switching
-      `_cache_lock` to `threading.RLock`, or (b) pre-snapshotting cache state
-      into a parameter and operating on the snapshot. (b) is preferred —
-      keeps the lock blast radius small.
+Legacy reference implementations (`_sieve_eratosthenes`, `_trial_division_6k`,
+`_is_prime_6k`) are retained for cross-validation tests and as a reference
+fallback; they are NOT called from the production runtime path.
 """
 
+import signal
 import threading
 from bisect import bisect_left, bisect_right
 from collections.abc import Iterator
 
-_INITIAL_PREWARM_BOUND = 10**5
 _SIEVE_THRESHOLD = 10**6
 _RANGE_CEILING = 10_000_000
-_HARD_TIMEOUT_MS = 30_000
-_GAP_THRESHOLD = 100_000
+_HARD_TIMEOUT_MS = 60_000
+
+# Small-prime table used by sieve and trial-division paths.
+# Built once at module load; covers all primes <= sqrt(_RANGE_CEILING) = 3163.
+# This is a module-level constant (read-only after build), not a mutable cache.
+_SMALL_PRIMES: list[int] = []
 
 
 def _build_prime_table(bound: int) -> list[int]:
     """Build a sorted list of primes up to `bound` via Sieve of Eratosthenes.
 
-    Used both at module load (for the pre-warm) and (in tests) to construct
-    expected oracle values when sympy is not available.
+    Used both at module load (for the small-primes table) and (in tests) to
+    construct expected oracle values when sympy is not available.
     """
     if bound < 2:
         return []
@@ -100,84 +69,69 @@ def _build_prime_table(bound: int) -> list[int]:
     return [n for n in range(2, bound + 1) if is_prime[n]]
 
 
-# ─── Mutable cache state — guarded by `_cache_lock` ─────────────────────────
-# Pre-warmed at module load; ~5-15ms one-off cost per uvicorn worker.
-# See ADR-0020 for the full rationale.
-_cache_lock = threading.Lock()
-_known_primes: list[int] = _build_prime_table(_INITIAL_PREWARM_BOUND)
-_known_max: int = _INITIAL_PREWARM_BOUND
+# Build the small-prime table at module load (covers sqrt(_RANGE_CEILING)).
+_SMALL_PRIMES = _build_prime_table(int(_RANGE_CEILING**0.5) + 1)
+
+# Lock guards the small-prime table read in _segmented_sieve / _compute
+# when called concurrently. The table itself is read-only after module load,
+# but Python list access during iteration is not guaranteed safe under all
+# threading models without explicit synchronisation.
+_table_lock = threading.Lock()
 
 
-def _set_known_max(value: int) -> None:
-    """Module-level setter — keeps the `global` keyword localised here."""
-    global _known_max
-    _known_max = value
+# ─── SIGALRM timeout wrapper ──────────────────────────────────────────────────
+
+_SIGALRM_SECONDS = 60  # hard compute budget for the worker path
 
 
-def _estimate_compute_ms(start: int, end: int, known_max: int) -> int:
-    """Estimate compute time in milliseconds, given current cache state.
+def _sigalrm_handler(signum: int, frame: object) -> None:
+    """SIGALRM handler: raise TimeoutError to interrupt CPU-bound compute."""
+    raise TimeoutError("sieve computation exceeded SIGALRM budget")
 
-    Conservative — over-estimate is OK (we cut early on 'too slow').
-    Calibrated against M4 / Fargate t4g.medium. Constants reflect the
-    cache-leveraging compute paths (ADR-0021):
-      - Segmented sieve marking: ~1 ms per 10⁴ of compute_range
-        (NOT bound — the bytearray is only `compute_range` bytes, much
-        smaller than the prior full-sieve [0, end] allocation)
-      - Trial division by known primes: ~7000 Python ops per ms
-        (~2.4× faster than the legacy 6k±1 path because we divide only
-        by actual primes ≤ sqrt(end), not by every 6k±1 candidate)
-      - 6k±1 candidate generation factor of ~1/6 retained as a coarse
-        upper-bound on candidates inspected
+
+def sieve_with_timeout(start: int, end: int) -> list[int]:
+    """Compute primes_in_range under a SIGALRM 60s hard deadline.
+
+    SIGALRM is the only mechanism that can interrupt a CPU-bound Python loop
+    (asyncio.wait_for / threading timeouts cannot preempt the GIL holder).
+    This function is intended for the worker process (not the async API server).
+
+    On SIGALRM expiry: raises TimeoutError.
+    Caller is responsible for catching TimeoutError and writing status=failed.
+
+    NOTE: signal.alarm is process-wide and UNIX-only (not Windows-compatible).
+    The worker is expected to run in a Linux container (Fargate/Docker).
     """
-    if end <= known_max:
-        return 1  # bisect + slice path, sub-millisecond
+    old_handler = signal.signal(signal.SIGALRM, _sigalrm_handler)
+    signal.alarm(_SIGALRM_SECONDS)
+    try:
+        return primes_in_range(start, end)
+    finally:
+        signal.alarm(0)  # cancel pending alarm
+        signal.signal(signal.SIGALRM, old_handler)  # restore prior handler
 
-    # Determine if we'll extend the cache or compute standalone.
-    if start <= known_max + _GAP_THRESHOLD:
-        compute_start = known_max + 1  # extend
-    else:
-        compute_start = start  # standalone (no cache pollution)
 
-    compute_range = end - compute_start + 1
+# ─── Validation & estimation ──────────────────────────────────────────────────
 
+
+def _estimate_compute_ms(start: int, end: int) -> int:
+    """Estimate compute time in milliseconds (stateless, no cache state).
+
+    Calibrated against M4 / Fargate t4g.medium. Conservative — over-estimate
+    is fine (we cut early on 'too slow').
+
+    Layer selection mirrors `primes_in_range`:
+      - end <= _SIEVE_THRESHOLD: segmented sieve, ~1 ms per 10⁴ compute_range
+      - end > _SIEVE_THRESHOLD: trial division, compute_range × sqrt(end) / 6 / 7000
+    """
     if end <= _SIEVE_THRESHOLD:
-        # Segmented sieve over [compute_start, end]; bytearray sized to
-        # `compute_range`, marking work concentrated on the segment.
+        compute_range = end - start + 1
         return max(50, compute_range // 10_000)
 
-    # Layer 3: trial division by known primes over `compute_range` candidates
+    compute_range = end - start + 1
     sqrt_max = int(end**0.5) + 1
     estimated_ops = compute_range * sqrt_max // 6
     return estimated_ops // 7_000
-
-
-def primes_in_range(start: int, end: int) -> list[int]:
-    """Return primes in the inclusive range [start, end].
-
-    Pre-flight rejects queries that would exceed `_HARD_TIMEOUT_MS` at
-    estimated cost (with cache state factored in). Cache state can only
-    improve estimates for subsequent calls — more known → fewer estimated
-    ops on the same query.
-
-    Raises:
-        ValueError: if start < 2, start > end, range > _RANGE_CEILING,
-            or estimated compute time exceeds the hard timeout.
-    """
-    _validate(start, end)
-
-    with _cache_lock:
-        if end <= _known_max:
-            return _slice_known(start, end)
-
-        if start <= _known_max + _GAP_THRESHOLD:
-            # Extend cache contiguously
-            new_primes = list(_compute(_known_max + 1, end))
-            _known_primes.extend(new_primes)
-            _set_known_max(end)
-            return _slice_known(start, end)
-
-        # Far gap — compute standalone, do not pollute cache
-        return list(_compute(start, end))
 
 
 def _validate(start: int, end: int) -> None:
@@ -190,11 +144,7 @@ def _validate(start: int, end: int) -> None:
             f"range size ({end - start}) exceeds ceiling ({_RANGE_CEILING}); "
             "split the request into smaller windows"
         )
-    # Snapshot `_known_max` once — Python int reads are atomic under the GIL,
-    # and an off-by-one between snapshot and actual extension only matters in
-    # the conservative direction (more known later = even cheaper).
-    snapshot_max = _known_max
-    estimated = _estimate_compute_ms(start, end, snapshot_max)
+    estimated = _estimate_compute_ms(start, end)
     if estimated > _HARD_TIMEOUT_MS:
         raise ValueError(
             f"estimated compute time {estimated} ms exceeds {_HARD_TIMEOUT_MS} ms "
@@ -202,56 +152,48 @@ def _validate(start: int, end: int) -> None:
         )
 
 
-def _slice_known(start: int, end: int) -> list[int]:
-    """Bisect-slice the known_primes list for the inclusive range [start, end].
+def primes_in_range(start: int, end: int) -> list[int]:
+    """Return primes in the inclusive range [start, end].
 
-    O(log n) per range bound via bisect; O(k) for the slice copy. Caller
-    must hold `_cache_lock` during this call (or operate on a snapshot)
-    because `_known_primes` is mutable.
+    Raises:
+        ValueError: if start < 2, start > end, range > _RANGE_CEILING,
+            or estimated compute time exceeds the hard timeout.
     """
-    lo = bisect_left(_known_primes, start)
-    hi = bisect_right(_known_primes, end)
-    return _known_primes[lo:hi]
+    _validate(start, end)
+    return _compute(start, end)
 
 
 def _compute(start: int, end: int) -> list[int]:
-    """Runtime computation when cache doesn't cover the range.
+    """Runtime computation — algorithm chosen by end vs _SIEVE_THRESHOLD.
 
-    Leverages `_known_primes` as the small-primes list for both sieve and
-    trial-division paths (ADR-0021). Caller MUST hold `_cache_lock` so the
-    `_known_primes` view is stable across the computation.
-
-    Algorithm choice:
-      - end <= _SIEVE_THRESHOLD: segmented sieve — memory O(end - start),
-        avoids re-marking the [0, start) range that the legacy
-        `_sieve_eratosthenes` would have wasted.
-      - end > _SIEVE_THRESHOLD: trial division by known primes — faster than
-        6k±1 because we skip composite candidates that 6k±1 would generate.
-
-    The legacy `_sieve_eratosthenes` and `_trial_division_6k` are retained
-    in this module as reference implementations for cross-validation tests
-    (`tests/test_primes.py` asserts the new and legacy paths agree on every
-    BVA point).
+    Uses the module-level _SMALL_PRIMES table (read-only after module load).
     """
     if end <= _SIEVE_THRESHOLD:
-        return _segmented_sieve(start, end, _known_primes)
-    return _trial_division_with_known(start, end, _known_primes)
+        with _table_lock:
+            small = list(_SMALL_PRIMES)
+        return _segmented_sieve(start, end, small)
+    with _table_lock:
+        small = list(_SMALL_PRIMES)
+    return _trial_division_with_known(start, end, small)
+
+
+def _slice_known(known: list[int], start: int, end: int) -> list[int]:
+    """Bisect-slice a sorted prime list for the inclusive range [start, end].
+
+    Used by the cache layer (bootstrap/worker) when retrieving a sub-range
+    from a cached larger range. Not part of the stateless compute path.
+    """
+    lo = bisect_left(known, start)
+    hi = bisect_right(known, end)
+    return known[lo:hi]
 
 
 def _segmented_sieve(low: int, high: int, small_primes: list[int]) -> list[int]:
     """Segmented Sieve of Eratosthenes over [low, high] using `small_primes`.
 
-    Requires: `small_primes` contains all primes <= sqrt(high). For our
-    bounds (`_RANGE_CEILING = 10⁷` → sqrt ≈ 3162; `_INITIAL_PREWARM_BOUND
-    = 10⁵` ≥ 3162), `_known_primes` always satisfies this when the lock
-    is held.
-
-    Memory: O(high - low + 1) bytearray (the segment, not [0, high]).
-    Time: O((high - low) × log log high) — the work is concentrated on the
-    segment, NOT on re-sieving the [0, low) prefix that the legacy
-    `_sieve_eratosthenes(high, low)` would have re-marked.
-
-    Caller must hold `_cache_lock` if `small_primes is _known_primes`.
+    Requires: `small_primes` contains all primes <= sqrt(high).
+    Memory: O(high - low + 1) bytearray.
+    Time: O((high - low) × log log high).
     """
     if low < 2:
         low = 2
@@ -264,9 +206,6 @@ def _segmented_sieve(low: int, high: int, small_primes: list[int]) -> list[int]:
     for p in small_primes:
         if p * p > high:
             break
-        # First multiple of p that lies in [low, high]. Smaller multiples
-        # of p (i.e., p × k for k < p) were eliminated by smaller primes,
-        # so we can start at max(p², ceil(low / p) × p).
         first_mult = max(p * p, ((low + p - 1) // p) * p)
         for m in range(first_mult, high + 1, p):
             seg[m - low] = 0
@@ -277,10 +216,7 @@ def _segmented_sieve(low: int, high: int, small_primes: list[int]) -> list[int]:
 def _is_prime_with_known(n: int, small_primes: list[int]) -> bool:
     """Single primality check via trial division by `small_primes`.
 
-    Requires: `small_primes` contains all primes <= sqrt(n). Faster than
-    `_is_prime_6k` because we divide only by actual primes (~446 primes
-    below sqrt(10⁷)) instead of every 6k±1 candidate (~1054 candidates),
-    a ~2.4× speedup.
+    Requires: `small_primes` contains all primes <= sqrt(n).
     """
     if n < 2:
         return False
@@ -299,48 +235,19 @@ def _is_prime_with_known(n: int, small_primes: list[int]) -> bool:
 
 
 def _trial_division_with_known(start: int, end: int, small_primes: list[int]) -> list[int]:
-    """Trial division over [start, end] using `small_primes` as divisors.
-
-    Requires: same as `_is_prime_with_known`. Caller must hold `_cache_lock`
-    if `small_primes is _known_primes`.
-    """
+    """Trial division over [start, end] using `small_primes` as divisors."""
     return [n for n in range(start, end + 1) if _is_prime_with_known(n, small_primes)]
 
 
-# ─── Legacy reference implementations ─────────────────────────────────────
-# The three functions below (`_sieve_eratosthenes`, `_trial_division_6k`,
-# `_is_prime_6k`) are NOT called from the production runtime path. The
-# active compute paths are `_segmented_sieve`, `_is_prime_with_known`, and
-# `_trial_division_with_known` (see `_compute` above).
-#
-# They are retained deliberately for three reasons:
-#   1. Cross-validation. `tests/test_primes.py` runs three-way differential
-#      tests on every BVA point: the cache-leveraging path, these legacy
-#      functions, and the `sympy` oracle must all agree. Removing the
-#      legacy functions would collapse three-way differential coverage to
-#      two-way, weakening confidence in the new paths.
-#   2. ADR-0017 historical record. The 6k±1 path was the original
-#      production strategy; ADR-0017 documents it as the "trade-off lever"
-#      we considered. Keeping the implementation in tree means the ADR
-#      remains anchored to runnable code.
-#   3. Fallback baseline. If `_RANGE_CEILING` is ever raised above
-#      `_INITIAL_PREWARM_BOUND²` (i.e., 10¹⁰), `_known_primes` would no
-#      longer always cover sqrt(end), and the cache-leveraging paths
-#      would need an extension step. The 6k±1 path is correct without
-#      that precondition and would be the safe baseline.
-#
-# See ADR-0021 § Alternatives Considered for the full rationale.
-# Future contributors: do NOT delete these as "dead code" — the test
-# suite depends on them. If you do remove them, downgrade the differential
-# tests in `tests/test_primes.py` to two-way (new path vs sympy) and
-# document the rationale in a follow-up ADR.
+# ─── Legacy reference implementations ─────────────────────────────────────────
+# These three functions are NOT called from the production runtime path.
+# Retained for cross-validation in tests/test_primes.py.
 
 
 def _sieve_eratosthenes(upper: int, start: int) -> Iterator[int]:
     """Sieve of Eratosthenes up to `upper`, yielding primes >= start.
 
-    LEGACY REFERENCE — not called from production runtime. See the
-    section header above and ADR-0021 § Alternatives Considered.
+    LEGACY REFERENCE — not called from production runtime.
     """
     is_prime = bytearray([1]) * (upper + 1)
     is_prime[0] = 0
@@ -359,10 +266,9 @@ def _sieve_eratosthenes(upper: int, start: int) -> Iterator[int]:
 
 
 def _trial_division_6k(start: int, end: int) -> Iterator[int]:
-    """Trial division using 6k±1 candidate generation, no sieve allocation.
+    """Trial division using 6k±1 candidate generation.
 
-    LEGACY REFERENCE — not called from production runtime. See the
-    section header above and ADR-0021 § Alternatives Considered.
+    LEGACY REFERENCE — not called from production runtime.
     """
     for n in range(start, end + 1):
         if _is_prime_6k(n):
@@ -372,8 +278,7 @@ def _trial_division_6k(start: int, end: int) -> Iterator[int]:
 def _is_prime_6k(n: int) -> bool:
     """Check primality using 6k±1: every prime > 3 has form 6k-1 or 6k+1.
 
-    LEGACY REFERENCE — not called from production runtime. See the
-    section header above and ADR-0021 § Alternatives Considered.
+    LEGACY REFERENCE — not called from production runtime.
     """
     if n < 2:
         return False

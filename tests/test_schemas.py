@@ -130,30 +130,47 @@ class TestPrimeRangeRequestTypeCoercion:
 
 
 class TestPrimeRangeResponse:
-    """Structural coverage for the response model — no custom validators."""
+    """Structural coverage for the 202 Accepted response (async path).
 
-    def test_minimal(self) -> None:
-        resp = PrimeRangeResponse(primes=[2, 3, 5, 7], count=4, execution_id=1)
-        assert resp.count == 4
+    PrimeRangeResponse is now {execution_id, status} — the synchronous
+    {primes, count} fields moved to ExecutionResponse (GET /primes/{id}).
+    """
+
+    def test_minimal_execution_id_and_status(self) -> None:
+        resp = PrimeRangeResponse(execution_id=1, status="queued")
         assert resp.execution_id == 1
+        assert resp.status == "queued"
 
-    def test_empty_primes(self) -> None:
-        resp = PrimeRangeResponse(primes=[], count=0, execution_id=42)
-        assert resp.primes == []
+    def test_default_status_is_queued(self) -> None:
+        resp = PrimeRangeResponse(execution_id=42)
+        assert resp.status == "queued"
 
-    def test_count_field_required(self) -> None:
-        with pytest.raises(ValidationError, match="count"):
-            PrimeRangeResponse(primes=[2], execution_id=1)  # type: ignore[call-arg]
+    def test_execution_id_required(self) -> None:
+        with pytest.raises(ValidationError):
+            PrimeRangeResponse()  # type: ignore[call-arg]
 
     def test_execution_id_negative_accepted(self) -> None:
         # No constraint on execution_id polarity; test documents current contract.
-        resp = PrimeRangeResponse(primes=[2], count=1, execution_id=-1)
+        resp = PrimeRangeResponse(execution_id=-1)
         assert resp.execution_id == -1
 
     def test_serialise_roundtrip(self) -> None:
-        original = PrimeRangeResponse(primes=[2, 3, 5], count=3, execution_id=7)
+        original = PrimeRangeResponse(execution_id=7, status="queued")
         round_tripped = PrimeRangeResponse.model_validate_json(original.model_dump_json())
         assert round_tripped == original
+
+    # BVA on execution_id boundary (any int accepted, no schema constraint)
+    def test_execution_id_bva_at_0(self) -> None:
+        resp = PrimeRangeResponse(execution_id=0)
+        assert resp.execution_id == 0
+
+    def test_execution_id_bva_at_1(self) -> None:
+        resp = PrimeRangeResponse(execution_id=1)
+        assert resp.execution_id == 1
+
+    def test_execution_id_bva_at_2(self) -> None:
+        resp = PrimeRangeResponse(execution_id=2)
+        assert resp.execution_id == 2
 
 
 # ───────────────────────────────────────────────────────────────────────────
