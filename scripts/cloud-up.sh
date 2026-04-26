@@ -272,33 +272,42 @@ cat <<EOF
   VPN endpoint: $VPN_ID
   Apply elapsed: ${ELAPSED_MIN}m ${ELAPSED_SEC}s
 
-  Operator next steps:
+  Operator next steps (commands include --profile so they're copy-paste safe;
+  AWS_PROFILE export inside this script is subshell-only and doesn't carry
+  back to your terminal):
+
     1. Download VPN client config:
        aws ec2 export-client-vpn-client-configuration \\
-           --client-vpn-endpoint-id $VPN_ID \\
+           --profile $AWS_PROFILE \\
            --region $REGION \\
+           --client-vpn-endpoint-id $VPN_ID \\
            --output text > pki/$OPERATOR.ovpn
        Append the operator's client cert + key (in pki/$OPERATOR/) into the .ovpn
 
     2. Connect via Tunnelblick or 'sudo openvpn --config pki/$OPERATOR.ovpn'
 
-    3. Run smoke test:
-       Capture the ALB CA pem + endpoint DNS, then:
+    3. Run smoke test (the make target reads terraform outputs; it inherits
+       AWS_PROFILE if set in your shell, otherwise prompts):
+         AWS_PROFILE=$AWS_PROFILE make cloud-smoke
+       (or manually:
          ALB_IP=\$(dig +short \$(cd terraform && terraform output -raw alb_dns_name) | head -1)
          cd terraform && terraform output -raw alb_self_signed_ca_pem > /tmp/alb-ca.pem
          CURL="curl --cacert /tmp/alb-ca.pem --resolve api.enclave.internal:443:\$ALB_IP"
-         \$CURL https://api.enclave.internal/health
-       (or wrap into scripts/cloud-smoke.sh — TODO)
+         \$CURL https://api.enclave.internal/health)
 
     4. CloudWatch evidence capture (per memory feedback_phase25_screenshot_evidence.md):
-       Screenshot dashboards BEFORE running 'make cloud-down'. Targets:
+         AWS_PROFILE=$AWS_PROFILE make cloud-evidence
+       Then screenshot dashboards in the AWS Console BEFORE running 'make cloud-down'.
+       Targets:
          - SQS ApproximateNumberOfMessagesVisible
          - ECS DesiredCount (worker autoscale)
          - ElastiCache BytesUsedForCache + ElastiCacheProcessingUnits
          - Worker CloudWatch logs + bootstrap task logs
          - 6/6 smoke test screenshots
 
-    5. When done: 'make cloud-down' (drains ECR + destroys + cleans ACM certs)
+    5. When done:
+         AWS_PROFILE=$AWS_PROFILE make cloud-down
+       (drains ECR + destroys + cleans ACM certs + collateral-free verify)
        Cost budget reminder: ≤ 3h apply-then-destroy window (≈ \$1.20-1.80 per ADR-0031)
 
 EOF
