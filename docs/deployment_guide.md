@@ -16,7 +16,7 @@ This guide assumes you have completed the README's Prerequisites and run `make i
 - System tools (one-time, via Homebrew on macOS): `brew install easy-rsa pip-audit` — easy-rsa is required by `scripts/bootstrap-vpn-certs.sh` to generate the Client VPN PKI; pip-audit backs `make audit` for supply-chain scanning. Both fail loudly with the brew install command if missing.
 - AWS region selected (default `eu-central-1` — see `terraform/variables.tf`)
 - VPC quotas sufficient for one VPC + 2 private subnets + 2 public subnets + 1 NAT gateway + 1 ALB + 1 ECS cluster + 1 ElastiCache Serverless cache + 1 Client VPN endpoint
-- Cost ceiling awareness: a 3h apply window typically costs **< $2** at us-east-1 / eu-central-1 rates; verify in AWS Pricing Calculator before apply if your account has unusual pricing
+- Cost awareness: steady-state idle ≈ $0.60/h (eu-central-1 list price). Multiply by your intended duration. Per-component breakdown in § Cost shape below — do not anchor on the case-study's 3h Phase 2.5 window; that was our cost-ceiling for evidence capture, not a deliverable property.
 - (Optional, recommended) AWS Cost Explorer enabled to see the actual spend post-destroy
 
 **Apple silicon (M1/M2/M3/M4) note**: `make install` via `uv sync --locked --extra dev` resolves arm64 wheels for the only two C-extension dependencies — `lupa` (Lua bindings for the Valkey range-coalescing script, includes `lua54.cpython-XXX-darwin.so` Mach-O 64-bit bundle arm64) and `redis-py` (pure Python, no native build). No Rosetta 2 emulation, no source compilation. Verified on M4 with Python 3.14.4. The `linux/amd64` build flag in `cloud-up.sh` (`docker build --platform linux/amd64`) is for the Fargate target architecture, not the local dev machine.
@@ -167,11 +167,56 @@ Notes on the plan-only posture (see [`terraform/README.md`](../terraform/README.
 
 ## Cost shape
 
+### Hourly rate (eu-central-1 list price, April 2026)
+
+The forker decides their own deployment duration. This table is the per-hour cost breakdown so you can plan against your own budget — multiply by hours, don't anchor on the case-study's 3h window (which is OUR cost-ceiling for the Phase 2.5 acceptance cycle, not a design property).
+
+| Component | Quantity | Hourly cost |
+|---|---|---|
+| Interface VPC endpoints (8 services × 2 AZ) | 16 ENI-h | $0.176 |
+| S3 gateway endpoint | 1 | $0 (free) |
+| Client VPN endpoint association | 2 AZ | $0.20 |
+| Client VPN active connection | per connected operator | $0.05 |
+| ALB (idle) | 1 | $0.025 |
+| RDS db.t4g.micro Multi-AZ Postgres 16.13 | 1 instance | $0.034 |
+| RDS storage (20 GB gp3) | 20 GB | $0.003 |
+| ECS Fargate — app task (0.25 vCPU, 0.5 GB) | 1 | $0.012 |
+| ECS Fargate — worker task (0.25 vCPU, 0.5 GB) | 1 (idle, scales 1-3 on SQS depth) | $0.012 |
+| ElastiCache Serverless Valkey (storage min) | ≥ 100 MB | $0.085 |
+| **Steady-state idle (no traffic, 1 VPN client)** | | **≈ $0.60/h** |
+
+Per-request / per-traffic items below are negligible at smoke-test load (< 0.1 ¢/h):
+
+| Component | Cost basis |
+|---|---|
+| ECS Fargate — bootstrap one-shot task | ~30s of vCPU+memory at task end |
+| ECR image storage (one image, ~150 MB) | $0.10/GB-month |
+| CloudWatch log ingest (worker + bootstrap) | $0.50/GB ingest |
+| SQS API requests (smoke load < 100K/h) | $0.40/M requests |
+| ElastiCache eCPU (Lua + ZSET ops) | $0.001/1K eCPU |
+
+**Time projection at steady-state idle** (multiply by your duration):
+
+| Duration | Cumulative cost |
+|---|---|
+| 1 hour | ~$0.60 |
+| 3 hours | ~$1.80 (case-study Phase 2.5 actual: $1.50) |
+| 24 hours | ~$14 |
+| 7 days (24/7) | ~$100 |
+| 30 days (24/7) | ~$430 |
+
+Caveats:
+- List prices in eu-central-1; other regions vary up to ~30 % either direction. Verify in AWS Pricing Calculator for your region/account.
+- Reserved Instance / Savings Plan / Fargate Spot can reduce ECS Fargate by ~30-70 % if your workload tolerates the commitment or interruption.
+- The figures assume one connected VPN operator. Each additional connected client adds $0.05/h.
+
+### Architectural cost choices
+
 The composition surfaces FinOps signals as architectural choices, not as a separate cost-modelling exercise:
 
 - **`default_tags` on the AWS provider** tag every resource with `Project` / `Environment` / `CostCenter` / `Owner` / `Repository`. Cost attribution scaffolding is in place from day one.
 - **ECS Fargate over EKS** avoids the ~$73/month EKS control-plane fee at PoC scale (ADR-0015). Fargate is the appropriate-complexity managed primitive for the workload; EKS becomes a Phase 2 conversation only if the buyer's actual workload demands it.
-- **Single NAT gateway** (`single_nat_gateway = true`) rather than per-AZ NAT — a deliberate cost discipline for PoC scale. A production deployment would re-evaluate this; the trade-off is documented inline in `terraform/main.tf`.
+- **No NAT gateway** — the VPC has zero public-egress paths. All AWS API access is through the 8 Interface VPC endpoints + S3 gateway endpoint listed above. Saves ~$32/month (single-NAT) to ~$96/month (per-AZ NAT) for an active VPC, at the cost of per-hour endpoint fees that dominate at low scale (the table above).
 - **Client VPN endpoint cost analysis** from ADR-0006: ~$1,400/month at 30-user / 2-AZ / 24-7 operation versus ~$8/month for self-hosted NetBird at the same scale (~170× TCO reduction). This is the cost driver behind the migration runbook's recommendation in [`docs/migration_runbook.md`](migration_runbook.md), not a political framing.
 
 ## Cross-cloud and scaling
@@ -350,6 +395,15 @@ Not enabled in the current composition. Production should add `aws_flow_log` res
 ### 7. Dependabot / Renovate for dependency updates
 
 `uv.lock` (committed) pins exact Python dependency versions for reproducibility. The Terraform module + provider versions are exact-pinned in `main.tf` per the supply-chain hardening commit. Without an automated bump tool, pinned versions go stale and miss security patches. Production should configure either Dependabot (GitHub-native) or Renovate (more flexible, supports Terraform modules natively) with weekly bump PRs.
+
+### 8. FinOps cap + anomaly detection
+
+The case-study composition has cost attribution (provider `default_tags` for Cost Explorer queries) and a per-hour cost table (§ Cost shape) but **does not** wire `aws_budgets_budget` (monthly cap with email/SNS notification at threshold) or `aws_ce_anomaly_monitor` / `aws_ce_anomaly_subscription` (Cost Anomaly Detection ML on the tagged resources). For a forker:
+
+- **Budget cap** (~10 lines TF): `aws_budgets_budget` with `budget_type = "COST"`, monthly limit set to your steady-state estimate × 1.5, plus a `notification` block at 80%/100%/forecasted-100% to an SNS topic or email.
+- **Anomaly detection** (~15 lines TF): `aws_ce_anomaly_monitor` scoped to `monitor_dimension = "SERVICE"` for the case-study's services (RDS, ECS, ElastiCache, ALB, VPC), plus an `aws_ce_anomaly_subscription` with a daily summary or above-threshold alert.
+
+Both features are free at the AWS billing layer; the cost is only the SNS messages or email delivery. Adding them is the inflection point at which the deployment crosses from "cost-aware" to "FinOps-disciplined".
 
 ---
 

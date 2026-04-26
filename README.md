@@ -94,7 +94,37 @@ Files marked **gitignored** in [CLAUDE.md § 2](CLAUDE.md#2-files-and-their-role
 **Three-axis hygiene at a glance:**
 - **GitOps** — `Makefile` declares all ops targets (`make help`); Terraform is the cloud's git-as-truth (community modules in `terraform/`)
 - **DevSecOps** — `SECURITY.md` (disclosure), `.pre-commit-config.yaml` (gitleaks + ruff + terraform fmt at commit-time, full pytest gate at pre-push), `.github/workflows/ci.yml` (lint + pytest on every push and PR), `.github/dependabot.yml` (weekly automated updates), capability gates for AI agents in [`CLAUDE.md` § 7](CLAUDE.md#7-capability-gates-for-ai-agent-driven-work)
-- **FinOps** — `terraform/main.tf` provider block declares `default_tags` (Project / Environment / CostCenter / Owner) for cost attribution; cost analysis recorded in [ADR-0006](docs/ADR/0006-vpn-three-tier-story.md) and [ADR-0015](docs/ADR/0015-no-k8s-no-real-apply.md)
+- **FinOps (scope: cost attribution + per-hour cost estimate only)** — `terraform/main.tf` provider block declares `default_tags` (Project / Environment / CostCenter / Owner) so every resource is queryable via Cost Explorer. Per-hour cost estimate at eu-central-1 list price is the table below. Cost analysis recorded in [ADR-0006](docs/ADR/0006-vpn-three-tier-story.md) and [ADR-0015](docs/ADR/0015-no-k8s-no-real-apply.md). **NOT included**: `aws_budgets_budget` cap, AWS Cost Anomaly Detection, automated chargeback. These are forker-add items in [`docs/deployment_guide.md` § Production hardening checklist](docs/deployment_guide.md#production-hardening-checklist).
+
+### Hourly cost (eu-central-1 list price, April 2026)
+
+You decide your deployment duration; this is the per-hour breakdown so you can plan against your budget. Multiply by hours — don't anchor on the case-study's 3h Phase-2.5 window (that was OUR cost-ceiling for evidence capture, not a design property).
+
+| Component | Quantity | Hourly cost |
+|---|---|---|
+| Interface VPC endpoints (8 services × 2 AZ) | 16 ENI-h | $0.176 |
+| S3 gateway endpoint | 1 | free |
+| Client VPN endpoint association | 2 AZ | $0.20 |
+| Client VPN active connection | per connected operator | $0.05 |
+| ALB (idle) | 1 | $0.025 |
+| RDS db.t4g.micro Multi-AZ Postgres 16.13 | 1 instance | $0.034 |
+| RDS storage (20 GB gp3) | 20 GB | $0.003 |
+| ECS Fargate — app task (0.25 vCPU, 0.5 GB) | 1 | $0.012 |
+| ECS Fargate — worker task (0.25 vCPU, 0.5 GB) | 1 (idle, scales 1–3 on SQS depth) | $0.012 |
+| ElastiCache Serverless Valkey (storage min) | ≥ 100 MB | $0.085 |
+| **Steady-state idle (no traffic, 1 VPN client)** | | **≈ $0.60/h** |
+
+**Time projection** (multiply by your duration):
+
+| Duration | Cumulative cost |
+|---|---|
+| 1 hour | ~$0.60 |
+| 3 hours | ~$1.80 (Phase 2.5 case-study actual: $1.50) |
+| 24 hours | ~$14 |
+| 7 days (24/7) | ~$100 |
+| 30 days (24/7) | ~$430 |
+
+Per-traffic items (SQS, CloudWatch logs, ECS bootstrap one-shot, eCPU) are < 0.1 ¢/h at smoke load. Reserved Instances / Savings Plans / Fargate Spot can reduce ECS by 30–70 %. Verify in AWS Pricing Calculator for your region/account. Full breakdown including per-traffic items: [`docs/deployment_guide.md` § Cost shape](docs/deployment_guide.md#cost-shape).
 
 ---
 
@@ -472,7 +502,9 @@ $CURL https://api.enclave.internal/primes -X POST -H 'Content-Type: application/
 # Expected: timeout (ALB is in private subnets only — see ADR-0019).
 ```
 
-Evidence is captured per [`docs/design_doc.md` § 3 (Observability posture)](docs/design_doc.md) — that section is the spec for what to screenshot and which logs to pull (aggregate dashboards + per-endpoint curl/log pairs + Client VPN handshake + `terraform output`). All artifacts land in [`docs/deployment_guide.md`](docs/deployment_guide.md). The stack is torn down immediately after evidence capture; the acceptance window is bounded to **≤ 3 hours**, with a total cost **under $2** (RDS Multi-AZ, Client VPN endpoint, ALB, and ECS Fargate are billed per hour, not per month — the historic "≈ $50/mo" framing only applies to a sustained deployment).
+Evidence is captured per [`docs/design_doc.md` § 3 (Observability posture)](docs/design_doc.md) — that section is the spec for what to screenshot and which logs to pull (aggregate dashboards + per-endpoint curl/log pairs + Client VPN handshake + `terraform output`). All artifacts land in [`docs/deployment_guide.md`](docs/deployment_guide.md).
+
+**Hourly running cost** (eu-central-1 list price, ≈ $0.60/h steady-state idle): see [`docs/deployment_guide.md` § Cost shape — hourly rate table](docs/deployment_guide.md#cost-shape) for the per-component breakdown. The case-study Phase 2.5 cycle deliberately ran a ≤ 3h apply-then-destroy window for cost-control reasons (~$1.50 actual); a forker chooses their own duration based on the per-hour rate.
 
 ---
 
