@@ -27,6 +27,10 @@ _ensure-venv:
 
 .PHONY: help
 help: ## Show this help (default)
+	@printf "\n\033[1mQuick start (forker pickup order):\033[0m\n"
+	@printf "  Local-stack:  install → up → smoke → negative → down\n"
+	@printf "  Cloud-stack:  install → cloud-up → cloud-smoke → cloud-evidence → cloud-down\n"
+	@printf "\n\033[1mAll targets:\033[0m\n"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: install

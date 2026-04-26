@@ -1,4 +1,21 @@
-# Copy this file to `terraform.tfvars` (gitignored) before running `make tf-plan`.
+# ⚠ DO NOT run `terraform apply` directly with this file — the cert ARNs
+# below are placeholders (zeroes / ones) that satisfy the type constraint
+# for `terraform plan` but will fail at apply time with "ResourceNotFoundException:
+# Could not find certificate" from AWS ACM.
+#
+# Recommended path for the case-study Phase 2.5 cycle:
+#   make cloud-up    — runs scripts/cloud-up.sh which auto-generates real
+#                      VPN cert ARNs via easy-rsa + ACM imports, then writes
+#                      them to terraform/cert-arns.auto.tfvars (gitignored)
+#                      and triggers the staged apply.
+#
+# Manual path (production adoption workflow):
+#   1. Copy this file to `terraform.tfvars` (gitignored)
+#   2. Replace the placeholder cert ARNs below with REAL ACM-imported certificates
+#      (see docs/production_adoption.md § 3 for cert-provisioning paths)
+#   3. Run `make tf-plan` to verify the plan
+#   4. Run `make tf-apply` (or scripts/ts_apply.sh) to apply
+#
 # Each block below documents what an operator should override when adopting
 # this composition into their own AWS environment. See
 # `docs/production_adoption.md` for the full adoption workflow.
