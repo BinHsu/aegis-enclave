@@ -63,7 +63,7 @@ provider "aws" {
 # has no public-internet egress path at all.
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 5.8"
+  version = "5.21.0" # exact pin (case-study reproducibility); was ~> 5.8
 
   name = "aegis-enclave-vpc"
   cidr = var.vpc_cidr
@@ -85,7 +85,7 @@ module "vpc" {
 # Security group permitting HTTPS from the VPC CIDR to the endpoint ENIs.
 module "vpc_endpoints_sg" {
   source  = "terraform-aws-modules/security-group/aws"
-  version = "~> 5.2"
+  version = "5.3.1" # exact pin (case-study reproducibility); was ~> 5.2
 
   name        = "aegis-enclave-vpc-endpoints-sg"
   description = "VPC Endpoint ENI inbound - HTTPS from within the VPC"
@@ -137,7 +137,7 @@ resource "aws_vpc_endpoint" "interfaces" {
 # ─── Security groups (ALB → app → RDS chain) ───────────────────────────────
 module "alb_sg" {
   source  = "terraform-aws-modules/security-group/aws"
-  version = "~> 5.2"
+  version = "5.3.1" # exact pin (case-study reproducibility); was ~> 5.2
 
   name        = "aegis-enclave-alb-sg"
   description = "Internal ALB - reachable only from VPC (Client VPN clients arrive via VPC routes)"
@@ -150,7 +150,7 @@ module "alb_sg" {
 
 module "app_sg" {
   source  = "terraform-aws-modules/security-group/aws"
-  version = "~> 5.2"
+  version = "5.3.1" # exact pin (case-study reproducibility); was ~> 5.2
 
   name        = "aegis-enclave-app-sg"
   description = "Application service - accept traffic only from internal ALB"
@@ -168,7 +168,7 @@ module "app_sg" {
 
 module "rds_sg" {
   source  = "terraform-aws-modules/security-group/aws"
-  version = "~> 5.2"
+  version = "5.3.1" # exact pin (case-study reproducibility); was ~> 5.2
 
   name        = "aegis-enclave-rds-sg"
   description = "PostgreSQL - accept traffic only from app service"
@@ -187,7 +187,7 @@ module "rds_sg" {
 # ─── Database (ADR-0009: RDS PostgreSQL, multi_az = true) ──────────────────
 module "rds" {
   source  = "terraform-aws-modules/rds/aws"
-  version = "~> 6.7"
+  version = "6.13.1" # exact pin (case-study reproducibility); was ~> 6.7
 
   identifier = "aegis-enclave-pg"
 
@@ -221,7 +221,7 @@ module "rds" {
 # ─── Container registry (ECR with scan-on-push + immutable tags) ───────────
 module "ecr" {
   source  = "terraform-aws-modules/ecr/aws"
-  version = "~> 2.3"
+  version = "2.4.0" # exact pin (case-study reproducibility); was ~> 2.3
 
   repository_name                 = "aegis-enclave"
   repository_image_tag_mutability = "IMMUTABLE"
@@ -285,7 +285,7 @@ resource "aws_acm_certificate" "alb" {
 # ─── Internal load balancer (private, behind Client VPN endpoint) ──────────
 module "alb" {
   source  = "terraform-aws-modules/alb/aws"
-  version = "~> 9.9"
+  version = "9.17.0" # exact pin (case-study reproducibility); was ~> 9.9
 
   name    = "aegis-enclave-alb"
   vpc_id  = module.vpc.vpc_id
@@ -361,7 +361,9 @@ module "ecs" {
   # 'var.container_definitions will be known only after apply'.
   # See https://github.com/terraform-aws-modules/terraform-aws-ecs/issues
   # 5.11.x predates that change and accepts our standard module-output references.
-  version = "~> 5.11.0"
+  # Exact-pinned to 5.11.4 (case-study reproducibility) — registry could otherwise
+  # tag 5.11.5 with a regression and silently break the next forker apply.
+  version = "5.11.4"
 
   cluster_name = "aegis-enclave"
 
