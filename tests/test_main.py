@@ -197,7 +197,9 @@ class TestComputePrimesEndpoint:
         ],
     )
     async def test_validation_errors_return_422(
-        self, payload: dict, expected_status: int  # type: ignore[type-arg]
+        self,
+        payload: dict,
+        expected_status: int,  # type: ignore[type-arg]
     ) -> None:
         session = AsyncMock()
         with patch("prime_service.main.PrimeQueue") as MockQueue:

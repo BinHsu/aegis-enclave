@@ -31,7 +31,7 @@ dev = [
     "mypy >=1.10",
     "types-pyyaml",
     "moto[sqs] >=5.0",
-    "fakeredis >=2.26",
+    "fakeredis[lua] >=2.26",
     "boto3-stubs[sqs] >=1.34",
 ]
 

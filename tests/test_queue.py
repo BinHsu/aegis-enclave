@@ -379,8 +379,7 @@ class TestQueueEnvironmentConfig:
             mock_client_factory.assert_called_once()
             call_kwargs = mock_client_factory.call_args
             assert call_kwargs.kwargs.get("endpoint_url") == "http://localhost:9324" or (
-                len(call_kwargs.args) > 1
-                and call_kwargs.args[1] == "http://localhost:9324"
+                len(call_kwargs.args) > 1 and call_kwargs.args[1] == "http://localhost:9324"
             )
 
     def test_no_endpoint_url_when_unset(self) -> None:
