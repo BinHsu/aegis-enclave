@@ -2,7 +2,7 @@
 
 ## Scope and calibration
 
-`aegis-enclave` is calibrated as **production-shape engineering at PoC scale** (ADR-0003). The deliverable answers a case-study brief that mixes "small application" framing with "long-term, multiple developers" hygiene language; the calibration resolves that tension by holding hygiene at production grade while letting feature surface stay deliberately small. The build is hard-capped at 22 hours (originally 15h per ADR-0002, revised to 22h per ADR-0028 to accommodate HTTPS at the internal ALB, the Phase 2.3 cloud-acceptance window, async L1-L3 implementation, and distributed cache implementation) and every cut taken to fit that budget is recorded as its own ADR rather than silently omitted.
+`aegis-enclave` is calibrated as **production-shape engineering at PoC scale** (ADR-0003). The deliverable answers a case-study brief that mixes "small application" framing with "long-term, multiple developers" hygiene language; the calibration resolves that tension by holding hygiene at production grade while letting feature surface stay deliberately small. The build is hard-capped at 24 hours (originally 15h per ADR-0002, revised to 22h per ADR-0028, then to 24h per ADR-0034 to accommodate HTTPS at the internal ALB, the Phase 2.5 cloud-acceptance window, async L1-L3 implementation, distributed cache implementation, and range-coalescing L4 expansion) and every cut taken to fit that budget is recorded as its own ADR rather than silently omitted.
 
 The following operations layers are **intentionally absent**, named so the reviewer reads deliberate deferral rather than oversight:
 
@@ -106,7 +106,7 @@ The principle is captured in ADR-0018 (managed-default tool selection) — pick 
 
 Observability is named in § 1.3 as deliberately out of scope: no Prometheus, no Grafana, no Loki, no centralised collector, no APM, no OpenTelemetry. That is the **scope** statement, not the **architecture** statement. The architecture statement — what the deployed system already emits, what it cannot answer with that emission alone, and what the upgrade path looks like — is below.
 
-This section is also the **evidence-capture spec for Phase 2.3**: the table in § 3.1 is what gets screenshotted into `docs/deployment_guide.md` while the cloud-acceptance window is live, before teardown.
+This section is also the **evidence-capture spec for Phase 2.5**: the table in § 3.1 is what gets screenshotted into `docs/deployment_guide.md` while the cloud-acceptance window is live, before teardown.
 
 ### 3.1 What the cloud composition emits for free
 
@@ -120,7 +120,7 @@ Every primitive in the Terraform composition publishes a baseline of CloudWatch 
 | AWS Client VPN endpoint | `ActiveConnectionsCount`, `AuthenticationFailures`, `IngressBytes`, `EgressBytes` | Connection log: client cert CN, source IP, connect / disconnect timestamps |
 | VPC Flow Logs | (per-flow records) | All NIC-to-NIC traffic, including PrivateLink endpoint hits |
 
-Phase 2.3's cloud-acceptance gate consumes this baseline by combining four evidence sources, captured before the stack is destroyed:
+Phase 2.5's cloud-acceptance gate consumes this baseline by combining four evidence sources, captured before the stack is destroyed:
 
 1. **Aggregate metric dashboards** — ALB `RequestCount` / `TargetResponseTime` / 5xx, ECS task CPU / memory, RDS CPU / connections, Client VPN active connections. One screenshot per dashboard captures system-level health.
 2. **Per-endpoint round-trip** — manual `curl` invocations against `/health`, `POST /primes`, and `GET /executions/{id}` with request and response bodies recorded. This is the per-endpoint correctness signal.
@@ -186,11 +186,267 @@ The migration runbook (`docs/migration_runbook.md`) is the right place to record
 
 ### 3.5 Calibration recap
 
-The architecture above mirrors the calibration shape in § 1.3: name the architecture, scope the implementation, leave deferred work as designed sketches rather than absent ones. Phase 2.3 ships the infrastructure-observability layer that AWS managed services emit by default; the application-observability sketch above gives the buyer enough design clarity to scope the upgrade conversation when (or if) the workload justifies it.
+The architecture above mirrors the calibration shape in § 1.3: name the architecture, scope the implementation, leave deferred work as designed sketches rather than absent ones. Phase 2.5 ships the infrastructure-observability layer that AWS managed services emit by default; the application-observability sketch above gives the buyer enough design clarity to scope the upgrade conversation when (or if) the workload justifies it.
 
-## 4. Where to read next
+## 4. Async architecture + cost guards
 
-- **Smoke test** — [`README.md` § Initial Acceptance](../README.md#initial-acceptance-smoke-test). Five paste-and-run commands, two minutes, pass/fail visible without the candidate present.
+### 4.0 Service Specification
+
+This block is the canonical service contract. Every implementation choice in §§ 4–5 serves it.
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  PRIMES SERVICE — SERVICE CONTRACT                         │
+└────────────────────────────────────────────────────────────┘
+
+ENDPOINTS
+  POST /primes              → 202 + {execution_id, status: "queued"}
+  GET  /primes/{exec_id}    → {status, result?, error_message?}
+
+INPUT BOUNDS
+  start, end ∈ ℤ, start ≥ 2, end ≥ start, end - start ≤ 10⁷
+  out-of-bounds → 422
+
+THROUGHPUT
+  sustained:   ~20 req/sec/worker (cache-miss-bound; cache-hit ~30 req/sec)
+  peak burst:  up to (5 × worker_count) queued before back-pressure kicks
+  overload:    503 + Retry-After: 60s
+
+LATENCY (P50)
+  cache hit:                     < 100 ms
+  cache miss, range ≤ 10⁵:       < 500 ms
+  cache miss, range up to 10⁷:   up to 60 s (then status="failed")
+
+CLIENT POLLING
+  recommended interval: 1–2 s
+  status state machine: queued → running → done | failed
+
+FAILURE MODES
+  schema violation     → 422
+  queue overflow       → 503 + Retry-After
+  compute > 60 s       → status="failed", error_message captured
+  worker hang          → SIGALRM 60 s + audit failure write
+
+OPERATIONAL POSTURE
+  designed for:     bursty internal-tools (idle ~1 req/min, bursts 50–100 req/sec ≤30 s)
+  NOT designed for: sub-100 ms user-facing SLA, batch jobs > 60 s,
+                    multi-tenant isolation
+```
+
+See [ADR-0029](ADR/0029-async-post-sqs-worker-pool.md), [ADR-0031](ADR/0031-elasticache-serverless-valkey-zset-lua-coalescing.md), [ADR-0032](ADR/0032-cost-estimator-removed.md), [ADR-0033](ADR/0033-async-drain-semantics-sigalrm-sqs-redelivery.md) for the decisions behind each contract clause.
+
+### 4.1 Load profile rationale
+
+The service specification's "bursty internal-tools" framing is not a placeholder — it drives the key architectural choices:
+
+- **Burst shape: 50–100 req/sec for ≤ 30 s, then idle.** This is the pattern of operators running batch queries at the start of a work window, not sustained API traffic. The implication: peak capacity must handle the burst; steady-state cost must stay low during idle. A synchronous HTTP-compute model would require enough worker replicas to absorb the burst simultaneously — 50 requests each holding a worker for up to 30 s requires 50 replicas. A queue-decoupled model requires enough workers to drain the burst within an acceptable window — 3 workers at 1 job/60 s drains 50 messages in ~17 minutes. The service specification accepts that trade-off (polling resolves it for the client).
+- **Idle baseline: ~1 req/min.** Provisioned infrastructure at this scale is over-built at idle. ElastiCache Serverless (ADR-0031) and ECS auto-scaling (min=1, max=3) are the appropriate-complexity primitives: they cost near-zero at idle and scale to handle the burst within the ECS stabilisation window (~2–3 min).
+- **Range heterogeneity.** Internal-tools operators tend to submit queries with slightly varying boundaries over the same region (e.g., "all primes between 1M and 10M", then "1M to 8M", then "500k to 10M"). This is the exact pattern that range-coalescing (ADR-0031 § ZSET + Lua merge) is optimised for: each new boundary is absorbed into the superset cache entry rather than stored as a separate key.
+
+### 4.2 Three-layer cost guard
+
+The Phase 1 pre-flight cost estimator (ADR-0020) is removed (ADR-0032). Three independent guard layers replace it, each addressing a distinct failure mode:
+
+| Layer | Guard | Failure mode addressed | Why it suffices |
+|---|---|---|---|
+| **Schema cap** | Pydantic: `end - start ≤ 10⁷`, enforced at request ingress | Unbounded input — `(2, 10⁹)` rejected with 422 | Synchronous, no cache-state dependency, no estimation error. Stronger than the estimator for this class of input. |
+| **Backpressure** | Queue depth > `5 × worker_count` → 503 + `Retry-After: 60` | Queue saturation under sustained burst | Signals "try again in 60 s" to the client. Prevents SQS from accumulating an unbounded backlog when workers fall behind. Configurable via `backpressure_threshold_factor` env var. |
+| **Worker timeout** | SIGALRM 60 s per job → `status=failed` + `error_message` | Runaway compute within a single job | Bounds per-job wall time at the OS signal level, bypassing any Python-level cooperative-wait limitation. The audit row captures the failure for client polling. |
+
+The worst-case scenario after removing the estimator: a request that the estimator would have rejected enters the queue and times out after 60 s with `status=failed`. The client receives a structured failure response, not a connection reset. The SQS message is acknowledged — no redelivery loop. The estimator's role was to prevent this scenario; the three layers above make the scenario cheap and recoverable rather than preventing it.
+
+Why the estimator was removed rather than adapted: in the distributed-cache architecture, `_known_max` is a cluster-level property, not a per-worker value. Querying Valkey for the current high-water mark on every POST would add a network round-trip to the "cheap pre-flight check," defeating its purpose. See ADR-0032 for the full analysis.
+
+### 4.3 Worker compute budget rationale
+
+The worker compute budget is **60 s per job** (enforced by SIGALRM). The synchronous HTTP timeout (ADR-0020) was 30 s — the worker budget is double. The rationale:
+
+- **In the async model, the HTTP handler is not blocked.** The 30 s synchronous limit was set to keep the HTTP connection alive through the compute. The worker runs in a separate process with no HTTP connection to maintain. 60 s is the natural ceiling: it is the ECS task stop_timeout (70 s) minus drain headroom, and it matches the SQS visibility timeout (90 s) with a 30 s margin for write + ack overhead.
+- **Headroom over realistic compute at the schema cap.** A sieve of `[2, 10⁷]` on a Fargate 0.5 vCPU task takes approximately 3–5 s. The 60 s budget provides **12–20× headroom** over the worst-case legitimate compute at the schema ceiling. The budget fires only if a compute significantly exceeds the expected cost — i.e., a bug (infinite loop, runaway recursion) rather than a legitimate slow query.
+- **Client latency budget.** The service specification states "cache miss, range up to 10⁷: up to 60 s (then status=failed)." A client polling at 1–2 s intervals experiences at most 60 polling cycles for the worst case. This is acceptable for an internal-tools workload (operators submit a query and wait for the result, not a sub-second user-facing interaction).
+
+### 4.4 SIGALRM recovery for CPU-bound bugs
+
+SIGALRM is the worker-side guard for CPU-bound bugs. Understanding the scope of what it guards — and what it does not — is important for operating the service.
+
+**SIGALRM rescues the current job's audit record.** When SIGALRM fires, the Python `TimeoutError` propagates up through the compute call, is caught by the worker's exception handler, and triggers: `status=failed` DB write + `error_message="compute timeout"` + SQS `DeleteMessage`. The message is gone; the audit row is in a terminal `failed` state. The client polling `GET /primes/{id}` sees `status=failed` within the next polling interval.
+
+**SIGALRM does not rescue the worker process.** The worker continues running after the timeout. It catches the `TimeoutError`, writes the failure record, and loops back to the next `ReceiveMessage` call. If the bug that caused the timeout is in the prime computation and is input-dependent, the next message with the same input will timeout again. The worker is not restarted — ECS task health checks (CPU/memory) do not flag a SIGALRM event.
+
+**Queue redelivery rescues the message, not the worker.** SQS visibility timeout (90 s) redelivers the message if the worker is killed (SIGKILL, host failure, OOM). Redelivery gives the message to another worker — useful when the first worker is dead. But a CPU-bound bug that does not cause OOM does not kill the worker. The message is not redelivered while the worker is alive and processing it (even if processing takes longer than expected — the visibility timer is reset on `ReceiveMessage`). SIGALRM is therefore the only mechanism that bounds compute time per message when the worker is healthy but the compute is runaway. The memory rule `feedback_safety_guard_recovery_test.md` captures this distinction.
+
+**Practical implication:** a CPU-bound bug in `sieve()` that affects a specific input range will cause every job with that range to: (a) consume 60 s of CPU, (b) receive `status=failed`, (c) be acknowledged (no redelivery). The worker continues processing other ranges normally. This is the correct behaviour — the bug is contained to the affected range, logged in the audit table, and surfaced to the client as a structured failure. The worker does not need to be restarted to recover from it.
+
+### 4.5 Idempotency contract
+
+Worker idempotency handles the case where the same SQS message is delivered more than once (SQS at-least-once delivery):
+
+| Scenario | Worker action |
+|---|---|
+| `status = 'done'` at job start | Skip compute. ACK the message. (Duplicate delivery; result already committed.) |
+| `status = 'running'` AND `started_at` > 90 s ago | Mark `status=failed`, `error_message="stale running: presumed dead"`. Then proceed as if `queued`. (Previous worker died mid-job without writing `failed`; visibility timeout expired and redelivered.) |
+| `status = 'running'` AND `started_at` ≤ 90 s ago | Do NOT proceed. ACK the message. (Another worker is currently processing this job — this is a duplicate delivery within the visibility window; the active worker will write the result.) |
+| `status = 'queued'` | Set `status=running`, `started_at=now`. Proceed with compute. |
+| `status = 'failed'` | Skip compute. ACK the message. (A previous attempt already failed; client should read `error_message`.) |
+
+The 90 s stale threshold matches the SQS visibility timeout — a `running` row older than 90 s means the worker that set it either died (visibility expired, message redelivered) or is in a runaway state (should have hit SIGALRM by now). In either case, treating the row as stale and re-running the job is the correct recovery action.
+
+### 4.6 L5 deferred
+
+The following capabilities are named but deferred to a future phase. Naming them prevents the reviewer from reading their absence as oversight.
+
+- **Cancellation API** (`DELETE /primes/{id}` or `POST /primes/{id}/cancel`) — requires SQS message deletion by message ID, which needs a separate index of SQS receipt handles. Not in the PoC.
+- **Dead-letter queue (DLQ) retry policy** — the Terraform composition includes a skeletal DLQ resource but does not wire automatic retry. A production deployment would set `maxReceiveCount` and configure a DLQ alarm.
+- **Per-user quota** — all operators share the same queue and backpressure threshold. Multi-tenant isolation (per-user limits, separate queues per tenant) requires a routing layer.
+- **Pagination for `result` when cap > 10⁷** — the schema cap keeps response size below ~7 MB raw (~1.5–2 MB gzipped). If the cap is raised, pagination is required; the current `GZipMiddleware` is not a substitute.
+- **Multi-tier queue** (priority queue, separate queues per range size) — the single queue treats all jobs equally. A priority queue would drain small cache-hit jobs faster than large compute-miss jobs.
+
+## 5. Cache distribution
+
+### 5.1 Multi-Fargate-task cache sharing motivation
+
+The Phase 1 per-worker cache (`_known_primes` in `primes.py`) warmed independently on each ECS task. With the async worker pool (ADR-0029, min=1 / max=3 tasks), cache hits are not shared across tasks. Concrete cost: Task A computes `[2, 10_000_000]` after a cache miss, taking ~3–5 s on 0.5 vCPU. Task B receives `[1_000_000, 5_000_000]` — a strict subset already computed by Task A — and repeats the compute from scratch.
+
+The distributed cache solves this by giving all workers a shared hit pool. The hit pool persists across ECS task lifecycle events (scale-in, rolling deploy, Spot eviction) — the cache is not lost when the worker that computed a range is replaced. This is the architectural motivation for a network cache at all: without cross-task sharing, the per-worker LRU already provides adequate hit rates for a single-task deployment.
+
+### 5.2 Valkey Serverless choice
+
+ElastiCache Serverless Valkey (ADR-0031) is the cache backend. The full alternatives analysis is in ADR-0031; this section summarises the cost framing for the acceptance window.
+
+**Cost framing (3h apply-then-destroy):**
+
+| Option | 3h window cost estimate | Notes |
+|---|---|---|
+| ElastiCache Serverless Valkey | < $0.10 | ECPU-seconds billed on actual usage; data storage billed per GB-hour (< 1 MB stored) |
+| ElastiCache provisioned (`cache.t3.micro`) | ~$0.05 | $0.017/hr × 3h; plus must be explicitly created and destroyed |
+| Amazon MemoryDB (provisioned, `db.t4g.small`) | ~$0.12 | ~$0.04/hr × 3h; durable writes unnecessary for a cache workload |
+| DynamoDB on-demand | ~$0.01 | Read/write unit pricing; cheap but lacks ZSET overlap semantics |
+
+For the 3-hour acceptance window, cost differences are negligible. The decision driver is feature fit: ZSET + Lua atomicity for range-coalescing (ADR-0031) are native to Valkey and unavailable in DynamoDB without substantial workarounds. Serverless is the right operational shape for a PoC acceptance window (no cluster provisioning, scales to zero, one-line Terraform resource).
+
+### 5.3 ZSET key design and range-coalescing
+
+The ZSET schema stores known prime ranges as a sorted index:
+
+- **Index key:** `primes:{ranges}` — sorted set, member format `{start}:{end}`, score = `start`. The `{ranges}` hash tag keeps all related keys on a single Valkey shard (required for Lua atomicity).
+- **Data keys:** `primes:{ranges}:range:{start}:{end}` — string key holding the JSON-encoded prime list for the range `[start, end]`.
+- **TTL policy:** bootstrap entry (range `1:100000`) has no expiry. User-driven entries expire after 6 h. Merged entries inherit `max(ttl_a, ttl_b)` or reset to 6 h if both inputs expired.
+
+**Lookup path:**
+
+```
+ZRANGEBYSCORE primes:{ranges} 0 {request_end}
+  → candidate_members whose score (= start) ≤ request_end
+  → filter: member.end ≥ request_start  (overlap condition)
+  → if any member covers [request_start, request_end] fully → slice result list
+  → else: fall through to compute
+```
+
+**Lua merge script (outline):**
+
+```lua
+-- KEYS[1] = 'primes:{ranges}' (ZSET index)
+-- ARGV[1] = new_start, ARGV[2] = new_end, ARGV[3] = new_primes_json, ARGV[4] = ttl_seconds
+local zkey = KEYS[1]
+local new_start = tonumber(ARGV[1])
+local new_end   = tonumber(ARGV[2])
+
+-- 1. Find all overlapping or adjacent ranges
+local candidates = redis.call('ZRANGEBYSCORE', zkey, 0, new_end)
+local to_merge = {}
+for _, member in ipairs(candidates) do
+    local s, e = member:match('^(%d+):(%d+)$')
+    if tonumber(e) >= new_start then
+        table.insert(to_merge, {start=tonumber(s), end_=tonumber(e), member=member})
+    end
+end
+
+-- 2. Compute merged bounds
+local merged_start = new_start
+local merged_end   = new_end
+for _, r in ipairs(to_merge) do
+    merged_start = math.min(merged_start, r.start)
+    merged_end   = math.max(merged_end, r.end_)
+end
+
+-- 3. Delete originals + write coalesced entry
+for _, r in ipairs(to_merge) do
+    redis.call('ZREM', zkey, r.member)
+    redis.call('DEL', 'primes:{ranges}:range:' .. r.member)
+end
+local merged_key = 'primes:{ranges}:range:' .. merged_start .. ':' .. merged_end
+redis.call('ZADD', zkey, merged_start, merged_start .. ':' .. merged_end)
+redis.call('SET', merged_key, ARGV[3])  -- caller computes merged prime list before calling Lua
+redis.call('EXPIRE', merged_key, tonumber(ARGV[4]))
+return 1
+```
+
+The caller (worker) computes the merged prime list (union of all candidate lists + new primes, deduplicated and sorted) before invoking the Lua script. The Lua script handles only the atomic ZSET and data-key manipulation. This split keeps the Lua script minimal while preserving atomicity for the storage operations.
+
+### 5.4 Bootstrap pattern
+
+The bootstrap task (`python -m prime_service.bootstrap`) is a one-shot ECS Fargate task triggered by Terraform:
+
+```hcl
+resource "null_resource" "run_cache_bootstrap" {
+  triggers = {
+    valkey_endpoint = aws_elasticache_serverless_cache.valkey.endpoint[0].address
+    task_def_arn    = aws_ecs_task_definition.cache_bootstrap.arn
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      aws ecs run-task \
+        --cluster ${aws_ecs_cluster.main.name} \
+        --task-definition ${aws_ecs_task_definition.cache_bootstrap.arn} \
+        --launch-type FARGATE \
+        --network-configuration '{...}'
+    EOT
+  }
+
+  depends_on = [
+    aws_elasticache_serverless_cache.valkey,
+    aws_ecs_task_definition.cache_bootstrap
+  ]
+}
+```
+
+The bootstrap task logic:
+
+1. Check `EXISTS primes:{ranges}:range:1:100000` → if `1`, exit 0 (idempotent; already seeded).
+2. Compute `sieve(1, 100_000)` (~9,592 primes, ~5–15 ms).
+3. Call `cache.put_if_absent("primes:{ranges}:range:1:100000", primes_json)` — uses `SET NX` (no overwrite; safe for concurrent bootstrap calls on redeploy).
+4. Log success (or skip) clearly for CloudWatch evidence.
+
+The bootstrap entry has **no TTL** — it is the permanent warm-up baseline. Every request whose range is a subset of `[1, 100,000]` is a cache hit from first user request onward.
+
+In the Docker Compose stack, the bootstrap service runs with `profiles: ["bootstrap"]` so `docker compose up` does not start it automatically. The smoke test step invokes it once:
+
+```bash
+docker compose run --rm bootstrap
+```
+
+### 5.5 Lazy population and L5 deferred
+
+**Lazy population (write-on-compute):**
+
+After every cache miss + successful compute, the worker writes the result to Valkey via the Lua merge script. The next request for the same or overlapping range finds the entry and returns from cache. This is the read-through / write-on-miss pattern: no separate cache-warming job is needed for user-driven ranges; the cache fills organically as requests arrive.
+
+**Merge cost vs. split:**
+
+The Lua merge is O(k) in the number of overlapping cache entries it merges, plus the prime-list union operation (O(n log n) sort for the merged list). For realistic internal-tools traffic (dozens to hundreds of distinct range requests), k ≤ 10 in practice. If traffic drives the ZSET member count into the thousands (e.g., a systematic sweep of non-overlapping ranges), the merge cost per write grows. Monitoring `ElastiCacheProcessingUnits` per request in the Phase 2.5 acceptance window gives the signal to decide whether the merge-on-write pattern remains appropriate or whether a separate compaction job (L5 deferred) is warranted.
+
+**L5 deferred cache enhancements:**
+
+- **Read-through TTL refresh** — reset TTL on every read so hot entries don't expire while in use.
+- **Multi-tier cache** — in-process LRU for ultra-hot entries (< 10 ms) backed by Valkey for cross-worker sharing. Adds complexity; worth considering if Valkey round-trip latency (~2–5 ms) is measurable in the p99 budget.
+- **Alternative eviction policies** — LFU (Redis `allkeys-lfu`) for skewed hot-cold distributions. Not configurable on ElastiCache Serverless; relevant if migrating to provisioned.
+- **Range query strategies** — for cap > 10⁷, a trie or segment tree index over the ZSET could reduce the ZRANGEBYSCORE scan cost. Not needed at current scale.
+- **Cache backend revisit** — if merge cost grows (high distinct-range traffic), consider a Postgres `prime_cache` table with a GiST range index or a purpose-built segment cache. The `cache.py` abstraction is the extension point; the decision ADR (0031) records the trigger conditions.
+
+## 6. Where to read next
+
+- **Smoke test** — [`README.md` § Initial Acceptance](../README.md#initial-acceptance-smoke-test). Six paste-and-run commands (includes cache-hit and backpressure steps), two minutes, pass/fail visible without the candidate present.
 - **Cloud deployment walkthrough** — [`docs/deployment_guide.md`](deployment_guide.md). Architecture diagram, component table, network flow, plan-only Terraform usage.
 - **Cross-cloud migration spec** — [`docs/migration_runbook.md`](migration_runbook.md) (Phase 2). Agent-executable runbook with service-mapping table at the top; spec is invariant across destinations.
 - **Single-region → multi-region** — [`docs/scaling_runbook.md`](scaling_runbook.md) (Phase 2). Same agent-executable schema, second axis of extension.
