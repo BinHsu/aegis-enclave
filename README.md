@@ -324,13 +324,12 @@ This gate exercises the **deployment-architecture VPN** (AWS Client VPN endpoint
 ```
 
 ```bash
-# Pre-req (operator-side, one-time): AWS account, SSO configured, AWS_PROFILE exported,
-# Docker Desktop running, terraform + aws CLI installed.
-# IAM perms required (per docs/iam-permissions.md): PowerUserAccess + IAM-scoped
-# for the apply path; tier-1 read-only for tfvars-init / smoke / evidence / verify.
-aws sso login --sso-session <name>          # SSO recommended (cloud-up auto-refreshes if expired)
-export AWS_PROFILE=<sso-profile>            # long-term keys also work — see iam-permissions.md
-aws sts get-caller-identity                 # verify
+# Pre-req (one-time): AWS account + SSO (or long-term keys), Docker Desktop running,
+# terraform + aws CLI installed. IAM perms per docs/iam-permissions.md (tier 2 for
+# apply, tier 1 for validation-only paths).
+#
+# That's it. cloud-up prompts for AWS_PROFILE if unset and auto-triggers
+# 'aws sso login' when the SSO token has expired — no manual login / export needed.
 
 # Phase 2.5 deploy — one-shot orchestrator (cert + ECR + image push + apply):
 make cloud-up   # ~15-20 min; idempotent if cert-arns.auto.tfvars already exists
