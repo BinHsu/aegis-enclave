@@ -185,10 +185,34 @@ aws ecr get-login-password --region "$REGION" | \
     docker login --username AWS --password-stdin "$ECR_URL" >/dev/null
 ok "Docker logged in to $ECR_URL"
 
-info "Building image (--platform linux/amd64 for Fargate x86_64 default)"
-(cd "$REPO_ROOT" && docker build --platform linux/amd64 -t "$ECR_URL:latest" .)
+info "Building image (--platform linux/amd64 for Fargate; --provenance=false for deterministic digest)"
+# --provenance=false + --sbom=false: BuildKit attestation embeds build-time
+# provenance (timestamps, git sha) into the manifest list, making same-content
+# rebuilds produce different digests → ECR IMMUTABLE tag rejects subsequent
+# push. Disabling them makes the manifest deterministic for cached layers.
+(cd "$REPO_ROOT" && docker build --platform linux/amd64 --provenance=false --sbom=false -t "$ECR_URL:latest" .)
+
 info "Pushing image"
-docker push "$ECR_URL:latest" >/dev/null
+PUSH_RC=0
+PUSH_RAW=$(docker push "$ECR_URL:latest" 2>&1) || PUSH_RC=$?
+if [[ "$PUSH_RC" -ne 0 ]]; then
+    if echo "$PUSH_RAW" | grep -qiE 'tag.*already exists.*immutable|cannot be overwritten'; then
+        printf "\n--- docker push hit IMMUTABLE tag conflict ---\n%s\n--- end ---\n" "$PUSH_RAW" >&2
+        printf "\nECR repository is IMMUTABLE (per main.tf module.ecr). The :latest tag\n" >&2
+        printf "exists in ECR with a DIFFERENT manifest digest than what we just built.\n" >&2
+        printf "Recovery options:\n" >&2
+        printf "  1. Drop existing tag (this will not affect anything else in the repo):\n" >&2
+        printf "       aws ecr batch-delete-image --region %s --repository-name aegis-enclave \\\\\n         --image-ids imageTag=latest\n" "$REGION" >&2
+        printf "     then re-run 'make cloud-up'\n" >&2
+        printf "  2. If terraform apply has already run, use 'make cloud-down' (full teardown)\n" >&2
+        printf "  3. Permanently switch to MUTABLE tags: edit terraform/main.tf module.ecr,\n" >&2
+        printf "     set repository_image_tag_mutability = \"MUTABLE\" (lower prod-shape signal)\n" >&2
+        fail "ECR push blocked by IMMUTABLE policy"
+    else
+        printf "\n--- docker push failed ---\n%s\n--- end ---\n" "$PUSH_RAW" >&2
+        fail "ECR push failed for unexpected reason"
+    fi
+fi
 ok "Image pushed: $ECR_URL:latest"
 
 # ─── Phase 3: Full terraform apply ─────────────────────────────────────────
