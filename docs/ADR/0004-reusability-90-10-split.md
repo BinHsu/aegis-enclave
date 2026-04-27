@@ -24,7 +24,7 @@ Structure the repo so **~90 % is generic (committed)** and **~10 % is buyer-spec
 - `case_study/*.pdf` — copyrighted source brief
 - `strategy.md` — current cycle's time budget, cuts, mitigation
 
-The split is enforced by `.gitignore` and by `CLAUDE.md` § 6 (no company name, address, person, or buyer-specific framing in committed files, period).
+The split is enforced by `.gitignore` and by `CLAUDE.md` § 5 (no company name, address, person, or buyer-specific framing in committed files, period).
 
 ## Alternatives Considered
 
@@ -38,7 +38,7 @@ The split is enforced by `.gitignore` and by `CLAUDE.md` § 6 (no company name, 
 - Per-cycle setup time drops to ~30–60 min for V2/V3 (refresh gitignored files; tweak narrative analogies in the design doc only where carefully scoped).
 - Committed history stays clean for eventual public release.
 - Pre-public-ise verification: `git log -p | grep -i <buyer-name>` should return nothing. If it does, the leak gets stripped before flipping public.
-- Discipline burden: every commit must filter out buyer language. Enforced by `CLAUDE.md` § 6 and by the commit-hygiene checklist.
+- Discipline burden: every commit must filter out buyer language. Enforced by `CLAUDE.md` § 5 and by the commit-hygiene checklist.
 - The 10 % top layer is a one-shot artifact per cycle — no investment in it carries forward except as a reusable shape (cover-note structure, steps-file headings).
 - Reuse compounds: each cycle's ADRs become permanent assets, the engineering core hardens, only the framing layer churns.
 
