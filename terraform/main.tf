@@ -187,7 +187,7 @@ module "rds_sg" {
 # ─── Database (ADR-0009: RDS PostgreSQL, multi_az = true) ──────────────────
 module "rds" {
   source  = "terraform-aws-modules/rds/aws"
-  version = "6.13.1" # exact pin (case-study reproducibility); was ~> 6.7
+  version = "7.2.0" # exact pin (case-study reproducibility); was ~> 6.7
 
   identifier = "aegis-enclave-pg"
 
