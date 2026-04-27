@@ -30,6 +30,12 @@ from prime_service.primes import _build_prime_table
 
 structlog.configure(
     processors=[
+        # Symmetry with main.py + worker.py: merge contextvars-bound fields
+        # (request_id, execution_id, etc.) into every log line. bootstrap is
+        # a one-shot lifecycle task with no per-request context to bind today,
+        # but the consistent processor chain means future contextvars work
+        # without each module needing a re-config.
+        structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.JSONRenderer(),

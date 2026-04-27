@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from typing import Any
@@ -54,9 +56,15 @@ _BACKPRESSURE_FACTOR = int(os.environ.get("BACKPRESSURE_FACTOR", "5"))
 _WORKER_COUNT = int(os.environ.get("WORKER_COUNT", "1"))
 _BACKPRESSURE_THRESHOLD = _BACKPRESSURE_FACTOR * _WORKER_COUNT
 
-# Structured JSON logging
+# Structured JSON logging.
+# `merge_contextvars` pulls contextvars (set by the request_id middleware
+# below) into every log line emitted in the request scope — so request_id
+# attaches to ALL logs from a request, not just the middleware's own emit.
+# This is the basic-tier substitute for OpenTelemetry trace_id propagation
+# (no APM stack in case-study scope per design_doc § 3).
 structlog.configure(
     processors=[
+        structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.JSONRenderer(),
@@ -84,6 +92,41 @@ app = FastAPI(
 )
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+# ─── Request-ID middleware (correlation across logs within a request) ────────
+# Every HTTP request gets a UUID4 bound into structlog contextvars so all
+# subsequent log lines emitted while handling that request automatically
+# include `request_id`. Also returned to the client via X-Request-ID header
+# for client-side correlation. This handles the cases that execution_id
+# can't cover: 422 validation rejections, 503 backpressure rejections, and
+# any failure before insert_queued_execution assigns an execution_id.
+
+
+@app.middleware("http")
+async def request_id_middleware(
+    request: Request,
+    call_next: Callable[[Request], Coroutine[Any, Any, Response]],
+) -> Response:
+    """Bind a UUID4 request_id into structlog contextvars + emit start/end events."""
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    structlog.contextvars.bind_contextvars(request_id=request_id)
+    started = time.perf_counter()
+    log.info("request_received", method=request.method, path=request.url.path)
+    try:
+        response = await call_next(request)
+    finally:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+    log.info(
+        "request_completed",
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        duration_ms=duration_ms,
+    )
+    response.headers["X-Request-ID"] = request_id
+    structlog.contextvars.clear_contextvars()
+    return response
 
 
 # ─── Backpressure middleware ──────────────────────────────────────────────────
@@ -156,16 +199,21 @@ async def compute_primes(
             detail="audit log unavailable",
         ) from exc
 
+    # Bind execution_id into contextvars — all subsequent logs in this request
+    # auto-include it via the merge_contextvars processor. Avoids the
+    # forget-to-pass-execution_id bug class on new log lines.
+    structlog.contextvars.bind_contextvars(execution_id=execution_id)
+
     try:
         queue = PrimeQueue()
         queue.enqueue(execution_id=execution_id, start=req.start, end=req.end)
     except Exception as exc:  # noqa: BLE001
-        log.error("enqueue_failed", execution_id=execution_id, error=str(exc))
+        log.error("enqueue_failed", error=str(exc))
         # Queue is unavailable — still return 202 so the client can poll.
         # The worker will pick up the job when the queue recovers (or the
         # operator can manually re-enqueue). The audit row exists as the record.
 
-    log.info("job_queued", execution_id=execution_id, start=req.start, end=req.end)
+    log.info("job_queued", start=req.start, end=req.end)
     return PrimeRangeResponse(execution_id=execution_id, status=Status.queued)
 
 
@@ -175,12 +223,15 @@ async def get_primes_result(
     session: AsyncSession = Depends(get_session),
 ) -> ExecutionResponse:
     """Return the current state of a queued prime-computation job."""
+    structlog.contextvars.bind_contextvars(execution_id=execution_id)
     row: Execution | None = await get_execution(session, execution_id)
     if row is None:
+        log.info("job_query_not_found")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"execution {execution_id} not found",
         )
+    log.info("job_query", status=row.status)
     return ExecutionResponse(
         id=row.id,
         status=Status(row.status),
@@ -195,12 +246,15 @@ async def fetch_execution(
     session: AsyncSession = Depends(get_session),
 ) -> dict:  # type: ignore[type-arg]
     """Legacy: return raw execution audit detail by id."""
+    structlog.contextvars.bind_contextvars(execution_id=execution_id)
     row = await get_execution(session, execution_id)
     if row is None:
+        log.info("execution_query_not_found")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"execution {execution_id} not found",
         )
+    log.info("execution_query", status=row.status)
     return {
         "id": row.id,
         "range_start": row.range_start,
