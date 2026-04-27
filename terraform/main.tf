@@ -420,10 +420,29 @@ module "ecs" {
           # uvicorn drops it, and ECS waits another 15s before SIGKILL.
           stop_timeout = 60
 
+          # Explicit log_configuration mirroring worker / bootstrap pattern.
+          # Without this, terraform-aws-modules/ecs auto-creates a log group
+          # with retention_in_days=null (never-expire) — a slow cost leak for
+          # forkers running long-term. 7-day retention matches our other
+          # task definitions and the case-study cycle window.
+          logConfiguration = {
+            logDriver = "awslogs"
+            options = {
+              "awslogs-group"         = "/ecs/aegis-enclave-app"
+              "awslogs-region"        = var.region
+              "awslogs-stream-prefix" = "app"
+            }
+          }
+
           readonly_root_filesystem = false # FastAPI/uvicorn writes to tmpdir
           essential                = true
         }
       }
+
+      # Disable the module's auto-created log group so our explicit one above
+      # is the canonical destination (avoids drift between two log groups for
+      # the same service).
+      create_cloudwatch_log_group = false
 
       load_balancer = {
         service = {
@@ -816,6 +835,14 @@ resource "aws_ecs_task_definition" "worker" {
 # CloudWatch log group for the worker.
 resource "aws_cloudwatch_log_group" "worker" {
   name              = "/ecs/aegis-enclave-worker"
+  retention_in_days = 7
+}
+
+# CloudWatch log group for the FastAPI app container.
+# Explicit (rather than module-auto) so retention is set to 7 days — module
+# default is never-expire which is a slow cost leak on long-running deployments.
+resource "aws_cloudwatch_log_group" "app" {
+  name              = "/ecs/aegis-enclave-app"
   retention_in_days = 7
 }
 

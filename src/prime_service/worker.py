@@ -40,6 +40,11 @@ from prime_service.schemas import Status
 
 structlog.configure(
     processors=[
+        # merge_contextvars pulls vars bound via structlog.contextvars
+        # into every log line. handle_message() binds execution_id at entry
+        # and clears at exit so all 12+ log calls inside auto-include it
+        # without each having to pass execution_id=execution_id manually.
+        structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.JSONRenderer(),
@@ -145,97 +150,95 @@ def handle_message(
     start: int = int(body["start"])
     end: int = int(body["end"])
 
-    log.info("message_received", execution_id=execution_id, start=start, end=end)
-
-    # ── Idempotency check ──
-    row: Execution | None = _run_async(_get_exec(execution_id))  # type: ignore[assignment]
-
-    if row is None:
-        # Row missing — ack and skip (orphaned message)
-        log.warning("execution_not_found", execution_id=execution_id)
-        queue.ack(message)
-        return
-
-    if row.status == Status.done.value:
-        log.info("already_done", execution_id=execution_id)
-        queue.ack(message)
-        return
-
-    if row.status == Status.running.value:
-        # Check if stale (prior worker crashed)
-        if row.started_at is not None:
-            age_s = (datetime.now(UTC) - row.started_at).total_seconds()
-            if age_s <= _RUNNING_STALE_THRESHOLD_S:
-                # Another worker is actively computing — skip without ack.
-                # SQS visibility timeout will re-deliver if that worker dies.
-                log.info("running_not_stale", execution_id=execution_id, age_s=age_s)
-                return
-        # Stale running: mark failed, then fall through to fresh compute.
-        log.warning("running_stale", execution_id=execution_id)
-        _run_async(_mark_failed(execution_id, "stale running — prior worker crash"))
-
-    # ── Mark running ──
-    _run_async(_mark_running(execution_id))
-    started = time.perf_counter()
-
-    # ── Cache-first: try to serve from Valkey ──
+    # Bind execution_id into contextvars so every log line in this function
+    # auto-includes it via merge_contextvars processor. clear in finally so
+    # the next message's binding starts clean even if this message raises
+    # past the per-exception ack/return paths.
+    structlog.contextvars.bind_contextvars(execution_id=execution_id)
     try:
-        cached = cache.get_covering_slice(start, end)
-        if cached is not None:
-            duration_ms = int((time.perf_counter() - started) * 1000)
-            _run_async(_mark_done(execution_id, cached, duration_ms))
+        log.info("message_received", start=start, end=end)
+
+        # ── Idempotency check ──
+        row: Execution | None = _run_async(_get_exec(execution_id))  # type: ignore[assignment]
+
+        if row is None:
+            # Row missing — ack and skip (orphaned message)
+            log.warning("execution_not_found")
             queue.ack(message)
-            log.info(
-                "cache_hit",
-                execution_id=execution_id,
-                count=len(cached),
-                duration_ms=duration_ms,
-            )
             return
-    except Exception as exc:  # noqa: BLE001
-        log.warning("cache_lookup_error", execution_id=execution_id, error=str(exc))
-        # Cache errors are non-fatal; fall through to compute.
 
-    # ── Compute (SIGALRM 60s hard deadline) ──
-    try:
-        primes = sieve_with_timeout(start, end)
-    except TimeoutError as exc:
-        err = f"compute exceeded 60s SIGALRM budget: {exc}"
-        log.error("compute_timeout", execution_id=execution_id, error=err)
-        _run_async(_mark_failed(execution_id, err))
+        if row.status == Status.done.value:
+            log.info("already_done")
+            queue.ack(message)
+            return
+
+        if row.status == Status.running.value:
+            # Check if stale (prior worker crashed)
+            if row.started_at is not None:
+                age_s = (datetime.now(UTC) - row.started_at).total_seconds()
+                if age_s <= _RUNNING_STALE_THRESHOLD_S:
+                    # Another worker is actively computing — skip without ack.
+                    # SQS visibility timeout will re-deliver if that worker dies.
+                    log.info("running_not_stale", age_s=age_s)
+                    return
+            # Stale running: mark failed, then fall through to fresh compute.
+            log.warning("running_stale")
+            _run_async(_mark_failed(execution_id, "stale running — prior worker crash"))
+
+        # ── Mark running ──
+        _run_async(_mark_running(execution_id))
+        started = time.perf_counter()
+
+        # ── Cache-first: try to serve from Valkey ──
+        try:
+            cached = cache.get_covering_slice(start, end)
+            if cached is not None:
+                duration_ms = int((time.perf_counter() - started) * 1000)
+                _run_async(_mark_done(execution_id, cached, duration_ms))
+                queue.ack(message)
+                log.info("cache_hit", count=len(cached), duration_ms=duration_ms)
+                return
+        except Exception as exc:  # noqa: BLE001
+            log.warning("cache_lookup_error", error=str(exc))
+            # Cache errors are non-fatal; fall through to compute.
+
+        # ── Compute (SIGALRM 60s hard deadline) ──
+        try:
+            primes = sieve_with_timeout(start, end)
+        except TimeoutError as exc:
+            err = f"compute exceeded 60s SIGALRM budget: {exc}"
+            log.error("compute_timeout", error=err)
+            _run_async(_mark_failed(execution_id, err))
+            queue.ack(message)
+            return
+        except ValueError as exc:
+            err = f"validation error: {exc}"
+            log.error("compute_validation_error", error=err)
+            _run_async(_mark_failed(execution_id, err))
+            queue.ack(message)
+            return
+        except Exception as exc:  # noqa: BLE001
+            err = f"unexpected error: {type(exc).__name__}: {exc}"
+            log.error("compute_error", error=err)
+            _run_async(_mark_failed(execution_id, err))
+            queue.ack(message)
+            return
+
+        duration_ms = int((time.perf_counter() - started) * 1000)
+
+        # ── Write to cache (range-coalescing via Lua) ──
+        try:
+            cache.merge_or_put(start, end, primes)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("cache_write_error", error=str(exc))
+            # Cache write errors are non-fatal; result is still persisted to DB.
+
+        # ── Update audit record ──
+        _run_async(_mark_done(execution_id, primes, duration_ms))
         queue.ack(message)
-        return
-    except ValueError as exc:
-        err = f"validation error: {exc}"
-        log.error("compute_validation_error", execution_id=execution_id, error=err)
-        _run_async(_mark_failed(execution_id, err))
-        queue.ack(message)
-        return
-    except Exception as exc:  # noqa: BLE001
-        err = f"unexpected error: {type(exc).__name__}: {exc}"
-        log.error("compute_error", execution_id=execution_id, error=err)
-        _run_async(_mark_failed(execution_id, err))
-        queue.ack(message)
-        return
-
-    duration_ms = int((time.perf_counter() - started) * 1000)
-
-    # ── Write to cache (range-coalescing via Lua) ──
-    try:
-        cache.merge_or_put(start, end, primes)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("cache_write_error", execution_id=execution_id, error=str(exc))
-        # Cache write errors are non-fatal; result is still persisted to DB.
-
-    # ── Update audit record ──
-    _run_async(_mark_done(execution_id, primes, duration_ms))
-    queue.ack(message)
-    log.info(
-        "compute_done",
-        execution_id=execution_id,
-        count=len(primes),
-        duration_ms=duration_ms,
-    )
+        log.info("compute_done", count=len(primes), duration_ms=duration_ms)
+    finally:
+        structlog.contextvars.clear_contextvars()
 
 
 # ─── Main consumer loop ───────────────────────────────────────────────────────
