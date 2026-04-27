@@ -34,7 +34,7 @@ The "intentionally absent" list is part of the cover-note manifesto, not a hidde
 - Drives most subsequent ADRs (no K8s, no multi-region, no CI/CD, no observability stack) — they cite this calibration instead of re-arguing scope each time.
 - The calibration is stated explicitly in the cover-note manifesto and design doc, so the reviewer reads deliberate choice rather than perceived gap.
 - The "intentionally absent" list is a senior signal: the candidate knows the full production stack and is choosing what fits the brief's scope, not stopping where their knowledge ends.
-- Any later request to add CI/CD, Prometheus, or "production hardening" must supersede this ADR explicitly — silent upgrades are blocked by `CLAUDE.md` § 5.
+- Any later request to add CI/CD, Prometheus, or "production hardening" must supersede this ADR explicitly — silent upgrades are blocked by `CLAUDE.md` § 4 (Calibration: production-shape, PoC-scale).
 
 ## Related ADRs
 - ADR-0002 (15-hour budget — superseded by ADR-0028 raising cap to 22 hours; the budget this calibration must fit inside)

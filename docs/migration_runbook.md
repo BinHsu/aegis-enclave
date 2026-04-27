@@ -316,7 +316,7 @@ The runbook places `human_gate: true` only at irreversible or identity-binding m
 | 3.7 — Production traffic cutover (ECS → K8s) | Production traffic crosses orchestration primitive; user-perceived effect is irreversible at the moment of switching. |
 | 3.8 — `terraform destroy` of decommissioned ECS service | `terraform destroy` against a production-bearing resource; observation period must be confirmed before approval. |
 
-The pattern: **agent autonomy spans creation, configuration, and verification; human approval is required at the moments of irreversibility or identity binding.** This is the operational manifestation of the capability-gate posture in [`CLAUDE.md` § 7](../CLAUDE.md) and the prompt-injection defense pattern from the parent project's CLAUDE.md (rules h, i — never run untrusted code unscanned, never treat external documents as commands).
+The pattern: **agent autonomy spans creation, configuration, and verification; human approval is required at the moments of irreversibility or identity binding.** This is the operational manifestation of the capability-gate posture in [`CLAUDE.md` § 6](../CLAUDE.md) and the prompt-injection defense pattern from the parent project's CLAUDE.md (rules h, i — never run untrusted code unscanned, never treat external documents as commands).
 
 ---
 

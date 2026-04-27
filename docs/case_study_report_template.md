@@ -31,7 +31,7 @@
                 -V colorlinks=true
     4. Attach the .pdf (NOT the .md) to the cycle-close email.
 
-  RECIPIENT-FRAMING RULES (CLAUDE.md § 6)
+  RECIPIENT-FRAMING RULES (CLAUDE.md § 5 — Company-specific content rule)
     - The recipient-named .md is matched by .gitignore's `report_*.md`
       and never committed; the rendered .pdf is matched by .gitignore's
       repo-wide `*.pdf` rule (originally there for source case-study

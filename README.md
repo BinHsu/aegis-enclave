@@ -93,7 +93,7 @@ Files marked **gitignored** in [CLAUDE.md § 2](CLAUDE.md#2-files-and-their-role
 
 **Three-axis hygiene at a glance:**
 - **GitOps** — `Makefile` declares all ops targets (`make help`); Terraform is the cloud's git-as-truth (community modules in `terraform/`)
-- **DevSecOps** — `SECURITY.md` (disclosure), `.pre-commit-config.yaml` (gitleaks + ruff + terraform fmt at commit-time, full pytest gate at pre-push), `.github/workflows/ci.yml` (lint + pytest on every push and PR), `.github/dependabot.yml` (weekly automated updates), capability gates for AI agents in [`CLAUDE.md` § 7](CLAUDE.md#7-capability-gates-for-ai-agent-driven-work)
+- **DevSecOps** — `SECURITY.md` (disclosure), `.pre-commit-config.yaml` (gitleaks + ruff + terraform fmt at commit-time, full pytest gate at pre-push), `.github/workflows/ci.yml` (lint + pytest on every push and PR), `.github/dependabot.yml` (weekly automated updates), capability gates for AI agents in [`CLAUDE.md` § 6](CLAUDE.md#6-capability-gates-for-ai-agent-driven-work)
 - **FinOps (scope: cost attribution + per-hour cost estimate only)** — `terraform/main.tf` provider block declares `default_tags` (Project / Environment / CostCenter / Owner) so every resource is queryable via Cost Explorer. Per-hour cost estimate at eu-central-1 list price is the table below. Cost analysis recorded in [ADR-0006](docs/ADR/0006-vpn-three-tier-story.md) and [ADR-0015](docs/ADR/0015-no-k8s-no-real-apply.md). **NOT included**: `aws_budgets_budget` cap, AWS Cost Anomaly Detection, automated chargeback. These are forker-add items in [`docs/deployment_guide.md` § Production hardening checklist](docs/deployment_guide.md#production-hardening-checklist).
 
 ### Hourly cost (eu-central-1 list price, April 2026)
@@ -519,7 +519,7 @@ Evidence is captured per [`docs/design_doc.md` § 3 (Observability posture)](doc
 
 ## Delivery Phases
 
-The deliverable is staged into numbered phases (decimals allowed for sub-progress). Phase 1 fulfils the case-study brief; Phase 2 is forward-looking extension paths shaped as the same agent-executable spec format; Phase 3 is submission. Phase numbering rules are in [`CLAUDE.md` § 9](CLAUDE.md#9-commit-and-push-hygiene).
+The deliverable is staged into numbered phases (decimals allowed for sub-progress). Phase 1 fulfils the case-study brief; Phase 2 is forward-looking extension paths shaped as the same agent-executable spec format; Phase 3 is submission. The table below is the canonical record of where the project stands.
 
 | Phase | State | Scope | Key artifacts |
 |---|---|---|---|

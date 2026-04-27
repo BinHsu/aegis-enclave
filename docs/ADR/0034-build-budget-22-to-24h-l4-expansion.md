@@ -55,7 +55,7 @@ The 24h figure is the result of an explicit allocation table, not a comfortable 
 - **No buffer.** ADR-0028 already consumed the original buffer. The 24h revision absorbs the L4 overage with zero remaining slack. Any further unforeseen issues eat directly into delivery quality.
 - **Future scope additions trigger another supersession.** The same discipline applies: a new "just one more thing" requires an ADR superseding this one or an equivalent cut. Silent drift is blocked.
 - **Cover-note framing.** The cover note (gitignored) references 24h. The reader receives the revised number, not the obsolete 22h.
-- **Reader consistency.** All forward-facing budget references (`CLAUDE.md` § 4, `docs/design_doc.md` § Scope and calibration, README budget mentions) update to 24h. ADR-0028's and ADR-0002's bodies preserve their original decisions as historical records; their Status fields point forward.
+- **Reader consistency.** All forward-facing budget references (`docs/design_doc.md` § Scope and calibration, README budget mentions) update to 24h. ADR-0028's and ADR-0002's bodies preserve their original decisions as historical records; their Status fields point forward. (Note: 04/27 layer-review moved the cycle-internal 24h-budget rule from CLAUDE.md to memory `feedback_cycle_internal_disciplines.md` since the build-budget concept binds the original case-study cycle, not a forker.)
 
 ## Related ADRs
 - ADR-0028 (the 22h cap this ADR supersedes; body preserved as historical record)
