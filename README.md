@@ -96,33 +96,33 @@ Files marked **gitignored** in [CLAUDE.md § 2](CLAUDE.md#2-files-and-their-role
 - **DevSecOps** — `SECURITY.md` (disclosure), `.pre-commit-config.yaml` (gitleaks + ruff + terraform fmt at commit-time, full pytest gate at pre-push), `.github/workflows/ci.yml` (lint + pytest on every push and PR), `.github/dependabot.yml` (weekly automated updates), capability gates for AI agents in [`CLAUDE.md` § 6](CLAUDE.md#6-capability-gates-for-ai-agent-driven-work)
 - **FinOps (scope: cost attribution + per-hour cost estimate only)** — `terraform/main.tf` provider block declares `default_tags` (Project / Environment / CostCenter / Owner) so every resource is queryable via Cost Explorer. Per-hour cost estimate at eu-central-1 list price is the table below. Cost analysis recorded in [ADR-0006](docs/ADR/0006-vpn-three-tier-story.md) and [ADR-0015](docs/ADR/0015-no-k8s-no-real-apply.md). **NOT included**: `aws_budgets_budget` cap, AWS Cost Anomaly Detection, automated chargeback. These are forker-add items in [`docs/deployment_guide.md` § Production hardening checklist](docs/deployment_guide.md#production-hardening-checklist).
 
-### Hourly cost (eu-central-1 list price, April 2026)
+### Hourly cost (eu-central-1 list price, April 2026 — 3-AZ posture per ADR-0007 reconsidered)
 
 You decide your deployment duration; this is the per-hour breakdown so you can plan against your budget. Multiply by hours — don't anchor on the case-study's 3h Phase-2.5 window (that was OUR cost-ceiling for evidence capture, not a design property).
 
 | Component | Quantity | Hourly cost |
 |---|---|---|
-| Interface VPC endpoints (8 services × 2 AZ) | 16 ENI-h | $0.176 |
+| Interface VPC endpoints (8 services × 3 AZ) | 24 ENI-h | $0.264 |
 | S3 gateway endpoint | 1 | free |
-| Client VPN endpoint association | 2 AZ | $0.20 |
+| Client VPN endpoint association | 3 AZ | $0.30 |
 | Client VPN active connection | per connected operator | $0.05 |
 | ALB (idle) | 1 | $0.025 |
 | RDS db.t4g.micro Multi-AZ Postgres 16.13 | 1 instance | $0.034 |
 | RDS storage (20 GB gp3) | 20 GB | $0.003 |
-| ECS Fargate — app task (0.25 vCPU, 0.5 GB) | 1 | $0.012 |
-| ECS Fargate — worker task (0.25 vCPU, 0.5 GB) | 1 (idle, scales 1–3 on SQS depth) | $0.012 |
+| ECS Fargate — app service (0.25 vCPU, 0.5 GB × 3 tasks, one per AZ) | 3 | $0.036 |
+| ECS Fargate — worker service (0.25 vCPU, 0.5 GB × 3 tasks min, autoscales 3-9 on SQS depth) | 3 (idle) | $0.036 |
 | ElastiCache Serverless Valkey (storage min) | ≥ 100 MB | $0.085 |
-| **Steady-state idle (no traffic, 1 VPN client)** | | **≈ $0.60/h** |
+| **Steady-state idle (no traffic, 1 VPN client)** | | **≈ $0.84/h** |
 
 **Time projection** (multiply by your duration):
 
 | Duration | Cumulative cost |
 |---|---|
-| 1 hour | ~$0.60 |
-| 3 hours | ~$1.80 (Phase 2.5 case-study actual: $1.50) |
-| 24 hours | ~$14 |
-| 7 days (24/7) | ~$100 |
-| 30 days (24/7) | ~$430 |
+| 1 hour | ~$0.84 |
+| 3 hours | ~$2.52 |
+| 24 hours | ~$20 |
+| 7 days (24/7) | ~$141 |
+| 30 days (24/7) | ~$605 |
 
 Per-traffic items (SQS, CloudWatch logs, ECS bootstrap one-shot, eCPU) are < 0.1 ¢/h at smoke load. Reserved Instances / Savings Plans / Fargate Spot can reduce ECS by 30–70 %. Verify in AWS Pricing Calculator for your region/account. Full breakdown including per-traffic items: [`docs/deployment_guide.md` § Cost shape](docs/deployment_guide.md#cost-shape).
 
@@ -557,7 +557,7 @@ See [ADR-0012](docs/ADR/0012-migration-runbook-agent-executable.md) for the agen
 
 The cloud target is a Terraform composition built from `terraform-aws-modules/*` community modules and direct provider resources:
 
-- **Private-only VPC** across two AZs (per [ADR-0019](docs/ADR/0019-private-only-vpc-architecture.md)) — no IGW, no NAT, no public subnets; egress to AWS APIs via 8 interface VPC Endpoints + 1 S3 gateway endpoint
+- **Private-only VPC** across three AZs (per [ADR-0019](docs/ADR/0019-private-only-vpc-architecture.md) + [ADR-0007 reconsidered](docs/ADR/0007-single-region-multi-az.md)) — no IGW, no NAT, no public subnets; egress to AWS APIs via 8 interface VPC Endpoints + 1 S3 gateway endpoint
 - ECS Fargate behind **internal** ALB (private subnets only) — API service + worker service (auto-scaling on queue depth)
 - **SQS** queue (`aegis-enclave-primes`, visibility timeout 90s) for async job dispatch
 - **ElastiCache Serverless Valkey** for distributed prime-range cache (ZSET + Lua merge)

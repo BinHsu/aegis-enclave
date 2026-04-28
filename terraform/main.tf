@@ -68,9 +68,16 @@ module "vpc" {
   name = "aegis-enclave-vpc"
   cidr = var.vpc_cidr
 
-  azs              = ["${var.region}a", "${var.region}b"]
-  private_subnets  = ["10.0.1.0/24", "10.0.2.0/24"]
-  database_subnets = ["10.0.201.0/24", "10.0.202.0/24"]
+  # ADR-0007 reconsidered (04/28): bumped from 2 AZs to 3. RDS Multi-AZ uses
+  # primary + standby (only 2 AZs) regardless of subnet group size, but a 3rd
+  # subnet gives the DB subnet group flexibility for AZ-level maintenance and
+  # is a hard requirement for ECS to spread tasks evenly across 3 fault
+  # domains. ALB + ECS span all 3 private subnets; Client VPN associates to
+  # all 3 (one association per AZ — see aws_ec2_client_vpn_network_association
+  # blocks below).
+  azs              = ["${var.region}a", "${var.region}b", "${var.region}c"]
+  private_subnets  = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+  database_subnets = ["10.0.201.0/24", "10.0.202.0/24", "10.0.203.0/24"]
   # public_subnets intentionally absent — see ADR-0019.
 
   enable_nat_gateway   = false # ADR-0019 — no public-internet egress
@@ -396,6 +403,13 @@ module "ecs" {
       cpu    = 256
       memory = 512
 
+      # ADR-0007 reconsidered (04/28): app starts at 3 tasks, one per AZ.
+      # ECS Fargate spreads tasks across the 3 private subnets via the
+      # subnet_ids list below, so AZ loss leaves 2/3 capacity (vs 1/2 with
+      # the prior 2-AZ posture). Worker autoscale separately governs worker
+      # task count via SQS depth (see aws_appautoscaling_target.worker).
+      desired_count = 3
+
       container_definitions = {
         app = {
           image = "${module.ecr.repository_url}:${var.image_tag}"
@@ -539,6 +553,11 @@ resource "aws_ec2_client_vpn_network_association" "primary_az" {
 resource "aws_ec2_client_vpn_network_association" "secondary_az" {
   client_vpn_endpoint_id = aws_ec2_client_vpn_endpoint.main.id
   subnet_id              = module.vpc.private_subnets[1]
+}
+
+resource "aws_ec2_client_vpn_network_association" "tertiary_az" {
+  client_vpn_endpoint_id = aws_ec2_client_vpn_endpoint.main.id
+  subnet_id              = module.vpc.private_subnets[2]
 }
 
 resource "aws_ec2_client_vpn_authorization_rule" "vpc_access" {

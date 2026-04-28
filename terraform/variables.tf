@@ -60,15 +60,15 @@ variable "image_tag" {
 }
 
 variable "worker_min_count" {
-  description = "Minimum number of worker ECS tasks (SQS consumer)."
+  description = "Minimum number of worker ECS tasks (SQS consumer). Default 3 = one per AZ in the 3-AZ posture (ADR-0007 reconsidered 04/28). Loss of one AZ leaves 2/3 capacity."
   type        = number
-  default     = 1
+  default     = 3
 }
 
 variable "worker_max_count" {
-  description = "Maximum number of worker ECS tasks (autoscaling ceiling)."
+  description = "Maximum number of worker ECS tasks (autoscaling ceiling). Default 9 keeps the 3x scale headroom over min_count."
   type        = number
-  default     = 3
+  default     = 9
 }
 
 variable "compute_budget_seconds" {

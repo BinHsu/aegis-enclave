@@ -56,3 +56,29 @@ None of these triggers are met at case-study scope. The reviewer reads "I have a
 - ADR-0009 (DB topology — Multi-AZ standby specifics)
 - ADR-0012 (runbook format — same spec shape as the scaling runbook)
 - ADR-0019 (private-only VPC — single-region multi-AZ is realised through the same VPC with private subnets only)
+- ADR-0040 (production target = Frankfurt + Ireland multi-region with Route53 failover; this ADR is the case-study scope cut, ADR-0040 is the production endpoint)
+
+---
+
+### Reconsidered (2026-04-28): 2 AZs → 3 AZs
+
+The original Decision said "multi-AZ subnet distribution" without specifying how many AZs. The implementation defaulted to 2 (`["${var.region}a", "${var.region}b"]`), which is the minimum that qualifies as multi-AZ but is the weakest form of it.
+
+**Refined**: the deliverable now provisions **3 AZs** by default (`a` / `b` / `c`), with 3 private subnets + 3 database subnets and ECS Fargate task spread across all 3.
+
+Why the refinement was needed:
+
+- **Fault-domain coverage**: with 2 AZs, loss of one AZ leaves 1/2 capacity (50% degradation). With 3 AZs, loss of one AZ leaves 2/3 capacity (33% degradation). Production-grade multi-AZ is widely understood to mean ≥ 3 AZs precisely for this reason.
+- **ECS task spread**: the original `desired_count = 1` for the app service couldn't actually exercise multi-AZ — a single task lives in exactly one AZ at any given moment. Bumping app `desired_count = 3` and worker `min_count = 3` (was 1) lets ECS spread one task per AZ, so AZ loss leaves 2 tasks still serving rather than 0 or 1.
+- **RDS subnet group flexibility**: RDS Multi-AZ uses primary + standby (only 2 AZs at any moment), but the DB subnet group having 3 subnets means RDS has freedom to choose which 2 AZs to use during AZ-level maintenance windows. Without the 3rd subnet, an AZ-impacting maintenance event would have nowhere for RDS to fail over to within the same DB subnet group.
+- **Carrying forward to ADR-0040**: the production target (Frankfurt + Ireland multi-region per ADR-0040) explicitly relies on within-region 3-AZ posture in both regions. Hardening 3-AZ in the case-study deliverable means the multi-region target is a region-pair operation, not a region-pair-AND-AZ-count refactor.
+
+**Cost impact** (eu-central-1 list price):
+- 8 Interface VPC endpoints × 1 extra AZ = +$0.088/h
+- Client VPN endpoint association × 1 extra AZ = +$0.10/h
+- 2 ECS service × 2 extra tasks each (1 → 3 baseline) × $0.012/h = +$0.048/h
+- Steady-state idle: ~$0.60/h → ~$0.84/h (+40%)
+
+The cost increase was deliberately accepted because it converts "multi-AZ in name" into "multi-AZ in fact". Per-hour cost tables in `README.md` and `docs/deployment_guide.md` updated to reflect the new rate. The case-study Phase 2.5 cost ceiling is bumped from "< $2 in 3h" to "< $3 in 3h" accordingly.
+
+The fundamental Decision (single-region, multi-AZ in `eu-central-1`) is unchanged. This is a refinement of *how multi-AZ is implemented*, not a reversal.

@@ -17,7 +17,7 @@ Every architectural claim below is anchored to a numbered ADR in [`docs/ADR/`](A
 
 ### 1.1 High availability
 
-The cloud composition is deployed to a single AWS region (`eu-central-1`, Frankfurt) with two-AZ subnet distribution and an RDS Multi-AZ standby. Multi-region active-active is **out of Phase 1 scope** and lives instead as an agent-executable runbook in `docs/scaling_runbook.md` (ADR-0007, ADR-0012). The triggers that would move multi-region from Phase 2 plan into Phase 1 implementation are named explicitly in the Reliability section of the design — none of them are met at case-study scope:
+The cloud composition is deployed to a single AWS region (`eu-central-1`, Frankfurt) with three-AZ subnet distribution (per ADR-0007 reconsidered) and an RDS Multi-AZ standby. Multi-region active-passive (Frankfurt primary + Ireland standby with Route53 health-based failover) is the **production target** documented in ADR-0040, and the agent-executable promotion runbook is `docs/scaling_runbook.md` (ADR-0012). The triggers that would move multi-region from documented-target into deployed-implementation are named explicitly in the Reliability section of the design — none of them are met at case-study scope:
 
 1. Workload concurrency exceeding what a single region can absorb (e.g., simultaneous high-throughput streams from independent producers)
 2. Globally distributed clients requiring locally-terminated network paths for latency or jurisdiction reasons

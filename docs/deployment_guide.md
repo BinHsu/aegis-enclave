@@ -46,10 +46,14 @@ graph TB
                 Pri2[Private subnet<br/>10.0.2.0/24]
                 Db2[Database subnet<br/>10.0.202.0/24]
             end
+            subgraph AZ3[AZ eu-central-1c]
+                Pri3[Private subnet<br/>10.0.3.0/24]
+                Db3[Database subnet<br/>10.0.203.0/24]
+            end
 
-            ALB[Internal ALB<br/>HTTPS :443]
-            ECS_API[ECS Fargate<br/>app service :8000]
-            ECS_WK[ECS Fargate<br/>worker service<br/>min=1 max=3]
+            ALB[Internal ALB<br/>HTTPS :443<br/>spans 3 AZs]
+            ECS_API[ECS Fargate<br/>app service :8000<br/>desired=3, one per AZ]
+            ECS_WK[ECS Fargate<br/>worker service<br/>min=3 max=9, one per AZ baseline]
             ECS_BS[ECS Fargate<br/>bootstrap task<br/>one-shot]
             VALKEY[(ElastiCache Serverless<br/>Valkey — ZSET cache)]
             RDS[(RDS PostgreSQL<br/>Multi-AZ standby)]
@@ -167,23 +171,23 @@ Notes on the plan-only posture (see [`terraform/README.md`](../terraform/README.
 
 ## Cost shape
 
-### Hourly rate (eu-central-1 list price, April 2026)
+### Hourly rate (eu-central-1 list price, April 2026 — 3-AZ posture per ADR-0007 reconsidered)
 
 The forker decides their own deployment duration. This table is the per-hour cost breakdown so you can plan against your own budget — multiply by hours, don't anchor on the case-study's 3h window (which is OUR cost-ceiling for the Phase 2.5 acceptance cycle, not a design property).
 
 | Component | Quantity | Hourly cost |
 |---|---|---|
-| Interface VPC endpoints (8 services × 2 AZ) | 16 ENI-h | $0.176 |
+| Interface VPC endpoints (8 services × 3 AZ) | 24 ENI-h | $0.264 |
 | S3 gateway endpoint | 1 | $0 (free) |
-| Client VPN endpoint association | 2 AZ | $0.20 |
+| Client VPN endpoint association | 3 AZ | $0.30 |
 | Client VPN active connection | per connected operator | $0.05 |
 | ALB (idle) | 1 | $0.025 |
 | RDS db.t4g.micro Multi-AZ Postgres 16.13 | 1 instance | $0.034 |
 | RDS storage (20 GB gp3) | 20 GB | $0.003 |
-| ECS Fargate — app task (0.25 vCPU, 0.5 GB) | 1 | $0.012 |
-| ECS Fargate — worker task (0.25 vCPU, 0.5 GB) | 1 (idle, scales 1-3 on SQS depth) | $0.012 |
+| ECS Fargate — app service (0.25 vCPU, 0.5 GB × 3 tasks, one per AZ) | 3 | $0.036 |
+| ECS Fargate — worker service (0.25 vCPU, 0.5 GB × 3 tasks min, autoscales 3-9 on SQS depth) | 3 (idle) | $0.036 |
 | ElastiCache Serverless Valkey (storage min) | ≥ 100 MB | $0.085 |
-| **Steady-state idle (no traffic, 1 VPN client)** | | **≈ $0.60/h** |
+| **Steady-state idle (no traffic, 1 VPN client)** | | **≈ $0.84/h** |
 
 Per-request / per-traffic items below are negligible at smoke-test load (< 0.1 ¢/h):
 
@@ -199,11 +203,11 @@ Per-request / per-traffic items below are negligible at smoke-test load (< 0.1 �
 
 | Duration | Cumulative cost |
 |---|---|
-| 1 hour | ~$0.60 |
-| 3 hours | ~$1.80 (case-study Phase 2.5 actual: $1.50) |
-| 24 hours | ~$14 |
-| 7 days (24/7) | ~$100 |
-| 30 days (24/7) | ~$430 |
+| 1 hour | ~$0.84 |
+| 3 hours | ~$2.52 |
+| 24 hours | ~$20 |
+| 7 days (24/7) | ~$141 |
+| 30 days (24/7) | ~$605 |
 
 Caveats:
 - List prices in eu-central-1; other regions vary up to ~30 % either direction. Verify in AWS Pricing Calculator for your region/account.
