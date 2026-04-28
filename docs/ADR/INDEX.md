@@ -1,6 +1,6 @@
 # ADR Index — read by goal, not by number
 
-40 ADRs is overwhelming for first-time onboarding. This index groups them by reader goal so you can pick the load-bearing ones for *your* purpose and skip the rest.
+41 ADRs is overwhelming for first-time onboarding. This index groups them by reader goal so you can pick the load-bearing ones for *your* purpose and skip the rest.
 
 ## Pick your goal
 
@@ -22,7 +22,7 @@ If you are evaluating the repo against a senior-engineer rubric, here are the AD
 | **Async API boundary** | 0029, 0033, 0030 | POST 202 + poll + DB state machine; SQS visibility 90s; ElasticMQ local parity |
 | **Timeout philosophy** | 0022, 0033, 0027 | 4-tier drain (app/ECS/ALB/SQS); SIGALRM 60s on CPU-bound; ALB idle 45s |
 | **Failure handling** | 0033, 0038, 0035 | Idempotent retry; DLQ alarm + manual triage (anti-auto-retry); bootstrap idempotency |
-| **Observability** | 0003, 0008 (+ design_doc § 3) | Calibrated stop-line; SLO/RTO/RPO targets; CloudWatch + structured logs only (no APM by design) |
+| **Observability** | 0041, 0008, 0003 (+ design_doc § 3) | Tier 1 implemented: SLI via EMF + CloudWatch Dashboard + multi-window burn-rate alarms (Google SRE Workbook pattern) + optional SNS email. Tier 2 (AMG / AMP) + Tier 3 (X-Ray distributed tracing) deferred per ADR-0041 alternatives + deployment_guide § Production hardening |
 | **Scalability** | 0029, 0009, 0007, 0040 | SQS-depth-driven autoscale; Multi-AZ (3-AZ default per ADR-0007 reconsidered); production target = Frankfurt + Ireland multi-region (ADR-0040) |
 | **Decision documentation** | (this INDEX + every ADR's Status / Related field) | Nygard MADR; supersession chains (0002→0028→0034, 0020→0029/0031/0032, 0023→0029) |
 | **Calibration honesty** | 0003, 0013, 0015, 0034, 0037, 0038 | PoC scope + prod hygiene split; deliverable-not-demo; explicit anti-pattern analyses |
@@ -88,6 +88,7 @@ These four set the scope, trade-off framework, and time budget that every other 
 | [0035](0035-bootstrap-task-includes-schema-migration.md) | One-shot bootstrap ECS task carries both schema migration + cache seed (Phase 2.5 reconsidered: V2 must replace driver + split together, not one without the other) |
 | [0036](0036-image-tag-git-sha-immutable-ecr.md) | Git-SHA image tagging + `--provenance=false --sbom=false` for IMMUTABLE-friendly deterministic ECR manifests |
 | [0038](0038-dlq-alarm-triage-not-auto-retry.md) | DLQ pattern: CloudWatch alarm + manual triage script, NOT auto-retry worker (anti-pattern analysis) |
+| [0041](0041-observability-amp-amg-not-grafana-cloud.md) | Observability backend: AWS-native CloudWatch SLI (EMF) + Dashboard + multi-window burn-rate alarms + opt-in SNS email. AMG / AMP / Grafana Cloud comparison records the V2 promotion paths |
 
 ### C-SUPPORTING (tool choices, build hygiene, dev parity)
 
@@ -114,6 +115,7 @@ These ADRs explicitly mark items deferred to V2 with the upgrade path documented
 | [0037](0037-secrets-manager-rotation-deferred.md) | Secrets Manager rotation Lambda is V2 (Lambda + KMS coupling overhead). Manual rotation procedure documented; IAM database authentication is the preferred V2 upgrade |
 | [0038](0038-dlq-alarm-triage-not-auto-retry.md) | (Also in Band C-OPS.) `alarm_actions = []` is the case-study stance; SNS topic + email/Slack subscriber is the production add |
 | [0040](0040-multi-region-frankfurt-ireland-route53.md) | **Production target** — Frankfurt primary + Ireland standby with Route53 health-based failover. Case-study deliverable single-region per ADR-0007 budget; ADR-0040 documents the EU-only multi-region endpoint architecture (no CDN, no global database). Promotion path: `docs/scaling_runbook.md` |
+| [0041](0041-observability-amp-amg-not-grafana-cloud.md) | (Also in Band C-OPERATIONS.) Observability Tier 2 (AMG dashboards-as-code via `grafana/grafana` provider; AMP for Prometheus-native ingest) + Tier 3 (X-Ray distributed tracing with SQS message-attribute propagation) deferred. Tier 1 (CloudWatch SLI + Dashboard + alarms) ships in case-study. |
 
 ---
 

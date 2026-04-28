@@ -41,6 +41,7 @@ from prime_service.db import (
     health_check,
     insert_queued_execution,
 )
+from prime_service.metrics import emit_count, emit_latency_ms
 from prime_service.queue import PrimeQueue
 from prime_service.schemas import (
     ExecutionResponse,
@@ -108,7 +109,16 @@ async def request_id_middleware(
     request: Request,
     call_next: Callable[[Request], Coroutine[Any, Any, Response]],
 ) -> Response:
-    """Bind a UUID4 request_id into structlog contextvars + emit start/end events."""
+    """Bind a UUID4 request_id + emit SLI metrics for every HTTP request.
+
+    SLI metrics (per ADR-0041 + ADR-0008):
+        request_total           Count, dimension=path
+        request_errors          Count, dimensions=path + error_class (only on 4xx/5xx)
+        request_latency_ms      Milliseconds, dimension=path
+    The 4xx/5xx split lets the SLO dashboard distinguish client errors
+    (path-specific input validation) from server errors (real fault budget
+    consumption). Burn-rate alarms in terraform watch error_class=5xx only.
+    """
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
     structlog.contextvars.bind_contextvars(request_id=request_id)
     started = time.perf_counter()
@@ -124,6 +134,18 @@ async def request_id_middleware(
         status_code=response.status_code,
         duration_ms=duration_ms,
     )
+    # SLI emission — minimal-cardinality aggregate metrics for the SLO
+    # alarms in terraform/main.tf to query without metric-math SEARCH
+    # expressions (which can flicker into INSUFFICIENT_DATA). Path-level
+    # breakdown stays available via CloudWatch Logs Insights queries on
+    # the `request_completed` structlog event (which carries path +
+    # status_code + duration_ms in the same line).
+    emit_count("request_total")
+    emit_latency_ms("request_latency_ms", float(duration_ms))
+    if response.status_code >= 500:
+        emit_count("request_errors_5xx")  # SLO numerator (server errors only)
+    elif response.status_code >= 400:
+        emit_count("request_errors_4xx")  # tracked but not in SLO error budget
     response.headers["X-Request-ID"] = request_id
     structlog.contextvars.clear_contextvars()
     return response

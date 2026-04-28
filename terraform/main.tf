@@ -579,6 +579,38 @@ resource "aws_sqs_queue" "primes_dlq" {
   receive_wait_time_seconds = 0
 }
 
+# ─── Alerting backbone — conditional SNS topic for email delivery ─────────
+# ADR-0041: alarms always exist + always emit state changes to EventBridge
+# (audit trail). Email delivery is opt-in via var.alarm_email — empty string
+# (default) leaves alarm_actions = [] and the deliverable ships with no
+# unsolicited mail to a forker. Setting alarm_email via tfvars-init prompt
+# (or TF_ALARM_EMAIL env var) provisions an SNS topic + email subscription
+# and wires every alarm below to it.
+#
+# SNS subscription requires the recipient to click a confirmation link in
+# the AWS-sent email after first apply (anti-spam, AWS design). cloud-up.sh
+# end-of-flow message reminds the operator with the literal email address
+# they entered.
+resource "aws_sns_topic" "alarms" {
+  count = var.alarm_email != "" ? 1 : 0
+  name  = "aegis-enclave-alarms"
+}
+
+resource "aws_sns_topic_subscription" "alarms_email" {
+  count     = var.alarm_email != "" ? 1 : 0
+  topic_arn = aws_sns_topic.alarms[0].arn
+  protocol  = "email"
+  endpoint  = var.alarm_email
+}
+
+# Helper local — every alarm references this for alarm_actions / ok_actions.
+# try() handles count=0 (alarms[0] doesn't exist) and falls back to []
+# (CloudWatch alarm with empty action list = "fire silently, only EventBridge
+# audit trail records state").
+locals {
+  alarm_action_list = try([aws_sns_topic.alarms[0].arn], [])
+}
+
 # ─── DLQ depth alarm — operator-actionable signal (ADR-0038) ──────────────
 # Auto-retry workers polling DLQ are an anti-pattern (failed messages
 # thrash main ↔ DLQ indefinitely). Production-shape DLQ pattern is:
@@ -609,8 +641,372 @@ resource "aws_cloudwatch_metric_alarm" "dlq_depth" {
     QueueName = aws_sqs_queue.primes_dlq.name
   }
 
-  # alarm_actions = [] — case-study PoC; production add: SNS topic ARN here.
-  # ok_actions = []    — same; alarms transition to OK silently.
+  # ADR-0041: wire to the conditional SNS topic. Empty list when var.alarm_email
+  # is unset — preserves the original ADR-0038 stance (alarms fire silently
+  # with audit trail) while enabling email delivery via opt-in.
+  alarm_actions = local.alarm_action_list
+  ok_actions    = local.alarm_action_list
+}
+
+# ─── SLO alarms (ADR-0041) ────────────────────────────────────────────────
+# SLI metrics emitted via EMF from src/prime_service/{main,worker,metrics}.py
+# into the "aegis-enclave" CloudWatch namespace:
+#   request_total          Sum/min   — POST + GET total
+#   request_errors_5xx     Sum/min   — server-error count (SLO numerator)
+#   request_errors_4xx     Sum/min   — client-error count (NOT in SLO budget)
+#   request_latency_ms     Stat/min  — API request wall time
+#   cache_hit_count        Sum/min   — worker served from cache
+#   cache_miss_count       Sum/min   — worker computed (cache miss)
+#   compute_duration_ms    Stat/min  — worker sieve wall time on miss path
+#   poll_to_done_ms        Stat/min  — end-to-end (worker pickup → done) on both paths
+#
+# SLO targets (per ADR-0008 + ADR-0041):
+#   POST 202 latency < 500ms p99
+#   poll-to-done   < 30s p95
+#   error rate (5xx)  < 0.1%   (= 99.9% availability budget)
+#   cache hit ratio   ≥ 80%
+
+# Multi-window multi-burn-rate (Google SRE Workbook canonical pattern):
+# Fast burn — 1h window, 14.4× SLO threshold (consumes 2% of 30-day budget in 1h).
+# Single-period evaluation; pairs with slow burn via composite alarm below.
+resource "aws_cloudwatch_metric_alarm" "slo_fast_burn" {
+  alarm_name          = "aegis-enclave-slo-fast-burn"
+  alarm_description   = "SLO fast burn: 5xx error rate > 1.44% over 1h (14.4× the 0.1% target). Consumes 2% of 30-day error budget if sustained."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  threshold           = 1.44
+  treat_missing_data  = "notBreaching"
+
+  metric_query {
+    id          = "error_rate_pct"
+    expression  = "100 * (FILL(m_errors, 0) / m_total)"
+    label       = "5xx error rate %"
+    return_data = true
+  }
+  metric_query {
+    id = "m_errors"
+    metric {
+      namespace   = "aegis-enclave"
+      metric_name = "request_errors_5xx"
+      period      = 3600
+      stat        = "Sum"
+    }
+  }
+  metric_query {
+    id = "m_total"
+    metric {
+      namespace   = "aegis-enclave"
+      metric_name = "request_total"
+      period      = 3600
+      stat        = "Sum"
+    }
+  }
+
+  alarm_actions = local.alarm_action_list
+  ok_actions    = local.alarm_action_list
+}
+
+# Slow burn — 6h window, 6× SLO threshold (consumes 5% of budget in 6h).
+resource "aws_cloudwatch_metric_alarm" "slo_slow_burn" {
+  alarm_name          = "aegis-enclave-slo-slow-burn"
+  alarm_description   = "SLO slow burn: 5xx error rate > 0.6% over 6h (6× the 0.1% target). Consumes 5% of 30-day error budget if sustained."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  threshold           = 0.6
+  treat_missing_data  = "notBreaching"
+
+  metric_query {
+    id          = "error_rate_pct"
+    expression  = "100 * (FILL(m_errors, 0) / m_total)"
+    label       = "5xx error rate %"
+    return_data = true
+  }
+  metric_query {
+    id = "m_errors"
+    metric {
+      namespace   = "aegis-enclave"
+      metric_name = "request_errors_5xx"
+      period      = 21600 # 6h
+      stat        = "Sum"
+    }
+  }
+  metric_query {
+    id = "m_total"
+    metric {
+      namespace   = "aegis-enclave"
+      metric_name = "request_total"
+      period      = 21600
+      stat        = "Sum"
+    }
+  }
+
+  alarm_actions = local.alarm_action_list
+  ok_actions    = local.alarm_action_list
+}
+
+# Composite — only page when BOTH fast AND slow burn fire. Avoids paging
+# on a single transient spike (which fast-burn-alone would catch but isn't
+# necessarily a real SLO breach if recovery is < 1h).
+resource "aws_cloudwatch_composite_alarm" "slo_breach" {
+  alarm_name        = "aegis-enclave-slo-breach"
+  alarm_description = "Confirmed SLO breach: fast-burn AND slow-burn both ALARM. Real error budget consumption past 7%; operator action expected."
+  alarm_rule        = "ALARM(${aws_cloudwatch_metric_alarm.slo_fast_burn.alarm_name}) AND ALARM(${aws_cloudwatch_metric_alarm.slo_slow_burn.alarm_name})"
+
+  alarm_actions = local.alarm_action_list
+  ok_actions    = local.alarm_action_list
+}
+
+# Latency SLO — POST 202 should return < 500ms p99. CloudWatch p99 statistic
+# computed natively from the EMF-emitted request_latency_ms histogram.
+resource "aws_cloudwatch_metric_alarm" "latency_p99_breach" {
+  alarm_name          = "aegis-enclave-latency-p99-breach"
+  alarm_description   = "API request latency p99 > 500ms sustained for 15 minutes. Per ADR-0008 SLO."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3 # 3 × 5min periods → 15min sustained
+  threshold           = 500
+  treat_missing_data  = "notBreaching"
+
+  metric_name        = "request_latency_ms"
+  namespace          = "aegis-enclave"
+  period             = 300
+  extended_statistic = "p99"
+
+  alarm_actions = local.alarm_action_list
+  ok_actions    = local.alarm_action_list
+}
+
+# Cache hit ratio SLO — degraded cache effectiveness signals upstream issue
+# (Valkey unhealthy / bootstrap didn't seed / range-coalescing broken).
+# 30-min window — short enough to detect operational regression, long enough
+# to absorb single-request noise (smoke test deliberately exercises miss path).
+resource "aws_cloudwatch_metric_alarm" "cache_hit_ratio_low" {
+  alarm_name          = "aegis-enclave-cache-hit-ratio-low"
+  alarm_description   = "Cache hit ratio < 80% over 30min sustained. Suggests Valkey unhealthy, bootstrap didn't seed, or range-coalescing broken."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  threshold           = 80
+  treat_missing_data  = "notBreaching"
+
+  metric_query {
+    id          = "hit_ratio_pct"
+    expression  = "100 * (FILL(m_hit, 0) / (FILL(m_hit, 0) + FILL(m_miss, 0)))"
+    label       = "cache hit ratio %"
+    return_data = true
+  }
+  metric_query {
+    id = "m_hit"
+    metric {
+      namespace   = "aegis-enclave"
+      metric_name = "cache_hit_count"
+      period      = 1800
+      stat        = "Sum"
+    }
+  }
+  metric_query {
+    id = "m_miss"
+    metric {
+      namespace   = "aegis-enclave"
+      metric_name = "cache_miss_count"
+      period      = 1800
+      stat        = "Sum"
+    }
+  }
+
+  alarm_actions = local.alarm_action_list
+  ok_actions    = local.alarm_action_list
+}
+
+# SLO dashboard — single-pane visualization mapped to ADR-0041's six panels.
+# Embedded in terraform so it lives + dies with the deployment (no manual
+# console-side dashboard to lose during destroy). Reviewer-facing screenshot
+# target for the case-study report PDF.
+resource "aws_cloudwatch_dashboard" "slo" {
+  dashboard_name = "aegis-enclave-slo"
+  dashboard_body = jsonencode({
+    widgets = [
+      # Panel 1: Request rate + cache breakdown — the volume context
+      {
+        type   = "metric"
+        x      = 0
+        y      = 0
+        width  = 12
+        height = 6
+        properties = {
+          title = "Request volume + cache breakdown"
+          metrics = [
+            ["aegis-enclave", "request_total", { stat = "Sum", label = "Total requests" }],
+            [".", "cache_hit_count", { stat = "Sum", label = "Cache hits" }],
+            [".", "cache_miss_count", { stat = "Sum", label = "Cache misses" }],
+          ]
+          period  = 60
+          region  = var.region
+          view    = "timeSeries"
+          stacked = false
+          yAxis   = { left = { min = 0, label = "requests / minute" } }
+        }
+      },
+
+      # Panel 2: API latency — p50 / p95 / p99 with SLO horizontal annotation
+      {
+        type   = "metric"
+        x      = 12
+        y      = 0
+        width  = 12
+        height = 6
+        properties = {
+          title = "API request latency (SLO target: p99 < 500ms)"
+          metrics = [
+            ["aegis-enclave", "request_latency_ms", { stat = "p50", label = "p50" }],
+            [".", ".", { stat = "p95", label = "p95" }],
+            [".", ".", { stat = "p99", label = "p99" }],
+          ]
+          period = 60
+          region = var.region
+          view   = "timeSeries"
+          yAxis  = { left = { min = 0, label = "ms" } }
+          annotations = {
+            horizontal = [
+              { value = 500, label = "SLO p99 target", color = "#d62728" },
+            ]
+          }
+        }
+      },
+
+      # Panel 3: 5xx error rate — the SLO numerator with burn-rate threshold lines
+      {
+        type   = "metric"
+        x      = 0
+        y      = 6
+        width  = 12
+        height = 6
+        properties = {
+          title = "5xx error rate % (SLO target < 0.1%)"
+          metrics = [
+            [
+              {
+                expression = "100 * (FILL(m_errors, 0) / m_total)"
+                label      = "5xx error rate %"
+                id         = "rate"
+              }
+            ],
+            ["aegis-enclave", "request_errors_5xx", { id = "m_errors", visible = false, stat = "Sum" }],
+            [".", "request_total", { id = "m_total", visible = false, stat = "Sum" }],
+          ]
+          period = 60
+          region = var.region
+          view   = "timeSeries"
+          yAxis  = { left = { min = 0, label = "% errors" } }
+          annotations = {
+            horizontal = [
+              { value = 0.1, label = "SLO target 0.1%", color = "#2ca02c" },
+              { value = 0.6, label = "Slow-burn threshold (6× SLO, 6h window)", color = "#ff7f0e" },
+              { value = 1.44, label = "Fast-burn threshold (14.4× SLO, 1h window)", color = "#d62728" },
+            ]
+          }
+        }
+      },
+
+      # Panel 4: Cache hit ratio — the SLO bound for cache effectiveness
+      {
+        type   = "metric"
+        x      = 12
+        y      = 6
+        width  = 12
+        height = 6
+        properties = {
+          title = "Cache hit ratio % (SLO target ≥ 80%)"
+          metrics = [
+            [
+              {
+                expression = "100 * (FILL(m_hit, 0) / (FILL(m_hit, 0) + FILL(m_miss, 0)))"
+                label      = "cache hit ratio %"
+                id         = "ratio"
+              }
+            ],
+            ["aegis-enclave", "cache_hit_count", { id = "m_hit", visible = false, stat = "Sum" }],
+            [".", "cache_miss_count", { id = "m_miss", visible = false, stat = "Sum" }],
+          ]
+          period = 60
+          region = var.region
+          view   = "timeSeries"
+          yAxis  = { left = { min = 0, max = 100, label = "% hit" } }
+          annotations = {
+            horizontal = [
+              { value = 80, label = "SLO target 80%", color = "#2ca02c" },
+            ]
+          }
+        }
+      },
+
+      # Panel 5: Compute path latency — worker sieve performance, SIGALRM proximity
+      {
+        type   = "metric"
+        x      = 0
+        y      = 12
+        width  = 12
+        height = 6
+        properties = {
+          title = "Worker compute duration (SIGALRM ceiling 60000ms)"
+          metrics = [
+            ["aegis-enclave", "compute_duration_ms", { stat = "p50", label = "p50" }],
+            [".", ".", { stat = "p95", label = "p95" }],
+            [".", ".", { stat = "p99", label = "p99" }],
+          ]
+          period = 60
+          region = var.region
+          view   = "timeSeries"
+          yAxis  = { left = { min = 0, label = "ms" } }
+          annotations = {
+            horizontal = [
+              { value = 30000, label = "SLO target p95 < 30s", color = "#ff7f0e" },
+              { value = 60000, label = "SIGALRM hard ceiling", color = "#d62728" },
+            ]
+          }
+        }
+      },
+
+      # Panel 6: Alarm state strip — the entire SLO alarm family at a glance
+      {
+        type   = "alarm"
+        x      = 12
+        y      = 12
+        width  = 12
+        height = 6
+        properties = {
+          title = "SLO alarm states"
+          alarms = [
+            aws_cloudwatch_metric_alarm.slo_fast_burn.arn,
+            aws_cloudwatch_metric_alarm.slo_slow_burn.arn,
+            aws_cloudwatch_composite_alarm.slo_breach.arn,
+            aws_cloudwatch_metric_alarm.latency_p99_breach.arn,
+            aws_cloudwatch_metric_alarm.cache_hit_ratio_low.arn,
+            aws_cloudwatch_metric_alarm.compute_p95_breach.arn,
+            aws_cloudwatch_metric_alarm.dlq_depth.arn,
+          ]
+        }
+      },
+    ]
+  })
+}
+
+# Compute path latency SLO — sieve-with-timeout p95 should stay well under
+# the 60s SIGALRM hard ceiling. p95 > 30s means real compute is taking
+# longer than expected (range size growing? CPU contention? sieve slow?).
+resource "aws_cloudwatch_metric_alarm" "compute_p95_breach" {
+  alarm_name          = "aegis-enclave-compute-p95-breach"
+  alarm_description   = "Worker compute_duration_ms p95 > 30s sustained 15min. Half the SIGALRM 60s ceiling — investigate range distribution + CPU."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  threshold           = 30000
+  treat_missing_data  = "notBreaching"
+
+  metric_name        = "compute_duration_ms"
+  namespace          = "aegis-enclave"
+  period             = 300
+  extended_statistic = "p95"
+
+  alarm_actions = local.alarm_action_list
+  ok_actions    = local.alarm_action_list
 }
 
 resource "aws_sqs_queue" "primes" {

@@ -34,6 +34,7 @@ import structlog
 
 from prime_service.cache import PrimeCache
 from prime_service.db import Execution, async_session_maker, get_execution
+from prime_service.metrics import emit_count, emit_latency_ms
 from prime_service.primes import sieve_with_timeout
 from prime_service.queue import PrimeQueue
 from prime_service.schemas import Status
@@ -197,9 +198,15 @@ def handle_message(
                 _run_async(_mark_done(execution_id, cached, duration_ms))
                 queue.ack(message)
                 log.info("cache_hit", count=len(cached), duration_ms=duration_ms)
+                # SLI emission — cache_hit_count + poll_to_done duration on hit
+                # path. cache_hit_ratio = hit_count / (hit_count + miss_count)
+                # is computed in the SLO dashboard / alarm.
+                emit_count("cache_hit_count")
+                emit_latency_ms("poll_to_done_ms", float(duration_ms))
                 return
         except Exception as exc:  # noqa: BLE001
             log.warning("cache_lookup_error", error=str(exc))
+            emit_count("cache_lookup_errors")
             # Cache errors are non-fatal; fall through to compute.
 
         # ── Compute (SIGALRM 60s hard deadline) ──
@@ -208,18 +215,21 @@ def handle_message(
         except TimeoutError as exc:
             err = f"compute exceeded 60s SIGALRM budget: {exc}"
             log.error("compute_timeout", error=err)
+            emit_count("compute_errors", error_class="timeout")
             _run_async(_mark_failed(execution_id, err))
             queue.ack(message)
             return
         except ValueError as exc:
             err = f"validation error: {exc}"
             log.error("compute_validation_error", error=err)
+            emit_count("compute_errors", error_class="validation")
             _run_async(_mark_failed(execution_id, err))
             queue.ack(message)
             return
         except Exception as exc:  # noqa: BLE001
             err = f"unexpected error: {type(exc).__name__}: {exc}"
             log.error("compute_error", error=err)
+            emit_count("compute_errors", error_class="generic")
             _run_async(_mark_failed(execution_id, err))
             queue.ack(message)
             return
@@ -231,12 +241,18 @@ def handle_message(
             cache.merge_or_put(start, end, primes)
         except Exception as exc:  # noqa: BLE001
             log.warning("cache_write_error", error=str(exc))
+            emit_count("cache_write_errors")
             # Cache write errors are non-fatal; result is still persisted to DB.
 
         # ── Update audit record ──
         _run_async(_mark_done(execution_id, primes, duration_ms))
         queue.ack(message)
         log.info("compute_done", count=len(primes), duration_ms=duration_ms)
+        # SLI emission — cache_miss_count + compute_duration_ms (latency
+        # histogram on the compute path) + poll_to_done_ms (end-to-end SLO).
+        emit_count("cache_miss_count")
+        emit_latency_ms("compute_duration_ms", float(duration_ms))
+        emit_latency_ms("poll_to_done_ms", float(duration_ms))
     finally:
         structlog.contextvars.clear_contextvars()
 

@@ -384,9 +384,20 @@ The internal ALB runs HTTPS via a self-signed certificate imported into ACM. Thi
 
 The cache + schema bootstrap is currently triggered by a Terraform `null_resource` running `aws ecs run-task` via `local-exec`. This works for the bounded acceptance window but is fragile (no retry semantics, sequencing only via `depends_on`, dependent on the operator's local AWS CLI). **V2**: replace with Step Functions or a CodePipeline migration stage. Per ADR-0035 reconsidered block, splitting `cache_bootstrap` into separate `db_migrate` + `cache_bootstrap` tasks should be done **together** with the driver replacement, not separately — splitting alone doubles the fragile surface for no clarity gain.
 
-### 4. Observability stack (ADR-0003)
+### 4. Observability — Tier 1 implemented; Tier 2 + Tier 3 deferred (ADR-0003 + ADR-0041)
 
-CloudWatch metrics + structured worker/bootstrap logs are emitted, but there is no dashboard, no alarm wiring, no on-call escalation, no incident runbook, no distributed tracing. Production must add Prometheus + Grafana (self-managed) or Datadog/New Relic (managed). The case-study scope explicitly excludes this per ADR-0003 PoC-vs-prod calibration.
+**Implemented in the case-study composition (ADR-0041 Tier 1)**:
+- SLI emission via EMF in `src/prime_service/{main,worker,metrics}.py` — `request_total` / `request_errors_5xx` / `request_latency_ms` / `cache_hit_count` / `cache_miss_count` / `compute_duration_ms` / `poll_to_done_ms` into `aegis-enclave` CloudWatch namespace
+- 6-panel CloudWatch Dashboard (`aws_cloudwatch_dashboard.slo`) — volume, latency p50/p95/p99 with 500ms SLO threshold, 5xx error rate with multi-window burn thresholds (0.1% / 0.6% / 1.44%), cache hit ratio with 80% target, compute duration with 30s SLO + 60s SIGALRM ceiling, alarm state strip
+- 6 alarms wired with multi-window burn-rate logic (Google SRE Workbook pattern): `slo_fast_burn`, `slo_slow_burn`, `slo_breach` composite (fast AND slow), `latency_p99_breach`, `cache_hit_ratio_low`, `compute_p95_breach`
+- Optional SNS email delivery via `var.alarm_email` (set at `tfvars-init.sh` time or `TF_ALARM_EMAIL` env var)
+
+**Deferred to V2 (forker-add)**:
+- **Tier 2 — Grafana surface**: AMG (Amazon Managed Grafana) with CloudWatch / AMP data source + dashboards-as-code via the `grafana/grafana` terraform provider. ~7-8h promotion. Justified once a persistent live URL is operationally relevant (production adoption with sustained traffic).
+- **Tier 2 — AMP for Prometheus-native ingest**: only matters once the application emits high-cardinality metrics or distribution exemplars that EMF's dimension model is awkward for. ~3-4h on top of AMG.
+- **Tier 3 — Distributed tracing**: AWS X-Ray + ADOT collector + SQS message-attribute trace_id propagation. ~10-12h. Defer until first buyer-side / forker-side need.
+- **PagerDuty / Slack delivery**: Email is the floor; AWS Chatbot integration with Slack/Teams is the production extension. ~3-4h.
+- **Cross-region SNS aggregation**: Multi-region (ADR-0040) needs a per-region alarm + cross-region SNS or a single failover topic. Out of scope for single-region case-study.
 
 ### 5. Multi-region posture (ADR-0009)
 

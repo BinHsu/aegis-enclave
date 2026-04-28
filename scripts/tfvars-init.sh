@@ -36,7 +36,7 @@
 #
 # Env vars supported (uppercase prefix TF_, override prompt + default):
 #   TF_REGION, TF_ENVIRONMENT, TF_COST_CENTER, TF_OWNER, TF_VPC_CIDR,
-#   TF_ALB_HOSTNAME, TF_WORKER_MIN, TF_WORKER_MAX
+#   TF_ALB_HOSTNAME, TF_WORKER_MIN, TF_WORKER_MAX, TF_ALARM_EMAIL
 #
 # Called automatically by cloud-up.sh when terraform.tfvars is missing.
 
@@ -252,6 +252,12 @@ validate_positive_int() {
     [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 0 ]]
 }
 
+validate_email_or_empty() {
+    # Empty string is valid (means: skip SNS notifications). Non-empty must
+    # look like an email address (matches terraform/variables.tf validation).
+    [[ -z "$1" ]] || [[ "$1" =~ ^[^@]+@[^@]+\.[^@]+$ ]]
+}
+
 # ─── Q&A: region (validated) ───────────────────────────────────────────────
 section "Region"
 while true; do
@@ -323,16 +329,35 @@ done
 # ─── Q&A: worker counts (validated integers) ───────────────────────────────
 section "Worker autoscale"
 while true; do
-    ask WORKER_MIN "Worker min count (ECS desired_count floor)" "1"
+    ask WORKER_MIN "Worker min count (ECS desired_count floor; 3 = one task per AZ in 3-AZ posture)" "3"
     if validate_positive_int "$WORKER_MIN"; then break; fi
     batch_fail_or_retry WORKER_MIN "$WORKER_MIN" "must be non-negative integer"
 done
 while true; do
-    ask WORKER_MAX "Worker max count (autoscale ceiling)" "3"
+    ask WORKER_MAX "Worker max count (autoscale ceiling; 9 keeps 3x scale headroom over min=3)" "9"
     if validate_positive_int "$WORKER_MAX" && [[ "$WORKER_MAX" -ge "$WORKER_MIN" ]]; then
         break
     fi
     batch_fail_or_retry WORKER_MAX "$WORKER_MAX" "must be integer ≥ worker_min_count ($WORKER_MIN)"
+done
+
+# ─── Q&A: SNS alarm email (optional; opt-in delivery per ADR-0041) ─────────
+section "Alarm email (optional)"
+info "If set, terraform creates an SNS topic + email subscription. Alarms still"
+info "fire to EventBridge audit trail regardless. AWS will email a confirmation"
+info "link to the address on first apply — the operator must click it before"
+info "alarm notifications deliver."
+while true; do
+    ask ALARM_EMAIL "Email for alarm notifications (Enter to skip)" ""
+    if validate_email_or_empty "$ALARM_EMAIL"; then
+        if [[ -z "$ALARM_EMAIL" ]]; then
+            ok "alarm_email empty — alarms will fire silently (EventBridge audit trail only)"
+        else
+            ok "alarm_email = $ALARM_EMAIL"
+        fi
+        break
+    fi
+    batch_fail_or_retry ALARM_EMAIL "$ALARM_EMAIL" "not a valid email address (or leave empty to skip)"
 done
 
 # ─── Write tfvars ──────────────────────────────────────────────────────────
@@ -350,6 +375,7 @@ vpc_cidr              = "$VPC_CIDR"
 alb_internal_hostname = "$ALB_HOSTNAME"
 worker_min_count      = $WORKER_MIN
 worker_max_count      = $WORKER_MAX
+alarm_email           = "$ALARM_EMAIL"
 
 # ─── Less-commonly-tuned knobs (uncomment + edit if needed) ─────────────
 # compute_budget_seconds         = 60        # SIGALRM worker timeout (ADR-0033)

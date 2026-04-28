@@ -266,6 +266,12 @@ section "Cloud is UP — next steps"
 ALB_DNS=$(cd "$TF_DIR" && terraform output -raw alb_dns_name 2>/dev/null || echo "(output not present)")
 VPN_ID=$(cd "$TF_DIR"  && terraform output -raw client_vpn_endpoint_id 2>/dev/null || echo "(output not present)")
 
+# Read the literal alarm_email value the operator entered at tfvars-init time
+# so the SNS confirmation reminder is not vague ("check your email") but
+# explicit ("check the inbox of <address>"). Empty value → no reminder.
+ALARM_EMAIL=$(grep -E '^alarm_email[[:space:]]*=' "$TFVARS" 2>/dev/null \
+              | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/' || echo "")
+
 ELAPSED=$(($(date -u +%s) - START_TIME))
 ELAPSED_MIN=$((ELAPSED / 60))
 ELAPSED_SEC=$((ELAPSED % 60))
@@ -304,7 +310,44 @@ cat <<EOF
     5. When done:
          AWS_PROFILE=$AWS_PROFILE make cloud-down
        (drains ECR + destroys + cleans ACM certs + collateral-free verify)
-       Cost budget reminder: ≤ 3h apply-then-destroy window (≈ \$1.20-1.80 per ADR-0031)
+       Cost budget reminder: ≤ 3h apply-then-destroy window (≈ \$0.84/h steady-state per
+       README cost table; 3h ≈ \$2.50 actual)
 
 EOF
+
+# ADR-0041: SNS subscription requires the recipient to click a confirmation
+# link in the AWS-sent email. Until they do, the subscription is in
+# 'PendingConfirmation' state and notifications don't deliver. Print the
+# literal email address (from tfvars) so the operator knows which inbox to
+# check, not just a vague "check your email".
+if [[ -n "$ALARM_EMAIL" ]]; then
+    section "⚠ Action required — SNS subscription confirmation"
+    cat <<EOF
+
+  An email from "AWS Notification - Subscription Confirmation" was sent to:
+
+    ${BOLD}${ALARM_EMAIL}${RESET}
+
+  Open that inbox and click the "Confirm subscription" link before triggering
+  any test alarm. Until you confirm, alarms still fire and log to EventBridge,
+  but email notifications will NOT deliver.
+
+  After confirming, you can verify by triggering a deliberate test alarm:
+
+    aws cloudwatch set-alarm-state --profile $AWS_PROFILE --region $REGION \\
+        --alarm-name aegis-enclave-slo-fast-burn \\
+        --state-value ALARM \\
+        --state-reason "manual smoke test"
+
+  You should receive an email titled "ALARM: aegis-enclave-slo-fast-burn".
+  Reset the alarm state to OK after verification:
+
+    aws cloudwatch set-alarm-state --profile $AWS_PROFILE --region $REGION \\
+        --alarm-name aegis-enclave-slo-fast-burn \\
+        --state-value OK \\
+        --state-reason "test complete"
+
+EOF
+fi
+
 ok "cloud-up complete — Phase 2.5 cost timer is running"

@@ -142,6 +142,8 @@ The gap is between **infrastructure observability** (already free) and **applica
 
 ### 3.3 When scope opens — the upgrade path
 
+> **Status (2026-04-28, ADR-0041): the EMF path described below is now implemented in the case-study deliverable.** `src/prime_service/metrics.py` wraps the EMF envelope; `main.py` middleware + `worker.py` `handle_message` emit SLI metrics into the `aegis-enclave` namespace; `terraform/main.tf` provisions a 6-panel `aws_cloudwatch_dashboard.slo` + 6 multi-window burn-rate alarms. The "sketch, not a commitment" caveat at the end of this subsection is superseded — ADR-0041 records the choice, the alternatives (AMG / AMP / Grafana Cloud), and the V2 promotion paths.
+
 The recommended primary upgrade is **CloudWatch Embedded Metric Format (EMF)** middleware, not `cloudwatch:PutMetricData` API calls. EMF works by writing a structured JSON log line per request:
 
 ```json
@@ -186,7 +188,7 @@ The migration runbook (`docs/migration_runbook.md`) is the right place to record
 
 ### 3.5 Calibration recap
 
-The architecture above mirrors the calibration shape in § 1.3: name the architecture, scope the implementation, leave deferred work as designed sketches rather than absent ones. Phase 2.5 ships the infrastructure-observability layer that AWS managed services emit by default; the application-observability sketch above gives the buyer enough design clarity to scope the upgrade conversation when (or if) the workload justifies it.
+The architecture above mirrors the calibration shape in § 1.3: name the architecture, scope the implementation, leave deferred work as designed sketches rather than absent ones. **Phase 2.5.1 (2026-04-28, per ADR-0041)** promoted § 3.3's "sketch" to shipped Tier 1: SLI emission, CloudWatch Dashboard, multi-window burn-rate alarms, optional SNS email delivery. § 3.4's APM/distributed-tracing layer remains a deliberate Tier 3 V2 — the SQS message-attribute trace_id propagation work and ADOT collector are documented in the deployment_guide § Production hardening checklist, not implemented. The **scope statement** at § 1.3 (no Prometheus, no Grafana surface, no APM) still reads correctly: we have neither Prometheus the system nor Grafana the UI; we have CloudWatch the AWS-native equivalent, scoped to what a 3h apply-then-destroy evidence model can deliver as screenshots.
 
 ## 4. Async architecture + cost guards
 
