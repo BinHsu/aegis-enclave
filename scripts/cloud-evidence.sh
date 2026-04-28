@@ -102,7 +102,7 @@ capture_metric() {
 }
 
 # ─── 1. CloudWatch metric widgets ─────────────────────────────────────────
-section "1/5 — CloudWatch metric widgets"
+section "1/6 — CloudWatch metric widgets (AWS-native services)"
 
 # Resolve resource identifiers DIRECTLY from terraform outputs (added in
 # outputs.tf). Each output is the bare identifier CloudWatch expects in the
@@ -133,7 +133,7 @@ info "  RDS DBInstanceIdentifier:      ${RDS_ID:-MISSING}"
 # Helps debug empty widgets — if list-metrics returns nothing for a namespace,
 # the resource hasn't emitted metrics yet (insufficient time / no traffic),
 # distinct from a wrong-dimension bug.
-section "2/5 — Discovery dry-run (list-metrics per namespace)"
+section "2/6 — Discovery dry-run (list-metrics per namespace)"
 for ns in AWS/SQS AWS/ECS AWS/ElastiCache AWS/ApplicationELB AWS/RDS; do
     count=$(aws cloudwatch list-metrics --region "$REGION" --namespace "$ns" \
               --query 'Metrics | length(@)' --output text 2>/dev/null || echo "?")
@@ -145,7 +145,7 @@ for ns in AWS/SQS AWS/ECS AWS/ElastiCache AWS/ApplicationELB AWS/RDS; do
 done
 
 # 01: SQS visible messages
-section "3/5 — Capture metric widgets"
+section "3/6 — Capture metric widgets"
 if [[ -n "$SQS_NAME" ]]; then
     capture_metric "01-sqs-visible.png" '{
       "metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","'"$SQS_NAME"'",{"label":"visible"}]],
@@ -211,7 +211,7 @@ else
 fi
 
 # ─── 4. CloudWatch log excerpts + cache-hit ground-truth counters ─────────
-section "4/5 — CloudWatch log excerpts + cache_hit/compute_done ground truth"
+section "4/6 — CloudWatch log excerpts + cache_hit/compute_done ground truth"
 START_MS=$(( ($(date +%s) - 3600) * 1000 ))
 
 # Worker logs — full excerpt for forensic browsing
@@ -285,8 +285,128 @@ fi
 (cd "$TF_DIR" && terraform output -json) > "$EVIDENCE_DIR/terraform-output.json"
 ok "terraform-output.json: $(wc -c <"$EVIDENCE_DIR/terraform-output.json" | tr -d ' ') bytes"
 
-# ─── 5. Summary stub ─────────────────────────────────────────────────────
-section "5/5 — summary.md stub"
+# ─── 5. SLO dashboard panels (API path, SCP-resilient) ────────────────────
+# AWS Console UI for CloudWatch Dashboards typically requires
+# cloudwatch:ListMetrics, which is SCP-denied at the org level for many
+# staging/dev accounts (positive guardrail signal). The dashboard provisioned
+# by terraform/main.tf still exists and alarms still fire — but the Console
+# screenshot path is unavailable. Fall back to the same API path the rest of
+# this script uses: aws cloudwatch get-metric-widget-image (per-widget PNG
+# render) + describe-alarms (alarm state JSON).
+section "5/6 — SLO dashboard panels + alarm state (API path)"
+
+mkdir -p "$EVIDENCE_DIR/slo"
+
+# Widget JSON for each SLO panel — kept here (not extracted via get-dashboard)
+# so this script works even if cloudwatch:GetDashboard is also SCP-restricted.
+# Mirrors the widget array in terraform/main.tf aws_cloudwatch_dashboard.slo;
+# any change there should be mirrored here.
+
+slo_capture() {
+    local fname="$1" widget="$2"
+    local out="$EVIDENCE_DIR/slo/$fname"
+    if aws cloudwatch get-metric-widget-image --region "$REGION" \
+         --metric-widget "$widget" --output text --query 'MetricWidgetImage' 2>/dev/null \
+         | base64 -d > "$out" 2>/dev/null; then
+        if [[ -s "$out" ]]; then
+            ok "SLO panel: $fname ($(wc -c <"$out" | tr -d ' ') bytes)"
+        else
+            rm -f "$out"
+            warn "SLO panel: $fname empty — namespace 'aegis-enclave' has no datapoints yet (run cloud-smoke first to seed metrics)"
+        fi
+    else
+        warn "SLO panel: $fname capture failed"
+    fi
+}
+
+# Panel 1: API latency p50/p95/p99 with 500ms SLO threshold annotation
+slo_capture "01-api-latency.png" '{
+  "metrics":[
+    ["aegis-enclave","request_latency_ms",{"stat":"p50","label":"p50"}],
+    [".",".",{"stat":"p95","label":"p95"}],
+    [".",".",{"stat":"p99","label":"p99"}]
+  ],
+  "period":60,"width":1024,"height":400,
+  "title":"API request latency (SLO p99 < 500ms)",
+  "annotations":{"horizontal":[{"value":500,"label":"SLO p99 target","color":"#d62728"}]}}'
+
+# Panel 2: 5xx error rate % with multi-window burn thresholds
+slo_capture "02-error-rate.png" '{
+  "metrics":[
+    [{"expression":"100 * (FILL(m_errors, 0) / m_total)","label":"5xx error rate %","id":"rate"}],
+    ["aegis-enclave","request_errors_5xx",{"id":"m_errors","visible":false,"stat":"Sum"}],
+    [".","request_total",{"id":"m_total","visible":false,"stat":"Sum"}]
+  ],
+  "period":60,"width":1024,"height":400,
+  "title":"5xx error rate % (SLO target < 0.1%)",
+  "annotations":{"horizontal":[
+    {"value":0.1,"label":"SLO target","color":"#2ca02c"},
+    {"value":0.6,"label":"Slow-burn threshold (6× SLO, 6h)","color":"#ff7f0e"},
+    {"value":1.44,"label":"Fast-burn threshold (14.4× SLO, 1h)","color":"#d62728"}
+  ]}}'
+
+# Panel 3: Cache hit ratio %
+slo_capture "03-cache-hit-ratio.png" '{
+  "metrics":[
+    [{"expression":"100 * (FILL(m_hit, 0) / (FILL(m_hit, 0) + FILL(m_miss, 0)))","label":"cache hit ratio %","id":"ratio"}],
+    ["aegis-enclave","cache_hit_count",{"id":"m_hit","visible":false,"stat":"Sum"}],
+    [".","cache_miss_count",{"id":"m_miss","visible":false,"stat":"Sum"}]
+  ],
+  "period":60,"width":1024,"height":400,
+  "title":"Cache hit ratio % (SLO target ≥ 80%)",
+  "yAxis":{"left":{"min":0,"max":100}},
+  "annotations":{"horizontal":[{"value":80,"label":"SLO target","color":"#2ca02c"}]}}'
+
+# Panel 4: Compute path latency p50/p95/p99 with SIGALRM ceiling
+slo_capture "04-compute-duration.png" '{
+  "metrics":[
+    ["aegis-enclave","compute_duration_ms",{"stat":"p50","label":"p50"}],
+    [".",".",{"stat":"p95","label":"p95"}],
+    [".",".",{"stat":"p99","label":"p99"}]
+  ],
+  "period":60,"width":1024,"height":400,
+  "title":"Worker compute duration (SIGALRM ceiling 60s)",
+  "annotations":{"horizontal":[
+    {"value":30000,"label":"SLO p95 target 30s","color":"#ff7f0e"},
+    {"value":60000,"label":"SIGALRM hard ceiling","color":"#d62728"}
+  ]}}'
+
+# Panel 5: Request volume + cache breakdown (context for SLO interpretation)
+slo_capture "05-volume-breakdown.png" '{
+  "metrics":[
+    ["aegis-enclave","request_total",{"stat":"Sum","label":"Total requests"}],
+    [".","cache_hit_count",{"stat":"Sum","label":"Cache hits"}],
+    [".","cache_miss_count",{"stat":"Sum","label":"Cache misses"}]
+  ],
+  "period":60,"width":1024,"height":400,
+  "title":"Request volume + cache breakdown"}'
+
+# Panel 6: Alarm state snapshot — JSON dump of current alarm states.
+# get-metric-widget-image doesn't render alarm-type widgets, so this is a
+# JSON evidence file rather than a PNG. Reviewer reads OK / ALARM / INSUFFICIENT_DATA
+# state for every aegis-enclave-* alarm.
+aws cloudwatch describe-alarms --region "$REGION" \
+    --alarm-name-prefix "aegis-enclave" \
+    --query 'MetricAlarms[*].{Name:AlarmName,State:StateValue,Reason:StateReason,Updated:StateUpdatedTimestamp} | CompositeAlarms[*].{Name:AlarmName,State:StateValue,Reason:StateReason,Updated:StateUpdatedTimestamp}' \
+    --output json > "$EVIDENCE_DIR/slo/06-alarm-state.json" 2>/dev/null \
+    && ok "alarm state snapshot → slo/06-alarm-state.json" \
+    || warn "alarm state snapshot failed"
+
+# Panel 7: Alarm history (last hour) — proves alarms transition correctly,
+# captures any deliberate test-alarm trigger fired during the evidence window
+# (per cloud-up.sh post-message: set-alarm-state ALARM → email → set OK).
+HISTORY_START=$(date -u -v-1H +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u -d "1 hour ago" +%Y-%m-%dT%H:%M:%S)
+aws cloudwatch describe-alarm-history --region "$REGION" \
+    --alarm-name "aegis-enclave-slo-fast-burn" \
+    --history-item-type "StateUpdate" \
+    --start-date "$HISTORY_START" \
+    --query 'AlarmHistoryItems[*].{Time:Timestamp,Summary:HistorySummary}' \
+    --output json > "$EVIDENCE_DIR/slo/07-alarm-history-fast-burn.json" 2>/dev/null \
+    && ok "alarm history (slo_fast_burn last 1h) → slo/07-alarm-history-fast-burn.json" \
+    || warn "alarm history fetch failed"
+
+# ─── 6. Summary stub ─────────────────────────────────────────────────────
+section "6/6 — summary.md stub"
 cat > "$EVIDENCE_DIR/summary.md" <<EOF
 # Phase 2.5 Evidence — $TS
 
@@ -296,7 +416,10 @@ cat > "$EVIDENCE_DIR/summary.md" <<EOF
 - Caller:  $ARN
 
 ## Captured (machine-readable)
-- 6 CloudWatch metric widgets (metrics/*.png) — chrome-sparse, API-fetched
+- 6 CloudWatch metric widgets — AWS-native services (metrics/*.png) — chrome-sparse, API-fetched
+- 5 SLO dashboard panels — application SLI (slo/0[1-5]-*.png) — API path; Console may be SCP-blocked
+- 1 alarm state snapshot (slo/06-alarm-state.json) — current OK/ALARM state for every aegis-enclave-* alarm
+- 1 alarm history excerpt (slo/07-alarm-history-fast-burn.json) — state transitions in last 1h, captures deliberate-trigger evidence
 - Worker CloudWatch logs ($([[ -f "$EVIDENCE_DIR/logs/worker.log" ]] && echo "captured" || echo "MISSING — log group not present"))
 - Bootstrap CloudWatch logs ($([[ -f "$EVIDENCE_DIR/logs/bootstrap.log" ]] && echo "captured" || echo "MISSING — log group not present"))
 - Cache assertion counters: logs/worker-cache-counters.txt (cache_hit vs compute_done)

@@ -299,13 +299,17 @@ cat <<EOF
 
     4. CloudWatch evidence capture (per memory feedback_phase25_screenshot_evidence.md):
          AWS_PROFILE=$AWS_PROFILE make cloud-evidence
-       Then screenshot dashboards in the AWS Console BEFORE running 'make cloud-down'.
-       Targets:
-         - SQS ApproximateNumberOfMessagesVisible
-         - ECS DesiredCount (worker autoscale)
-         - ElastiCache BytesUsedForCache + ElastiCacheProcessingUnits
-         - Worker CloudWatch logs + bootstrap task logs
-         - 6/6 smoke test screenshots
+       Captures via API path (cloudwatch:GetMetricWidgetImage + DescribeAlarms);
+       works under cloudwatch:ListMetrics SCP deny since it doesn't depend on
+       Console UI. AWS Console UI for the SLO dashboard MAY be SCP-blocked at
+       the org level — that is expected; the API path is the canonical source.
+       Targets captured into evidence/<TS>/:
+         - metrics/   AWS-native panels (SQS / ECS / Valkey / ALB / RDS)
+         - slo/       Application SLI panels (latency / error rate / cache hit
+                      ratio / compute duration / volume / alarm state JSON)
+         - logs/      Worker + bootstrap CloudWatch logs + cache_hit:compute_done
+                      counters + bootstrap idempotency counters
+         - terraform-output.json   Full state surface
 
     5. When done:
          AWS_PROFILE=$AWS_PROFILE make cloud-down
