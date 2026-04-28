@@ -1,8 +1,45 @@
 # Scaling Runbook — Single-Region → Multi-Region (AWS)
 
-> **Phase 2 deliverable.** Spec-grade, not code-grade. This document describes an agent-executable plan for moving the cloud composition in `terraform/main.tf` from single-region multi-AZ to multi-region active-passive (`eu-central-1` primary + `eu-west-1` secondary). Uses the same per-step schema as `docs/migration_runbook.md` — proving the runbook format is invariant across axes of extension.
+> **Phase 2 deliverable.** Spec-grade, not code-grade. This document describes an agent-executable plan for moving the cloud composition from single-region multi-AZ to multi-region. **Two paths, depending on deployment starting point** — see "Decision: Which path applies to you?" below.
 
-## When to run this
+## Decision: Which path applies to you?
+
+The runbook bifurcates by deployment starting point. Pick based on whether you carry an existing PostgreSQL/RDS investment.
+
+### Path A — Greenfield (no existing PG schema): ADR-0042 → DynamoDB Global Tables active-active
+
+**Recommended for new deployments.** This path is the cloud-native production-grade target:
+
+- Data layer: DynamoDB Global Tables (single resource declaration with `replica` block per secondary region) — native multi-master multi-region active-active
+- No Aurora migration step (no RDS to begin with)
+- No Lambda failover orchestration (DynamoDB doesn't need write-promotion)
+- No failback Path 1/2 reconstitution complexity
+- RTO ~60-300s (Route53 health check + DNS TTL only)
+- RPO ~1s (Global Tables async replication lag)
+- Cost ~2× single-region (both regions provisioned), no Aurora premium
+- Demonstrated on the `pivot/dynamodb-multi-region` branch of this repo
+
+If your starting point matches Path A, **stop reading the rest of this runbook**. The body below is Path B (Aurora migration). For Path A, follow:
+
+1. Adopt the `pivot/dynamodb-multi-region` branch as your terraform composition starting point (or merge selectively into your fork)
+2. `tfvars-init.sh` will prompt for `primary_region` (default eu-central-1) + `secondary_region` (default eu-west-1)
+3. `terraform apply` provisions both regions in one composition (provider aliases, conditional `count` on secondary resources)
+4. Multi-region terraform commits land alongside DynamoDB Global Tables `replica` config — no separate "migrate to multi-region" step
+5. Failover validation: stop primary ALB → Route53 health check fails → DNS flips → secondary serves writes (no Aurora promotion intermediate step)
+
+Total Path A effort: ~10-15 hours of greenfield infrastructure work + cloud-up validation window. Schema migration is not part of Path A because there is no schema migration (DynamoDB tables are terraform-managed via `aws_dynamodb_table.executions`).
+
+### Path B — Existing-PG-investment migration: ADR-0040 → Aurora Global Database active-passive
+
+**Use this path if** your starting point includes an existing RDS PostgreSQL deployment (typically the case-study `main` branch shape: PG Multi-AZ in single region, with SQLAlchemy/ORM tooling, schema migrations, ~50+ tests bound to PG semantics).
+
+This path is documented in ADR-0040 with full operational complexity: Lambda-driven failover automation, failback Path 1 (switchover origin, ~5-10 min) vs Path 2 (failover origin, 1-12h reconstitution), split-brain risk mitigation, etc. The runbook body below describes Path B step-by-step.
+
+Path B is materially harder than Path A. The trade-off: you avoid rewriting the data layer + tests + bootstrapping at the cost of Aurora-specific operational complexity. For most forkers this trade-off is correct only when the PG investment is large enough that rewriting it costs more than living with Aurora's failover semantics.
+
+Total Path B effort: ~32-42 hours (Aurora migration + Lambda automation + multi-region infrastructure + drill). Materially higher than Path A.
+
+## When to run this (either path)
 
 The case-study deliverable is intentionally single-region per [ADR-0007](ADR/0007-single-region-multi-az.md). **Do NOT execute this runbook unless one of the following triggers is met:**
 

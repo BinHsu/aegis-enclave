@@ -1,7 +1,10 @@
-# ADR-0009: Provision the database as RDS PostgreSQL Multi-AZ standby; no read replicas
+# ADR-0009: RDS PostgreSQL Multi-AZ standby (case-study scope; greenfield = DynamoDB per ADR-0042)
 
 ## Status
-Accepted (2026-04-25)
+**Accepted (2026-04-25) for the case-study deliverable scope** (`main` branch — RDS PostgreSQL Multi-AZ).
+**Superseded by ADR-0042 for greenfield production deployments (2026-04-28)** — a forker starting from scratch should follow ADR-0042 (DynamoDB Global Tables active-active) rather than this ADR's PG/RDS choice. The retrospective in ADR-0042 records that PG was assumed brief-mandated but is in fact our judgment; for the workload shape (insert-mostly audit log + idempotency-checked writes + range queries by created_at + no foreign-key joins), DynamoDB Global Tables is the structurally correct cloud-native choice. ADR-0040 documents the Aurora migration path for forkers carrying existing PG investment.
+
+The ADR body below records the original case-study PG topology rationale as historical truth and remains accurate for `main` branch.
 
 ## Context
 The cloud target uses RDS PostgreSQL behind ECS Fargate. The choice of HA topology has to match the workload, not default to "more replicas = more robust".

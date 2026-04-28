@@ -1,9 +1,17 @@
-# ADR-0040: Multi-region production target — Frankfurt primary + Ireland standby with Route53 health-based failover
+# ADR-0040: Multi-region via Aurora Global Database — Frankfurt primary + Ireland secondary (PG-existing migration path)
 
 ## Status
-Accepted (2026-04-28) — **target architecture, not implemented in the case-study cycle.**
+**Superseded by ADR-0042 for greenfield deployments** (2026-04-28).
+**Retained as the Aurora migration path** for forkers carrying an existing PostgreSQL/RDS investment.
 
-This ADR records the production endpoint architecture. The case-study deliverable is single-region (`eu-central-1`) per ADR-0007 (single-region multi-AZ posture) and within the build-budget cap of ADR-0034 (24h). The promotion path is `docs/scaling_runbook.md` (multi-region scaling spec, agent-executable).
+The decision space split mid-cycle once the original constraint (we believed the case-study brief mandated a relational data model) was re-checked and found to be a Phase 1 commitment, not a brief mandate. For a greenfield deployment, the cloud-native production-grade multi-region architecture is **DynamoDB Global Tables active-active** as documented in **ADR-0042** — no Aurora promotion step, no Lambda failover orchestration, no failback Path 1 vs Path 2 reconstitution complexity, RTO collapses from ~5-8 min to ~60-300s (DNS propagation only).
+
+This ADR is preserved because:
+- The PG/Aurora-Global path's operational complexity (Lambda automation, failback semantics, Path 2 reconstitution 1-12h) is the **direct evidence** for why ADR-0042 is the right greenfield choice. Reading both side-by-side shows the architectural fitness gap.
+- A forker who has already invested in PG schemas + tooling + ORM may rationally choose to migrate to Aurora Global rather than redesign the data layer; this ADR remains the runbook for that path.
+- The case-study deliverable itself uses RDS PostgreSQL (ADR-0009) — if implemented in this case-study's cycle, ADR-0040's path is what would actually be built.
+
+This ADR records the production endpoint architecture **as it would be implemented from the existing PG investment**. The case-study deliverable is single-region (`eu-central-1`) per ADR-0007 (single-region multi-AZ posture) and within the build-budget cap of ADR-0034 (24h); ADR-0040 + ADR-0042 are both V2 promotion paths, neither implemented in the case-study cycle. The promotion runbook is `docs/scaling_runbook.md` (agent-executable spec).
 
 ## Context
 
@@ -91,9 +99,70 @@ The production endpoint architecture is multi-region active-passive with Route53
 
 ### Failover semantics (RTO / RPO targets)
 
-- **RTO (time to traffic on secondary)**: ~3 minutes worst case. Breakdown: Route53 health check 3 consecutive failures × 30s = 90s + DNS propagation at TTL=60s up to ~60s + ECS UpdateService scaling app from 1 → 3 takes ~60s (warm-pool tasks). Within ADR-0008 RTO target of 15 minutes.
-- **RPO (data loss bound)**: Aurora Global Database replication lag is typically < 1 second under normal load. ADR-0008 RPO target ≤ 5 min for durable writes is comfortably met. RDS read-replica fallback gives RPO of "the time since last replica catch-up", which has been observed at sub-minute under steady load.
-- **Failback**: manual operator decision after the primary region is healthy and the data delta has been resolved (Aurora Global supports backwards switchover; RDS read-replica path requires DMS or dump-restore — V2 work).
+- **RTO (time to traffic on secondary, with Lambda automation)**: **~5–8 minutes worst case**. Breakdown:
+  - Route53 health check 3 consecutive failures × 30s = **90s**
+  - Composite alarm → SNS → Lambda invocation (cold start + decision logic): **30s**
+  - Lambda calls `failover-global-cluster` (disaster path) or `switchover-global-cluster` (planned path); Aurora promotes secondary writer + storage write-ownership transfer: **60–180s** (Aurora API returns in ~30s; actual promotion settle ~60–120s additional)
+  - Route53 record update API call: **1–2s API + DNS TTL propagation 60–300s** (TTL=60s, but resolvers may cache)
+  - ECS UpdateService secondary `desired_count` 1 → 3 + tasks healthy: **60–120s**
+  - Total: 5–8 min realistic, within ADR-0008 RTO target of 15 minutes
+- **RTO (operator-driven, no Lambda automation)**: ~15+ min realistic. Operator notification time + login + CLI sequence is unbounded; this exceeds ADR-0008's RTO budget if the operator is unavailable. Lambda automation is therefore the production-recommended posture; operator-driven is documented as the V2 fallback when an organisation has not built the automation yet.
+- **RPO (data loss bound)**: Aurora Global Database replication lag is typically < 1 second under normal load. ADR-0008 RPO target ≤ 5 min for durable writes is comfortably met. RDS read-replica fallback gives RPO of "the time since last replica catch-up", which has been observed at sub-minute under steady load. **`switchover-global-cluster` path achieves RPO=0** (it drains in-flight writes on the original primary before transferring write ownership) but requires the original primary to be reachable; it is the planned-failover path, not the disaster path.
+
+### Lambda automation pattern (the operational glue Aurora Global doesn't provide turnkey)
+
+Aurora Global Database does **not** include native automatic cross-region write failover. The replication is automatic (~1s lag); the secondary serves reads automatically; **but write-ownership transfer is operator-initiated** (split-brain prevention by deliberate design). The customer-built glue is a Lambda function triggered by composite CloudWatch alarms:
+
+```
+Trigger sources (any of):
+  - Route53 health check on primary ALB → CloudWatch composite alarm
+  - CloudWatch alarm: primary RDS connections = 0 / region-level health
+  - AWS Health Dashboard region-down event (EventBridge)
+  - Manual API Gateway button (ops dashboard / Slack-bot)
+                  ↓ SNS
+                  ↓
+        Failover Lambda (concurrency=1, timeout=5min, DLQ)
+                  ↓
+        (1) describe-global-clusters → check primary state
+        (2) Decision:
+              if primary reachable + healthy → switchover-global-cluster (RPO=0)
+              else                          → failover-global-cluster (disaster path)
+        (3) Wait for status='available' on new primary cluster
+        (4) Update Route53 failover record → secondary ALB
+        (5) ECS UpdateService secondary: desired_count 1 → 3
+```
+
+IAM scope for the Lambda execution role:
+- `rds:FailoverGlobalCluster`, `rds:SwitchoverGlobalCluster`, `rds:DescribeGlobalClusters`
+- `route53:ChangeResourceRecordSets` (scoped to the hosted zone)
+- `ecs:UpdateService` (scoped to the secondary region's app service)
+- `cloudwatch:DescribeAlarms` (for read-back state verification)
+
+The two Aurora Global APIs the Lambda chooses between have distinct semantics:
+
+| API | When used | RPO | Original primary disposition |
+|---|---|---|---|
+| `switchover-global-cluster` (added 2023, "Managed Planned Failover") | Original primary is **reachable**; controlled drain | **0** (waits for in-flight commits) | Becomes secondary; both clusters remain in same global cluster |
+| `failover-global-cluster` (disaster path) | Original primary **unreachable** | < 1s (replication lag) | **Detached** — becomes standalone cluster outside the global cluster |
+
+The disposition of the original primary is the load-bearing distinction for failback (see Failback semantics below).
+
+### Failback semantics
+
+Failover and failback are **not symmetric**. The cost of failback depends on which API the failover used:
+
+| Path | When | Failback time | Reconstitution work |
+|---|---|---|---|
+| **Path 1** (origin = `switchover`) | Planned drain; primary was reachable | **5–10 min** | Both clusters still in same global cluster; replication direction has reversed (Ireland → Frankfurt). Verify lag < 1s, then call `switchover-global-cluster` again with Frankfurt as target. RPO=0 on failback. Lambda can fully automate. |
+| **Path 2** (origin = `failover`) | Disaster; primary was unreachable | **1–12 hours** | Frankfurt's original cluster is **detached + stale + must be deleted**. Then: (a) `create-global-cluster --source-db-cluster-identifier <ireland>` to wrap Ireland's now-standalone cluster as a new global cluster, (b) `create-db-cluster --global-cluster-identifier <new-global> --source-region eu-west-1` to add Frankfurt back as new secondary, (c) **wait for initial storage seed** (1-2h for 10 GB cluster, 8-12h for 100 GB cluster), (d) wait for replication catch-up of accumulated writes (depends on outage duration), (e) finally `switchover-global-cluster` back to Frankfurt. Most of this is operator-driven; only the final switchover is Lambda-automatable. |
+
+**Cost during Path 2 reconstitution**: double-cluster storage (Ireland primary + new Frankfurt secondary) + cross-region transfer ~$0.02/GB for the seed + ongoing replication. For a 10 GB cluster: ~$0.20 seed + $0.50/day double storage. The cost is bounded (hours-to-days) but real.
+
+**Sharp edges shared across both paths**:
+- **Split-brain risk**: Lambda must NOT fire on transient network blips. Mitigation: composite alarm with multi-condition AND (Route53 + CloudWatch metric + EventBridge), plus 5-min cooldown after each invocation.
+- **DDL in-flight at failover**: an `ALTER TABLE` in-flight when failover triggers can lead to schema divergence. Production hardening: schema migrations should be backwards-compatible, and migration windows should pause failover automation.
+- **Application-level read-only handling on secondary**: Aurora secondary clusters are read-only until promotion. Secondary-region app/worker must either run in a read-only health-check-only mode, or have ECS `desired_count = 0` until failover triggers (then Lambda scales up).
+- **Failback is at minimum 30 min** even on Path 1 (need to verify replication caught up + plan a switchover window). Path 2 is hours-to-days. Production should not assume "we can failback whenever" — it is a planned operation.
 
 ## Alternatives Considered
 
@@ -105,7 +174,7 @@ The production endpoint architecture is multi-region active-passive with Route53
 | **CloudFront + multi-region origin** | Adds a CDN edge layer in front of the ALB(s). Useful for global anonymous web traffic. **Not useful here**: the access pattern is operator-on-Client-VPN reaching an internal ALB, not public web requests. CDN edge caching does not fit a VPN-gated single-tenant deployment. Rejected by problem-fit, not by cost. |
 | **Aurora Global Database with secondary in `us-east-1`** | The data residency stance is EU-only (per the geographic scope clarification above). Crossing the Atlantic for the standby breaks GDPR-clean failover semantics. Rejected by data-residency policy. |
 | **Vanilla RDS cross-region read replica (no Aurora)** | Avoids the migration from vanilla RDS PostgreSQL to Aurora. Trade-offs: (a) RPO worse (minutes vs ~1 second); (b) failover is manual (promote replica, swap connection string), not automatic. Acceptable for an interim — recorded as an alternative path for forkers who don't want the Aurora migration cost. |
-| **DynamoDB Global Tables instead of Aurora Global** | Truly multi-master, no migration overhead. Rejected: the schema is relational (executions table with foreign keys, range queries by created_at, paginated reads) — DynamoDB's single-table model would force a redesign that exceeds the target's scope. |
+| **DynamoDB Global Tables instead of Aurora Global** | **For greenfield this is the right Day 1 choice — see ADR-0042 for the full retrospective.** DynamoDB Global Tables is native multi-master multi-region active-active: zero failover orchestration (both regions are writers; conflict resolution is last-writer-wins), zero failback reconstitution (no detach-and-rebuild), RTO = DNS propagation only (~60-300s vs Aurora Global's 5-8 min with Lambda), no Aurora migration cost. The architectural mismatch documented earlier (relational schema with foreign keys) was the assumed-then-corrected constraint: the case-study brief is engine-agnostic; PG was Phase 1 commitment, not a brief mandate. **The case-study deliverable retains PG/Aurora-Global path because the schema migration is its own ~25h work + 50+ test rewrites that were not budgeted at decision time.** A forker starting greenfield should pick DynamoDB Global Tables and skip this ADR's Aurora-specific complexity entirely. The Aurora path documented here is a "migration-from-existing-investment" runbook, not a "right way to design multi-region from scratch" recommendation. |
 | **AWS RAM-shared Transit Gateway for cross-region private replication** | Would route Aurora replication traffic through customer VPCs over a customer-owned TGW. Rejected: doubles operational complexity for no security benefit (Aurora replication traffic is already TLS over the AWS backbone). |
 | **Two independent regions with manual promotion at failover (no Route53)** | Keeps the regions truly independent; failover is operator-driven via DNS cutover at registrar level. Rejected: RTO blows out to "however long the operator takes to log in", which is unbounded and worse than ADR-0008's 15-minute target. |
 
@@ -121,10 +190,11 @@ The production endpoint architecture is multi-region active-passive with Route53
 
 ## Related ADRs
 - ADR-0007 (single-region multi-AZ — the case-study scope decision this ADR's target supersedes for production deployments only; ADR-0007 stays as the case-study calibration)
-- ADR-0008 (reliability targets — RTO 15 min / RPO 5 min provide the budget against which this target's 3-min RTO and < 1s RPO are measured)
+- ADR-0008 (reliability targets — RTO 15 min / RPO 5 min provide the budget against which this target's 5-8 min Lambda-driven RTO and < 1s RPO are measured)
 - ADR-0009 (DB topology Multi-AZ standby — the within-region replication that this ADR extends across regions via Aurora Global)
 - ADR-0024 (VPN cert provisioning — operator-laptop CA shared across regions)
 - ADR-0034 (build budget 22 → 24h — the budget that explicitly excluded multi-region from the case-study cycle)
 - ADR-0037 (secrets rotation deferred — same V2-target shape; production adoption picks both up)
+- ADR-0042 (DynamoDB Global Tables greenfield retrospective — the architectural alternative this ADR considered and rejected by existing-investment constraint, not by technical fit)
 - `docs/scaling_runbook.md` (the agent-executable spec for executing this ADR)
 - `docs/migration_runbook.md` (cross-cloud variant; references this ADR's region-pair pattern as the within-AWS analogue)

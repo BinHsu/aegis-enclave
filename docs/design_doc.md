@@ -17,7 +17,12 @@ Every architectural claim below is anchored to a numbered ADR in [`docs/ADR/`](A
 
 ### 1.1 High availability
 
-The cloud composition is deployed to a single AWS region (`eu-central-1`, Frankfurt) with three-AZ subnet distribution (per ADR-0007 reconsidered) and an RDS Multi-AZ standby. Multi-region active-passive (Frankfurt primary + Ireland standby with Route53 health-based failover) is the **production target** documented in ADR-0040, and the agent-executable promotion runbook is `docs/scaling_runbook.md` (ADR-0012). The triggers that would move multi-region from documented-target into deployed-implementation are named explicitly in the Reliability section of the design — none of them are met at case-study scope:
+The cloud composition (`main` branch) is deployed to a single AWS region (`eu-central-1`, Frankfurt) with three-AZ subnet distribution (per ADR-0007 reconsidered) and an RDS Multi-AZ standby. **Production target depends on the deployment starting point**:
+
+- **Greenfield deployment** (no existing PG investment): the cloud-native production-grade target is multi-region **active-active** via DynamoDB Global Tables (ADR-0042), demonstrated on the `pivot/dynamodb-multi-region` branch. RTO ~60-300s (DNS-only); no Aurora promotion step; no Lambda failover orchestration; no failback Path 1/2 reconstitution. This is the canonical greenfield target.
+- **Existing PG-investment deployment** (case-study `main` branch starting point): the upgrade target is multi-region **active-passive** via Aurora Global Database (ADR-0040), with Lambda-driven failover and the operational complexity that path requires. Promotion runbook in `docs/scaling_runbook.md`.
+
+Both branches realise the multi-region step in `docs/scaling_runbook.md` (ADR-0012); the agent-executable runbook bifurcates greenfield vs migration paths. The triggers that would move multi-region from documented-target into deployed-implementation are named explicitly in the Reliability section of the design — none of them are met at case-study scope:
 
 1. Workload concurrency exceeding what a single region can absorb (e.g., simultaneous high-throughput streams from independent producers)
 2. Globally distributed clients requiring locally-terminated network paths for latency or jurisdiction reasons

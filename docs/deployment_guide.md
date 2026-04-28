@@ -397,11 +397,16 @@ The cache + schema bootstrap is currently triggered by a Terraform `null_resourc
 - **Tier 2 — AMP for Prometheus-native ingest**: only matters once the application emits high-cardinality metrics or distribution exemplars that EMF's dimension model is awkward for. ~3-4h on top of AMG.
 - **Tier 3 — Distributed tracing**: AWS X-Ray + ADOT collector + SQS message-attribute trace_id propagation. ~10-12h. Defer until first buyer-side / forker-side need.
 - **PagerDuty / Slack delivery**: Email is the floor; AWS Chatbot integration with Slack/Teams is the production extension. ~3-4h.
-- **Cross-region SNS aggregation**: Multi-region (ADR-0040) needs a per-region alarm + cross-region SNS or a single failover topic. Out of scope for single-region case-study.
+- **Cross-region SNS aggregation**: Multi-region deployments (ADR-0040 Aurora Global for existing-PG forks; ADR-0042 DynamoDB Global Tables for greenfield) need per-region alarms + cross-region SNS or a single failover topic. Out of scope for single-region case-study.
 
-### 5. Multi-region posture (ADR-0009)
+### 5. Multi-region posture (ADR-0007 reconsidered → bifurcated greenfield ADR-0042 / migration ADR-0040)
 
-Single-region (default `eu-central-1`) by design. Multi-region triggers documented in ADR-0009 and exercised by the migration runbook (`docs/migration_runbook.md`). Production deployments crossing the multi-region threshold should follow the runbook before ad-hoc resource duplication.
+The `main` branch is single-region (default `eu-central-1`) by design (ADR-0007). Production target depends on starting point:
+
+- **Greenfield deployment**: ADR-0042 = DynamoDB Global Tables active-active multi-region, demonstrated on `pivot/dynamodb-multi-region` branch. Cloud-native, simpler failover (DNS-only), no Aurora migration.
+- **Existing-PG deployment**: ADR-0040 = Aurora Global active-passive with Lambda-driven failover, full Aurora-specific operational complexity documented in that ADR.
+
+Multi-region triggers documented in ADR-0007 (case-study calibration) and exercised by `docs/scaling_runbook.md` (now bifurcated by deployment starting point). Production deployments crossing the multi-region threshold should follow the runbook before ad-hoc resource duplication.
 
 ### 6. VPC Flow Logs
 

@@ -1,7 +1,10 @@
-# ADR-0035: Bootstrap ECS task runs both schema migration and cache seeding
+# ADR-0035: Bootstrap ECS task runs both schema migration and cache seeding (case-study scope; greenfield drops schema migration per ADR-0042)
 
 ## Status
-Accepted (2026-04-26)
+**Accepted (2026-04-26) for the case-study deliverable scope** (`main` branch — bootstrap task carries `Base.metadata.create_all` for the PG executions table + Valkey cache seed).
+**Superseded by ADR-0042 for greenfield production deployments (2026-04-28)** — DynamoDB tables are terraform-managed (`aws_dynamodb_table.executions` resource); there is no schema-migration step in the greenfield target. The bootstrap task's role narrows to cache pre-warm only on the `pivot/dynamodb-multi-region` branch. The driver-fragility argument ("`null_resource` is brittle") in this ADR's Reconsidered block remains correct for both branches; in the greenfield branch it applies to the cache-seed-only bootstrap, in the case-study branch it applies to schema+cache-seed.
+
+The ADR body below records the original case-study rationale as historical truth and remains accurate for `main` branch.
 
 ## Context
 

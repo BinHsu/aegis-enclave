@@ -1,7 +1,10 @@
-# ADR-0007: Single-region eu-central-1 multi-AZ; multi-region in Phase 2
+# ADR-0007: Single-region eu-central-1 multi-AZ (case-study scope; greenfield V2 multi-region per ADR-0042)
 
 ## Status
-Accepted (2026-04-25)
+**Accepted (2026-04-25) for the case-study deliverable scope** (`main` branch — PG + RDS Multi-AZ + 3-AZ posture).
+**Superseded by ADR-0042 for greenfield production deployments (2026-04-28)** — a forker starting from scratch should follow ADR-0042 (DynamoDB Global Tables active-active multi-region) rather than this ADR's single-region calibration. ADR-0042's `pivot/dynamodb-multi-region` branch demonstrates the greenfield target.
+
+The ADR body below records the original case-study calibration as historical truth + the 04/28 reconsidered block bumping 2 AZ → 3 AZ. Both remain accurate for `main` branch.
 
 ## Context
 The candidate's mental model derives from two inputs: the brief's "small application" framing, and the buyer's actual production posture (a single-mission cargo program with EU customers and EU-region ground stations). Neither input justifies multi-region in Phase 1, but skipping multi-AZ would abandon free architectural credit.
