@@ -1,6 +1,6 @@
 # ADR Index — read by goal, not by number
 
-38 ADRs is overwhelming for first-time onboarding. This index groups them by reader goal so you can pick the load-bearing ones for *your* purpose and skip the rest.
+39 ADRs is overwhelming for first-time onboarding. This index groups them by reader goal so you can pick the load-bearing ones for *your* purpose and skip the rest.
 
 ## Pick your goal
 
@@ -12,6 +12,28 @@
 | **D. "Forking for production deployment"** | All bands + skim superseded for context | 2-3 hrs |
 
 Within each band, ADRs are ordered by reading priority within that band, not by number.
+
+## Engineering signal mapping (for code reviewers)
+
+If you are evaluating the repo against a senior-engineer rubric, here are the ADRs that evidence each signal axis (multiple ADRs often touch the same axis — listed in order of weight):
+
+| Signal axis | Primary ADRs | What to look for |
+|---|---|---|
+| **Async API boundary** | 0029, 0033, 0030 | POST 202 + poll + DB state machine; SQS visibility 90s; ElasticMQ local parity |
+| **Timeout philosophy** | 0022, 0033, 0027 | 4-tier drain (app/ECS/ALB/SQS); SIGALRM 60s on CPU-bound; ALB idle 45s |
+| **Failure handling** | 0033, 0038, 0035 | Idempotent retry; DLQ alarm + manual triage (anti-auto-retry); bootstrap idempotency |
+| **Observability** | 0003, 0008 (+ design_doc § 3) | Calibrated stop-line; SLO/RTO/RPO targets; CloudWatch + structured logs only (no APM by design) |
+| **Scalability** | 0029, 0009, 0007 | SQS-depth-driven autoscale; Multi-AZ standby; single-region with multi-region triggers documented |
+| **Decision documentation** | (this INDEX + every ADR's Status / Related field) | Nygard MADR; supersession chains (0002→0028→0034, 0020→0029/0031/0032, 0023→0029) |
+| **Calibration honesty** | 0003, 0013, 0015, 0034, 0037, 0038 | PoC scope + prod hygiene split; deliverable-not-demo; explicit anti-pattern analyses |
+| **Supply chain rigor** | 0039, 0036, 0016 | uv.lock + terraform exact-pin + `--provenance=false` ECR + signed-source defaults |
+| **Cost discipline** | 0006, 0015, 0024, 0027, 0031, 0032 (+ deployment_guide § Cost shape) | Per-component cost analysis; per-hour rates; FinOps scope honest |
+| **Security posture** | 0019, 0024, 0027, 0037 | Private-only VPC (no IGW/NAT); mTLS Client VPN; managed master password; rotation deferral path |
+| **Agent-executable runbooks** | 0012, 0014 (+ migration_runbook + scaling_runbook) | precondition / action / verify_cmd / on_failure / human_gate schema |
+| **Reproducibility from cold** | 0039, 0036, 0030 | Lock files; deterministic image tags; local↔cloud parity |
+| **Test rigor** | (CLAUDE.md § 8 + tests/) | BVA mandatory; branch coverage 95%; sympy differential; deterministic-seed fuzz |
+| **Incident-evidence discipline** | 0035 (Reconsidered block), 0038, 0027 (Future) | ADRs that document lessons from real incidents, not just decisions |
+| **Capability gates / human-in-loop** | 0012, 0024 (+ CLAUDE.md § 6) | Auto / Confirm / Refuse policy on irreversible operations |
 
 ---
 
@@ -73,12 +95,13 @@ These four set the scope, trade-off framework, and time budget that every other 
 |---|---|
 | [0010](0010-vpn-ownership-app-vs-platform.md) | Why VPN is part of the application repo (not a platform-level prereq) |
 | [0014](0014-mermaid-smoke-test-acceptance.md) | Mermaid only; no draw.io / images / Figma |
-| [0016](0016-community-terraform-modules.md) | terraform-aws-modules over hand-rolled — pinned exact-patch since Phase 2.5.1 |
+| [0016](0016-community-terraform-modules.md) | terraform-aws-modules over hand-rolled — pinned exact-patch since Phase 2.5.1 (see ADR-0039) |
 | [0023](0023-deferred-autoscaling-fixed-task-count.md) | Original fixed task count (superseded by 0029 worker autoscale on SQS depth) |
 | [0025](0025-terraform-state-backend-s3-dynamodb.md) | S3 + DynamoDB remote state for production adoption (case-study uses local) |
 | [0026](0026-pr-time-terraform-plan-via-oidc.md) | OIDC tier-1 read-only role for PR-time `terraform plan` workflow |
 | [0030](0030-elasticmq-local-sqs-parity.md) | ElasticMQ in docker-compose for local SQS-shape parity |
 | [0032](0032-cost-estimator-removed.md) | Why the Phase 1 cost estimator was removed (replaced by three-layer cost guard in design_doc § 4.2) |
+| [0039](0039-supply-chain-rigor.md) | Exact-pin / lock / signed-source defaults — uv.lock, terraform exact-patch, `--provenance=false` ECR, brew-preferred tooling |
 
 ---
 
