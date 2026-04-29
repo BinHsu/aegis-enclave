@@ -706,9 +706,9 @@ class TestIsPrimeWithKnown:
 
     def test_differential_against_sympy_small_range(self) -> None:
         for n in range(0, 1000):
-            assert _is_prime_with_known(n, _SMALL_PRIMES) == sympy_isprime(
-                n
-            ), f"disagreement with sympy at n={n}"
+            assert _is_prime_with_known(n, _SMALL_PRIMES) == sympy_isprime(n), (
+                f"disagreement with sympy at n={n}"
+            )
 
     def test_smallest_prime_above_million(self) -> None:
         assert _is_prime_with_known(1_000_003, _SMALL_PRIMES) is True
