@@ -116,7 +116,7 @@ ok "AWS caller:  $ARN"
 
 REGION=$(grep -E '^region[[:space:]]*=' "$TFVARS" 2>/dev/null | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
 REGION="${REGION:-eu-central-1}"
-SECONDARY_REGION=$(grep -E '^secondary_region[[:space:]]*=' "$TFVARS" 2>/dev/null | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
+SECONDARY_REGION=$( (grep -E '^secondary_region[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
 
 if [[ ! -d "$TF_DIR/.terraform" ]]; then
     info ".terraform/ missing — running terraform init"

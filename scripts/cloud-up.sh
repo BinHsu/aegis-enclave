@@ -153,11 +153,11 @@ REGION=$(grep -E '^region[[:space:]]*=' "$TFVARS" | sed -E 's/.*=[[:space:]]*"([
 REGION="${REGION:-eu-central-1}"
 ok "Region (primary): $REGION"
 
-SECONDARY_REGION=$(grep -E '^secondary_region[[:space:]]*=' "$TFVARS" | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
+SECONDARY_REGION=$( (grep -E '^secondary_region[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
 if [[ -n "$SECONDARY_REGION" ]]; then
     ok "Region (secondary): $SECONDARY_REGION (multi-region active-active mode)"
 else
-    info "secondary_region empty — single-region mode"
+    info "secondary_region empty/absent — single-region mode"
 fi
 
 # ─── Step 1: VPN PKI provisioning (idempotent, multi-region) ───────────────
