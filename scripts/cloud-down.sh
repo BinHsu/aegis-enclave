@@ -116,6 +116,7 @@ ok "AWS caller:  $ARN"
 
 REGION=$(grep -E '^region[[:space:]]*=' "$TFVARS" 2>/dev/null | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
 REGION="${REGION:-eu-central-1}"
+SECONDARY_REGION=$(grep -E '^secondary_region[[:space:]]*=' "$TFVARS" 2>/dev/null | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
 
 if [[ ! -d "$TF_DIR/.terraform" ]]; then
     info ".terraform/ missing — running terraform init"
@@ -161,11 +162,12 @@ fi
 # ─── Step 4: Delete ACM-imported VPN certs ─────────────────────────────────
 section "4/6 — Delete ACM-imported VPN certs (out-of-tfstate cleanup)"
 if [[ -f "$CERT_TFVARS" ]]; then
-    SERVER_ARN=$(grep -oE 'server_cert_arn[[:space:]]*=[[:space:]]*"arn:[^"]+"' "$CERT_TFVARS" | sed -E 's/.*"(arn:[^"]+)"/\1/')
-    CLIENT_ARN=$(grep -oE 'client_cert_arn[[:space:]]*=[[:space:]]*"arn:[^"]+"' "$CERT_TFVARS" | sed -E 's/.*"(arn:[^"]+)"/\1/')
+    # Primary region certs
+    SERVER_ARN=$(grep -E '^server_cert_arn = "arn:' "$CERT_TFVARS" | sed -E 's/.*"(arn:[^"]+)".*/\1/')
+    CLIENT_ARN=$(grep -E '^client_cert_arn = "arn:' "$CERT_TFVARS" | sed -E 's/.*"(arn:[^"]+)".*/\1/')
     for ARN_TO_DELETE in "$SERVER_ARN" "$CLIENT_ARN"; do
         if [[ -n "$ARN_TO_DELETE" ]]; then
-            info "aws acm delete-certificate --certificate-arn $ARN_TO_DELETE"
+            info "aws acm delete-certificate --certificate-arn $ARN_TO_DELETE --region $REGION"
             if aws acm delete-certificate --certificate-arn "$ARN_TO_DELETE" --region "$REGION" 2>/dev/null; then
                 ok "deleted: $ARN_TO_DELETE"
             else
@@ -173,6 +175,23 @@ if [[ -f "$CERT_TFVARS" ]]; then
             fi
         fi
     done
+
+    # Secondary region certs (multi-region only)
+    if [[ -n "$SECONDARY_REGION" ]]; then
+        SECONDARY_SERVER_ARN=$(grep -E '^secondary_server_cert_arn = "arn:' "$CERT_TFVARS" | sed -E 's/.*"(arn:[^"]+)".*/\1/')
+        SECONDARY_CLIENT_ARN=$(grep -E '^secondary_client_cert_arn = "arn:' "$CERT_TFVARS" | sed -E 's/.*"(arn:[^"]+)".*/\1/')
+        for ARN_TO_DELETE in "$SECONDARY_SERVER_ARN" "$SECONDARY_CLIENT_ARN"; do
+            if [[ -n "$ARN_TO_DELETE" ]]; then
+                info "aws acm delete-certificate --certificate-arn $ARN_TO_DELETE --region $SECONDARY_REGION"
+                if aws acm delete-certificate --certificate-arn "$ARN_TO_DELETE" --region "$SECONDARY_REGION" 2>/dev/null; then
+                    ok "deleted: $ARN_TO_DELETE"
+                else
+                    warn "delete failed (may already be gone): $ARN_TO_DELETE"
+                fi
+            fi
+        done
+    fi
+
     rm -f "$CERT_TFVARS"
     ok "removed $CERT_TFVARS"
 else

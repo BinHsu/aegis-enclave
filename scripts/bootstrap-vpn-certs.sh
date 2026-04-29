@@ -112,20 +112,22 @@ ok "caller:  $ARN"
 # ─── PKI directory hygiene ───────────────────────────────────────────────────
 section "3/6 — PKI directory hygiene"
 if [[ -d "$PKI_DIR" ]] && [[ $FORCE -eq 0 ]]; then
-    fail "$PKI_DIR exists and --force not given.
-
-      Re-running on an existing PKI is supported for ADDING operators only:
-        ./scripts/bootstrap-vpn-certs.sh --operator new-person
-
-      To DESTROY and rebuild the CA (revokes all existing client access):
-        rm -rf $PKI_DIR
-        ./scripts/bootstrap-vpn-certs.sh --operator ... --force"
+    # PKI exists — supported scenarios (all idempotent):
+    #   - Adding new operator(s) → easyrsa skips existing client certs in step 4/6
+    #   - ACM import to a different --region → ACM re-import returns same ARN
+    #     (or imports fresh if cert is not present in that region yet)
+    #   - Re-running same operator + same region → no-op
+    # To DESTROY and rebuild the CA (revokes all existing client access):
+    #   rm -rf $PKI_DIR && ./scripts/bootstrap-vpn-certs.sh --operator ... --force
+    info "$PKI_DIR exists — re-using existing PKI (idempotent for new operators / cross-region ACM import)"
+    PKI_REUSED=1
+else
+    PKI_REUSED=0
+    # Create with restrictive perms — root key custody matters (ADR-0024 § Security posture)
+    mkdir -p "$PKI_DIR"
+    chmod 700 "$PKI_DIR"
+    ok "pki dir: $PKI_DIR (chmod 700)"
 fi
-
-# Create with restrictive perms — root key custody matters (ADR-0024 § Security posture)
-mkdir -p "$PKI_DIR"
-chmod 700 "$PKI_DIR"
-ok "pki dir: $PKI_DIR (chmod 700)"
 
 # ─── easy-rsa: init + build CA + server cert ─────────────────────────────────
 section "4/6 — easy-rsa PKI build"
