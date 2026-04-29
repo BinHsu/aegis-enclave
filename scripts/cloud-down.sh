@@ -163,8 +163,8 @@ fi
 section "4/6 — Delete ACM-imported VPN certs (out-of-tfstate cleanup)"
 if [[ -f "$CERT_TFVARS" ]]; then
     # Primary region certs
-    SERVER_ARN=$(grep -E '^server_cert_arn = "arn:' "$CERT_TFVARS" | sed -E 's/.*"(arn:[^"]+)".*/\1/')
-    CLIENT_ARN=$(grep -E '^client_cert_arn = "arn:' "$CERT_TFVARS" | sed -E 's/.*"(arn:[^"]+)".*/\1/')
+    SERVER_ARN=$( (grep -E '^server_cert_arn = "arn:' "$CERT_TFVARS" 2>/dev/null || true) | sed -E 's/.*"(arn:[^"]+)".*/\1/')
+    CLIENT_ARN=$( (grep -E '^client_cert_arn = "arn:' "$CERT_TFVARS" 2>/dev/null || true) | sed -E 's/.*"(arn:[^"]+)".*/\1/')
     for ARN_TO_DELETE in "$SERVER_ARN" "$CLIENT_ARN"; do
         if [[ -n "$ARN_TO_DELETE" ]]; then
             info "aws acm delete-certificate --certificate-arn $ARN_TO_DELETE --region $REGION"
@@ -178,8 +178,8 @@ if [[ -f "$CERT_TFVARS" ]]; then
 
     # Secondary region certs (multi-region only)
     if [[ -n "$SECONDARY_REGION" ]]; then
-        SECONDARY_SERVER_ARN=$(grep -E '^secondary_server_cert_arn = "arn:' "$CERT_TFVARS" | sed -E 's/.*"(arn:[^"]+)".*/\1/')
-        SECONDARY_CLIENT_ARN=$(grep -E '^secondary_client_cert_arn = "arn:' "$CERT_TFVARS" | sed -E 's/.*"(arn:[^"]+)".*/\1/')
+        SECONDARY_SERVER_ARN=$( (grep -E '^secondary_server_cert_arn = "arn:' "$CERT_TFVARS" 2>/dev/null || true) | sed -E 's/.*"(arn:[^"]+)".*/\1/')
+        SECONDARY_CLIENT_ARN=$( (grep -E '^secondary_client_cert_arn = "arn:' "$CERT_TFVARS" 2>/dev/null || true) | sed -E 's/.*"(arn:[^"]+)".*/\1/')
         for ARN_TO_DELETE in "$SECONDARY_SERVER_ARN" "$SECONDARY_CLIENT_ARN"; do
             if [[ -n "$ARN_TO_DELETE" ]]; then
                 info "aws acm delete-certificate --certificate-arn $ARN_TO_DELETE --region $SECONDARY_REGION"

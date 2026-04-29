@@ -83,7 +83,7 @@ ALB_DNS=$(cd "$TF_DIR" && terraform output -raw alb_dns_name 2>/dev/null) \
     || fail "alb_dns_name output missing — run 'make cloud-up' first"
 ok "alb_dns_name: $ALB_DNS"
 
-ALB_IP=$(dig +short "$ALB_DNS" | grep -E '^[0-9.]+$' | head -1)
+ALB_IP=$( (dig +short "$ALB_DNS" | grep -E '^[0-9.]+$' || true) | head -1)
 [[ -n "$ALB_IP" ]] || fail "DNS resolution returned no IP — VPN not connected?
 Try: 'ping $ALB_DNS' from your terminal. If timeout, connect VPN first."
 ok "alb resolved IP: $ALB_IP"

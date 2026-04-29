@@ -111,7 +111,7 @@ trap '[[ -f "$PLAN_FILE" ]] && rm -f "$PLAN_FILE"' EXIT
 
 # ─── Confirm — strict ─────────────────────────────────────────────────────
 section "Confirm destroy"
-REGION=$(grep -E '^region[[:space:]]*=' "$TFVARS" | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
+REGION=$( (grep -E '^region[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
 echo "About to ${RED}${BOLD}DESTROY${RESET} infrastructure in:"
 echo "  AWS account: $ACCOUNT_ID"
 echo "  Region:      ${REGION:-<not parsed>}"

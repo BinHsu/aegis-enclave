@@ -68,7 +68,7 @@ command -v aws       >/dev/null 2>&1 || fail "aws CLI not found"
 command -v jq        >/dev/null 2>&1 || fail "jq not found"
 command -v terraform >/dev/null 2>&1 || fail "terraform not found"
 
-REGION=$(grep -E '^region[[:space:]]*=' "$TF_DIR/terraform.tfvars" 2>/dev/null \
+REGION=$( (grep -E '^region[[:space:]]*=' "$TF_DIR/terraform.tfvars" 2>/dev/null || true) \
          | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
 REGION="${REGION:-eu-central-1}"
 

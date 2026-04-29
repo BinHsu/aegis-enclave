@@ -150,7 +150,7 @@ if [[ ! -f "$TFVARS" ]]; then
 fi
 ok "$TFVARS present"
 
-REGION=$(grep -E '^region[[:space:]]*=' "$TFVARS" | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
+REGION=$( (grep -E '^region[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
 REGION="${REGION:-eu-central-1}"
 ok "Region (primary): $REGION"
 
