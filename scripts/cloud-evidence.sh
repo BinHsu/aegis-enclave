@@ -314,6 +314,11 @@ fi
 section "4/6 — CloudWatch log excerpts + cache_hit/compute_done ground truth"
 START_MS=$(( ($(date +%s) - 3600) * 1000 ))
 SHORT_START_MS=$(( ($(date +%s) - 600) * 1000 ))  # last 10 min — used for cache counter window
+# Bootstrap is one-shot at cloud-up T0. Cloud-acceptance windows can run up to
+# 3h (per cost discipline), and evidence capture can lag further. 12h covers
+# any reasonable cycle. Bootstrap log is tiny (1-2 events) — wider window is
+# free.
+BOOT_START_MS=$(( ($(date +%s) - 43200) * 1000 ))
 
 # Helper: capture worker log + cache counters from one region.
 # Sets globals HIT_COUNT / COMPUTE_COUNT (primary region only — used in summary).
@@ -379,10 +384,10 @@ if aws logs describe-log-groups --region "$REGION" --log-group-name-prefix "$BOO
      | grep -q "$BOOT_LG"; then
     aws logs filter-log-events --region "$REGION" \
         --log-group-name "$BOOT_LG" \
-        --start-time "$START_MS" \
+        --start-time "$BOOT_START_MS" \
         --output text \
-        --query 'events[*].[timestamp,message]' \
-        > "$BOOTSTRAP_LOG" 2>/dev/null \
+        --query 'events[*].message' \
+        2>/dev/null | tr '\t' '\n' > "$BOOTSTRAP_LOG" \
         && ok "bootstrap logs ($REGION): $(wc -l <"$BOOTSTRAP_LOG" | tr -d ' ') lines → $(basename "$BOOTSTRAP_LOG")" \
         || warn "bootstrap log fetch failed"
 
