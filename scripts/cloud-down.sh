@@ -114,7 +114,7 @@ ARN=$( ( printf '%s' "$AUTH_RAW" | grep -oE '"Arn":[[:space:]]*"[^"]+"' | sed -E
 ok "AWS account: $ACCOUNT_ID"
 ok "AWS caller:  $ARN"
 
-REGION=$(grep -E '^region[[:space:]]*=' "$TFVARS" 2>/dev/null | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
+REGION=$( (grep -E '^region[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
 REGION="${REGION:-eu-central-1}"
 SECONDARY_REGION=$( (grep -E '^secondary_region[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
 
