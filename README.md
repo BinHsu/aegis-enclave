@@ -484,23 +484,31 @@ This gate exercises the **deployment-architecture VPN** (AWS Client VPN endpoint
 ```
 
 ```bash
-# Pre-req (one-time): AWS account + SSO (or long-term keys), Docker Desktop running,
-# terraform + aws CLI installed. IAM perms per docs/iam-permissions.md (tier 2 for
-# apply, tier 1 for validation-only paths).
-#
-# That's it. cloud-up prompts for AWS_PROFILE if unset and auto-triggers
-# 'aws sso login' when the SSO token has expired — no manual login / export needed.
+# 0. Prepare AWS profile (one-time):
+#    - SSO operators: `aws sso login --profile <your-profile>` first
+#    - IAM user / long-term token: just have it active (cloud-up reads
+#      AWS_PROFILE from env or prompts if unset)
+#    Docker Desktop running, terraform + aws CLI + easy-rsa installed.
 
-# Cloud deploy — one-shot orchestrator (cert + ECR + image push + apply):
+# 1. Cloud deploy — one-shot orchestrator:
+#    Reads region + secondary_region from terraform.tfvars (interactive Q&A
+#    on first run); provisions PKI + ACM imports for both regions; ECR build
+#    + image push; full terraform apply.
 make cloud-up   # ~15-20 min; idempotent if cert-arns.auto.tfvars already exists
 
-# Operator next-steps (printed by cloud-up at the end):
-#   - Download VPN config and connect via Tunnelblick / openvpn
-#   - Run smoke (constructed curl with --cacert + --resolve per ADR-0027 HTTPS)
-#   - Capture CloudWatch evidence BEFORE teardown
+# 2. Connect to VPN — open ONE new terminal per region (multi-region active-active
+#    means each operator-region pair is its own tunnel; routing-table doesn't
+#    play nicely with two AWS Client VPN tunnels mounted at once):
+#       Terminal A: openvpn --config pki/<your-handle>-fra.ovpn
+#       Terminal B: openvpn --config pki/<your-handle>-ire.ovpn
+#    (Detailed VPN config export + cert append in walkthrough below.)
 
-# Cloud teardown — one-shot (drains ECR + destroys + cleans ACM-imported certs + verifies):
-make cloud-down
+# 3. Smoke + evidence + teardown:
+make cloud-smoke           # 6-step smoke against the active region's ALB
+make cloud-evidence        # capture CloudWatch panels + logs + tf output
+make cloud-evidence-verify # gate before destroy: PNGs non-empty, DDB Replicas[],
+                            # Route53 health Success, etc.
+make cloud-down            # drains ECR + destroys + cleans ACM (both regions)
 # Collateral-free: only resources tagged owner=<your-handle> / managed by this terraform/ are touched.
 
 # Low-level / surgical alternatives (cloud-up + cloud-down call these internally —
@@ -544,7 +552,7 @@ Runs eight phases in sequence, idempotent at each step:
 | 1/6 Tool presence | terraform / aws / docker check | <1 s | <1 s |
 | 2/6 AWS auth | sts get-caller-identity (with SSO refresh fallback) | 1-2 s | <1 s |
 | 3/6 tfvars present | runs `tfvars-init.sh` interactive Q&A if missing — **AWS-aware CIDR overlap validation** against existing VPCs in the account/region | ~2 min (first time) | skip |
-| 4/6 VPN PKI + ACM | easy-rsa CA bootstrap, server + client cert generation, ACM import × 2; idempotent if `cert-arns.auto.tfvars` exists | ~10 min | skip |
+| 4/6 VPN PKI + ACM | easy-rsa CA bootstrap, server + client cert generation, ACM import × 2 per region (× 4 in multi-region active-active mode); idempotent if `cert-arns.auto.tfvars` already has all 4 ARNs cached | ~10 min single-region / ~12 min multi-region | skip |
 | 5/6 Pre-deps + image push | `terraform apply -target=module.{vpc,ecr}` + DynamoDB Global Tables provisioning → docker build (`--provenance=false --sbom=false` for deterministic manifest) → push with git-SHA tag (per [ADR-0036](docs/ADR/0036-image-tag-git-sha-immutable-ecr.md)); skipped if tag already in ECR | ~5-8 min | ~30 s (cached) |
 | 6/6 Full apply | `terraform apply` for the remaining ~70 resources (Client VPN, ALB, ECS, Valkey, SQS, IAM, autoscaling, VPC endpoints, **bootstrap one-shot ECS task** that pre-warms Valkey) | ~10-15 min | ~1 min |
 
@@ -552,22 +560,46 @@ Output ends with operator-next-steps including the literal `aws ec2 export-clien
 
 **3. Connect to AWS Client VPN**
 
+In multi-region mode, each region exposes its own Client VPN endpoint.
+Open one terminal per region — connecting both simultaneously confuses
+macOS routing because both tunnels claim the same `utun` interface
+behaviour and overlapping client CIDRs would race for default route.
+
 ```bash
-# Download the .ovpn config (cloud-up's printed command, copy-paste safe single-line):
-aws ec2 export-client-vpn-client-configuration --profile <your-profile> --region eu-central-1 --client-vpn-endpoint-id <printed-by-cloud-up> --output text > pki/<your-handle>.ovpn
+# Export both .ovpn configs (cloud-up's printed commands; one per region):
+TF_DIR=terraform
+FRA_VPN_ID=$(terraform -chdir=$TF_DIR output -raw client_vpn_endpoint_id)
+IRE_VPN_ID=$(terraform -chdir=$TF_DIR output -raw secondary_client_vpn_endpoint_id)
 
-# Append client cert + key for mutual-TLS (one-shot block; not heredoc to avoid copy-paste breakage):
-{ echo; echo '<cert>'; cat pki/pki/issued/<your-handle>.crt; echo '</cert>'; echo '<key>'; cat pki/pki/private/<your-handle>.key; echo '</key>'; } >> pki/<your-handle>.ovpn
+aws ec2 export-client-vpn-client-configuration \
+  --profile "$AWS_PROFILE" --region eu-central-1 \
+  --client-vpn-endpoint-id "$FRA_VPN_ID" --output text > pki/<your-handle>-fra.ovpn
 
-# Then either GUI:
-open pki/<your-handle>.ovpn   # Tunnelblick prompts to install + name + Connect
+aws ec2 export-client-vpn-client-configuration \
+  --profile "$AWS_PROFILE" --region eu-west-1 \
+  --client-vpn-endpoint-id "$IRE_VPN_ID" --output text > pki/<your-handle>-ire.ovpn
 
-# OR CLI:
-sudo /opt/homebrew/sbin/openvpn --config pki/<your-handle>.ovpn   # don't sed `dev tun` → `dev utun`; openvpn 2.6+ on macOS handles it internally
-# Wait for "Initialization Sequence Completed" — VPN is up; keep terminal open
+# Append client cert + key for mutual-TLS (one-shot loop):
+for f in pki/<your-handle>-fra.ovpn pki/<your-handle>-ire.ovpn; do
+  { echo; echo '<cert>'; cat pki/pki/issued/<your-handle>.crt; echo '</cert>';
+    echo '<key>'; cat pki/pki/private/<your-handle>.key; echo '</key>'; } >> "$f"
+done
+
+# Connect ONE region at a time (don't connect both simultaneously):
+# Terminal A — Frankfurt:
+sudo /opt/homebrew/sbin/openvpn --config pki/<your-handle>-fra.ovpn
+# Wait for "Initialization Sequence Completed" — keep terminal A open
+
+# In another terminal: verify, smoke, capture FRA-side evidence
+ifconfig | grep utun       # new utun interface present
+make cloud-smoke           # smoke against Frankfurt ALB
+
+# To switch to Ireland: Ctrl+C terminal A, then in terminal B:
+sudo /opt/homebrew/sbin/openvpn --config pki/<your-handle>-ire.ovpn
+# (same workflow against Ireland for cross-region active-active proof)
 ```
 
-Verify VPN is up in another terminal: `ifconfig | grep utun` shows the new interface, `dig +short <alb_dns>` returns a private 10.0.x.x IP.
+Don't sed `dev tun` → `dev utun` — openvpn 2.6+ on macOS handles it internally.
 
 **4. `make cloud-smoke` (~10-15 s)**
 
