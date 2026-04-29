@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cloud-down.sh — one-shot cloud teardown orchestrator for aegis-enclave Phase 2.5.
+# cloud-down.sh — one-shot cloud teardown orchestrator for aegis-enclave.
 #
 # Tears down everything cloud-up.sh created, plus the 3 outside-tfstate items
 # that 'terraform destroy' alone leaves behind:
@@ -47,7 +47,7 @@ PKI_DIR="$REPO_ROOT/pki"
 
 START_TIME=$(date -u +%s)
 
-section "aegis-enclave — cloud-down (Phase 2.5 teardown)"
+section "aegis-enclave — cloud-down (cloud-acceptance window teardown)"
 echo "Repo:        $REPO_ROOT"
 echo "Terraform:   $TF_DIR"
 

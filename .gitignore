@@ -31,6 +31,9 @@ evidence/
 # Leak-guard pattern file (one regex per line of buyer-specific tokens)
 .leakguard
 
+# Claude harness state (transient lock files, schedule tracking)
+.claude/
+
 # ─────────────────────────────────────────────────────────────────
 # Local environment
 # ─────────────────────────────────────────────────────────────────

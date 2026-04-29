@@ -4,7 +4,7 @@
 Accepted (2026-04-25)
 
 ## Context
-The case-study brief lists "AWS or IONOS Cloud" as recommended-but-not-mandatory cloud targets. The deliverable must include cloud-side architecture and migration story, but the 22-hour budget (ADR-0028, originally 15h per ADR-0002) does not stretch to a credible production deployment on a cloud the candidate has no operational receipts for.
+The case-study brief lists "AWS or IONOS Cloud" as recommended-but-not-mandatory cloud targets. The deliverable must include cloud-side architecture and migration story, but does not stretch to a credible production deployment on a cloud the candidate has no operational receipts for.
 
 The candidate's production AWS receipts live in the `aegis-aws-landing-zone` portfolio repo — multi-account governance, VPC patterns, Terraform module composition. There is no equivalent IONOS production experience. Two failure modes follow:
 

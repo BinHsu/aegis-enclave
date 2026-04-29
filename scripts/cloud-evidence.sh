@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cloud-evidence.sh — capture Phase 2.5 evidence artifacts before teardown.
+# cloud-evidence.sh — capture cloud-acceptance evidence artifacts before teardown.
 #
 # Per memory feedback_phase25_screenshot_evidence.md: 'terraform destroy' is
 # irreversible — every dashboard / log line / handshake must be captured BEFORE
@@ -58,7 +58,7 @@ TS=$(date -u +%Y%m%dT%H%M%SZ)
 EVIDENCE_DIR="$REPO_ROOT/evidence/$TS"
 mkdir -p "$EVIDENCE_DIR/metrics" "$EVIDENCE_DIR/logs"
 
-section "aegis-enclave — Phase 2.5 evidence capture"
+section "aegis-enclave — cloud-acceptance evidence capture"
 echo "Output: $EVIDENCE_DIR"
 
 # ─── Pre-flight ──────────────────────────────────────────────────────────
@@ -413,7 +413,7 @@ aws cloudwatch describe-alarm-history --region "$REGION" \
 # ─── 6. Summary stub ─────────────────────────────────────────────────────
 section "6/6 — summary.md stub"
 cat > "$EVIDENCE_DIR/summary.md" <<EOF
-# Phase 2.5 Evidence — $TS
+# Cloud-Acceptance Evidence — $TS
 
 ## Operator
 - Account: $ACCOUNT_ID
@@ -450,11 +450,11 @@ cat > "$EVIDENCE_DIR/summary.md" <<EOF
 - [ ] AWS Client VPN handshake confirmation (Tunnelblick log or 'tunnelblick status')
 - [ ] AWS Console VPC topology screenshot (showing aegis-enclave-* tagged resources)
 
-## Phase 2.5 cost-window markers
+## Cloud-acceptance cost-window markers (per ADR-0034)
 - Apply started:    (fill in from cloud-up.sh start time)
 - Smoke completed:  (fill in)
 - Evidence captured (this script ran): $TS
-- Destroy started:  (fill in from cloud-down.sh start time — must be < 3h after apply)
+- Destroy started:  (fill in from cloud-down.sh start time — within the bounded window)
 EOF
 ok "summary.md written"
 

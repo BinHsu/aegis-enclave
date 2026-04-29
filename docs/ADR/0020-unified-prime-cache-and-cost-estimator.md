@@ -1,55 +1,71 @@
-# ADR-0020: Unified monotonic prime cache + cost-aware pre-flight reject + three-layer timeout
+# ADR-0020: Compute load management — three-layer defense derived from worst-case request budget
 
 ## Status
-Superseded by ADR-0032 (2026-04-26). The cost-estimator component is removed; schema cap + backpressure + worker timeout provide equivalent defence without the estimator's complexity. The unified monotonic cache decision is itself superseded by the distributed Valkey cache (ADR-0031). Partially supersedes ADR-0017 (the immutable-tuple `_PRIME_TABLE` posture; lock-protected mutability is required for monotonic cache extension).
+Accepted (2026-04-28)
 
 ## Context
-ADR-0017 documented the original prime-computation strategy: a static `_PRIME_TABLE` tuple pre-built at module load, with sieve and trial-division fallbacks for ranges above the table. The tuple was deliberately immutable — accidental `.append` / `.sort` / item-assignment would raise `TypeError` instead of silently corrupting subsequent lookups.
 
-Three follow-up concerns surfaced during Phase 1.5 review and SLO discussion:
+The brief PDF was surveyed for `timeout|seconds|response time|latency|sla|deadline` — **0 hits**. The brief is silent on temporal and capacity constraints. The defense layers below are OUR derived design from worst-case-request reasoning, not honoring an external mandate (per the cycle-discipline of separating brief mandates from architectural judgments).
 
-1. **The static table and any per-query LRU were two caches with different semantics.** The static table covers `[2, 100_000]`; an LRU caches arbitrary `(start, end) → list[int]` pairs. A query like `(50_000, 200_000)` would miss the LRU but the static table covers half — the deliverable would benefit from a single source of truth.
+The compute service has three orthogonal failure modes that each require their own guard:
 
-2. **The `_RANGE_CEILING = 10**7` is a memory bound, not a latency bound.** A query like `(1_000_001, 11_000_001)` is structurally legal but takes minutes via trial division — a real DoS risk if any operator-facing endpoint is exposed.
+- **Unbounded input** — a malicious or careless `(2, 10⁹)` request that requires gigabytes of memory and minutes of CPU.
+- **Aggregate burst** — a sudden 50–100 req/sec spike that fills the queue faster than workers can drain.
+- **Single-task hijack** — a CPU-bound bug or pathological input that pins a worker indefinitely.
 
-3. **No service-level timeout exists.** uvicorn has no built-in per-request timeout; FastAPI's asyncio runtime would happily block a worker indefinitely. Combined with `(2)`, a single malicious or careless client could pin all uvicorn workers.
+A single guard cannot cover all three. Schema-level rejection blocks unbounded input but cannot detect a stuck worker. Backpressure sheds aggregate burst but cannot interrupt a running compute. SIGALRM bounds per-task wall time but cannot prevent the queue from accumulating an unbounded backlog. **Three independent layers, each addressing a distinct failure mode, compose into a defense-in-depth.**
 
-These three concerns share a root: the cache, the validator, and the request lifecycle were each making assumptions in isolation, and the assumptions did not compose.
+### Policy choices that drive the derived constants
+
+| Policy choice | Value | Source |
+|---|---|---|
+| Worker count baseline | 3 | per-AZ posture (ADR-0007 — one task per AZ) |
+| Per-task time budget | 60 s SIGALRM | derived from worst-case range 10⁷ sieve cost on Fargate compute profile |
+| Acceptable p99 queue wait | 5 min | SLO calibration per Tier 2 ops support (ADR-0008) |
+
+Once these three policy values are set, the layer constants below are **derived, not chosen**.
 
 ## Decision
-Three coupled changes, treated as one architectural shift:
 
-**1. Unified monotonic cache.** Replace the static `_PRIME_TABLE: tuple` with a mutable `_known_primes: list[int]` plus `_known_max: int`, guarded by `threading.Lock`. The cache is pre-warmed at module load with primes up to `_INITIAL_PREWARM_BOUND = 10**5` (~9,592 primes, ~5–15 ms). Queries either hit the cache (`end <= _known_max` → bisect-and-slice), extend it (`start <= _known_max + _GAP_THRESHOLD` → compute the gap, append, return slice), or compute standalone for far-gap queries (no cache pollution).
+| Layer | Value | Derivation | Failure mode addressed |
+|---|---|---|---|
+| **L1 — schema absolute caps** | start, end ∈ [2, 10⁷] | static `_SMALL_PRIMES` table covers √(10⁷) = 3163 primes; trial_division correctness requires small_primes ≥ √n; only valid for n ≤ 10⁷ | Unbounded input |
+| **L1 — range size cap** | end - start ≤ 10⁷ | redundant given absolute caps; explicit guard for clarity | Unbounded input |
+| **L2 — queue backpressure** | depth > 5 × worker_count → 503 + Retry-After: 60 | (acceptable_wait / per-task_budget) = 300 s / 60 s = **5** | Aggregate burst |
+| **L3 — worker SIGALRM** | 60 s | per-task budget hard ceiling at OS-signal level (bypasses Python GIL) | Single-task hijack |
 
-**2. Cost-aware pre-flight rejection.** `_validate` now invokes `_estimate_compute_ms(start, end, _known_max)` and rejects with `ValueError` when the estimate exceeds `_HARD_TIMEOUT_MS = 30_000`. The estimator factors current cache state — as `_known_max` grows, more queries become free. The estimator is conservative; over-estimates result in unnecessary 400s, never under-estimated 504s.
+The static `_SMALL_PRIMES` table size is auto-aligned with the L1 absolute cap: range cap → √cap → table size. Cache cross-leverage between the small-primes table and the layered cache (Valkey) is unnecessary at this cap; `primes.py` uses the static table only. Anything above 10⁷ would require a different correctness story (probabilistic primality, pre-computed segments) — out of scope.
 
-**3. Three-layer timeout defence at the request lifecycle.** `main.py` wraps `primes_in_range` in `asyncio.wait_for(timeout=30)` and `insert_execution` in `asyncio.wait_for(timeout=10)`. `db.py` sets `command_timeout=10` on the asyncpg engine (driver-level enforcement). Terraform sets ALB `idle_timeout = 45` so the client sees the application's 504 rather than an ALB connection reset.
+### Why three layers, not redundant
 
-The three changes compose: pre-flight rejects DoS shapes; the cache makes repeated work fast; the timeouts catch edge cases the estimator misses.
+| Layer | Failure scenario it addresses | Why other layers don't suffice |
+|---|---|---|
+| L1 schema cap | Client submits `(2, 10⁹)` | L2 only sheds when queue is full; L3 only fires after compute starts. L1 rejects at request ingress with 422, no resource consumed. |
+| L2 backpressure | 100 concurrent legitimate requests | L1 lets them all through (each is in-bounds). L3 fires per-task but doesn't prevent unbounded queue accumulation. |
+| L3 SIGALRM | CPU-bound bug pins worker on a legitimate input | L1 and L2 don't run inside the worker's compute path. Only an OS signal interrupts a Python tight loop holding the GIL. |
 
 ## Alternatives Considered
 
-| Candidate | Why not |
-|---|---|
-| Keep static `_PRIME_TABLE` + add separate LRU for outputs | Two caches with different semantics; LRU keyed on `(start, end)` doesn't handle overlapping queries (the most common pattern). The unified cache handles half-hits naturally and gives a single source of truth for the estimator. |
-| Async + queue audit decoupling (write to queue, return immediately, audit in background) | Architecturally cleaner for a real production service but introduces consistency questions (client gets `execution_id`, immediately polls `/executions/{id}`, sees 404). Out of case-study scope; documented as Phase 2 in `docs/migration_runbook.md`. |
-| Fixed compute-time ceiling per query (no estimator) — e.g., reject any query above 10⁶ outright | Simpler but coarse. A `(2, 10⁶)` query is fine (~3s sieve); a `(10⁶, 11×10⁶)` query is not (minutes via trial division). The estimator separates "size" from "shape". |
-| Cross-worker shared cache via Redis | Phase 2 concern. Per-worker cache costs ~5–15 ms cold-start per worker; cross-worker shared cache eliminates that but adds a new infrastructure dependency (out of ADR-0003 PoC scope). |
-| Skip cache eviction (cache grows monotonically) ← chosen | Bounded by `_RANGE_CEILING = 10⁷` to ~664k primes ≈ 18 MB per worker. Cheaper to let the cache grow than to track LRU recency under a lock. |
+- **Cost estimator pattern** (industry-known: estimate compute cost, reject if above threshold). Schema cap already serves the equivalent gate at O(1) decision cost; estimate-then-reject adds attack surface (the estimator itself can be tricked or be wrong) and adds code complexity. FinOps-style cost estimation is an infra-level concern, separate from request-level defense. Industry pattern preserved here as context, not as journey-defense.
+- **Dynamic SIGALRM based on input range size** — e.g., 10 s for small ranges, 60 s for large. Variable budget complicates monitoring and alarm thresholds. Static 60 s simplifies reasoning and matches the SLO end-to-end calibration.
+- **Per-worker queue depth** instead of global threshold. SQS is region-shared; a global threshold suffices. Per-worker would require service-discovery for the worker count, which is dynamic under autoscale.
+- **Token-bucket rate-limit at API tier** (X req/sec/tenant). Useful for Tier 1 multi-tenant; aegis-enclave is Tier 2 single-tenant, no per-tenant accounting needed. Forker promoting to multi-tenant adds this layer.
+- **Pre-flight DB lookup for similar-range cache hit before enqueue.** Adds a synchronous read on the hot POST path; the worker already does the cache lookup with the same latency cost — moving it earlier doesn't reduce work.
 
 ## Consequences
-- **DoS-by-input-shape is closed.** The pre-flight estimator catches the worst-case `(start, end)` shapes (~5–15 minutes of trial division) before any compute runs. The estimator is fast (microseconds) so it adds no measurable latency to legitimate queries.
-- **Cache state amplifies over time.** As queries arrive and extend `_known_max`, subsequent estimates tighten — the same query that was rejected at cache-cold can become trivially cheap once a related query has warmed the cache to its tail. Predictable for production traffic; non-deterministic for adversarial.
-- **Three independent timeout layers.** Compute (30s), audit (10s), and ALB idle (45s) form a defence-in-depth; any one failing leaves the others as guards. The 30+10s app sum is below the 45s ALB so clients see explicit application 504/503 rather than ALB resets.
-- **ADR-0017's tuple-immutability claim is partially superseded.** `_known_primes` is now a mutable list. The hygiene goal (preventing accidental mutation) is now satisfied by `_cache_lock` plus module-level access discipline (no public re-export of `_known_primes`). Tests reset cache state via an autouse fixture so test ordering doesn't matter.
-- **Per-worker cache cold-starts on each uvicorn worker boot.** ~5–15 ms per worker; for 4 workers, ~60 ms aggregate paid in parallel during startup. Acceptable for ECS Fargate task lifecycle.
-- **Standalone compute path for far-gap queries** (e.g., `start=10**8, end=10**8+100`, far above `_known_max + _GAP_THRESHOLD`) returns correctly but doesn't extend the cache. Keeps `_known_primes` contiguous; avoids ballooning to a multi-GB cache for an isolated query.
-- **SLO calibration tightens.** With the cache, p99 latency for in-range queries drops from "sieve allocation cost" to "bisect + slice ≈ sub-millisecond". ADR-0008's `p99 < 500ms` becomes generous rather than tight.
+
+- **DoS-by-input-shape is closed at L1.** Pydantic validation rejects in O(1) before any allocation.
+- **Burst absorbance is bounded at L2.** Queue depth above 5 × worker_count signals "shed load now" rather than letting SQS accumulate an unbounded backlog. Auto-scaling (ADR-0023) catches up over the next 60–90 s.
+- **Worker-side runaway is bounded at L3.** SIGALRM 60 s + Python `TimeoutError` propagation + audit-row `status=failed` write + SQS `DeleteMessage` (no redelivery — the outcome was processed, just unsuccessfully). Client polling sees the structured failure within one polling interval.
+- **The three constants — 10⁷, 5×, 60 s — are derived, not magic numbers.** Anyone changing one of them must revisit the policy values they derive from (per-AZ baseline, p99 queue wait SLO, worst-case sieve cost).
+- **Per-worker cache cold-starts** on each ECS task boot (~5–15 ms for the bootstrap range). Acceptable for Fargate task lifecycle.
 
 ## Related ADRs
-- ADR-0003 (PoC scope, prod hygiene — calibration this ADR sits inside)
-- ADR-0008 (reliability targets — SLO/RTO/RPO; cache + timeout layers improve p99 budget)
-- ADR-0009 (DB topology — `command_timeout = 10` enforces at driver layer)
-- ADR-0015 (no real apply — Terraform `idle_timeout` is plan-only)
-- ADR-0017 (prime strategy — partially superseded by this ADR; tuple-immutability claim no longer holds)
-- ADR-0018 (managed-default — same shape: pick simplest, upgrade on trigger; cross-worker shared cache via Redis is the upgrade path)
+- ADR-0003 (PoC scope, prod hygiene calibration)
+- ADR-0007 (per-region 3-AZ posture — supplies worker_count baseline = 3)
+- ADR-0008 (reliability targets — supplies acceptable p99 queue wait = 5 min)
+- ADR-0017 (prime computation strategy — the algorithm whose worst-case cost the per-task budget bounds)
+- ADR-0023 (worker auto-scaling — the dynamic capacity layer that catches up after L2 backpressure fires)
+- ADR-0029 (async POST + SQS + worker pool — the architecture inside which these layers run)
+- ADR-0031 (Valkey range-coalescing cache — the cache layer that compounds L1's effectiveness over time)
+- ADR-0033 (async drain semantics — the SIGALRM / SQS visibility composition realising L3)

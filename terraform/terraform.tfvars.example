@@ -3,7 +3,7 @@
 # for `terraform plan` but will fail at apply time with "ResourceNotFoundException:
 # Could not find certificate" from AWS ACM.
 #
-# Recommended path for the case-study Phase 2.5 cycle:
+# Recommended path for the cloud-acceptance window:
 #   make cloud-up    — runs scripts/cloud-up.sh which auto-generates real
 #                      VPN cert ARNs via easy-rsa + ACM imports, then writes
 #                      them to terraform/cert-arns.auto.tfvars (gitignored)

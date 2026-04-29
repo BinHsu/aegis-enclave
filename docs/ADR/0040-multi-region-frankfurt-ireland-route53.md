@@ -1,17 +1,11 @@
 # ADR-0040: Multi-region via Aurora Global Database — Frankfurt primary + Ireland secondary (PG-existing migration path)
 
 ## Status
-**Superseded by ADR-0042 for greenfield deployments** (2026-04-28).
-**Retained as the Aurora migration path** for forkers carrying an existing PostgreSQL/RDS investment.
+Accepted (2026-04-28) — **alternative path for forkers carrying existing PostgreSQL/RDS investment.**
 
-The decision space split mid-cycle once the original constraint (we believed the case-study brief mandated a relational data model) was re-checked and found to be a Phase 1 commitment, not a brief mandate. For a greenfield deployment, the cloud-native production-grade multi-region architecture is **DynamoDB Global Tables active-active** as documented in **ADR-0042** — no Aurora promotion step, no Lambda failover orchestration, no failback Path 1 vs Path 2 reconstitution complexity, RTO collapses from ~5-8 min to ~60-300s (DNS propagation only).
+The greenfield production target uses **ADR-0042 (DynamoDB Global Tables active-active)** — no promotion step, no Lambda failover orchestration, no failback reconstitution complexity, RTO ~60–300 s (DNS propagation only). This ADR is retained as the runbook for forkers who have already invested in PG schemas + ORM tooling + tests bound to PG semantics, where redesigning the data layer costs more than living with Aurora's failover semantics.
 
-This ADR is preserved because:
-- The PG/Aurora-Global path's operational complexity (Lambda automation, failback semantics, Path 2 reconstitution 1-12h) is the **direct evidence** for why ADR-0042 is the right greenfield choice. Reading both side-by-side shows the architectural fitness gap.
-- A forker who has already invested in PG schemas + tooling + ORM may rationally choose to migrate to Aurora Global rather than redesign the data layer; this ADR remains the runbook for that path.
-- The case-study deliverable itself uses RDS PostgreSQL (ADR-0009) — if implemented in this case-study's cycle, ADR-0040's path is what would actually be built.
-
-This ADR records the production endpoint architecture **as it would be implemented from the existing PG investment**. The case-study deliverable is single-region (`eu-central-1`) per ADR-0007 (single-region multi-AZ posture) and within the build-budget cap of ADR-0034 (24h); ADR-0040 + ADR-0042 are both V2 promotion paths, neither implemented in the case-study cycle. The promotion runbook is `docs/scaling_runbook.md` (agent-executable spec).
+The PG/Aurora-Global path's operational complexity (Lambda automation, failback semantics, Path 2 reconstitution 1–12 h) is documented below in full. The promotion runbook is `docs/scaling_runbook.md` (agent-executable spec).
 
 ## Context
 
@@ -20,7 +14,7 @@ This ADR records the production endpoint architecture **as it would be implement
 The "multi-region" in this ADR's title is **EU multi-region for HA/DR within a single business region**, NOT global-customer reach. The deliverable explicitly targets a European-business deployment shape:
 
 - **No CDN** (no CloudFront, no Akamai, no Fastly). Traffic is internal-VPN-gated per ADR-0006 and ADR-0019; the access pattern is "operator on Client VPN → internal ALB → ECS", not "global anonymous web user → CloudFront edge → ALB". CDN solves a problem this architecture doesn't have.
-- **No global database** (no DynamoDB Global Tables, no Aurora cross-continent topology). The data residency stance is *EU only*; replication targets within `eu-central-1` + `eu-west-1` are EU-jurisdictional and stay EU-jurisdictional.
+- **EU-only data residency**: replication targets within `eu-central-1` + `eu-west-1` are EU-jurisdictional. Multi-region setup (Aurora Global on this path; DynamoDB Global Tables on the ADR-0042 path) stays EU-jurisdictional.
 - **No additional region beyond Frankfurt + Ireland.** Adding `us-east-1` or any APAC region would introduce data-export friction (GDPR Standard Contractual Clauses or Adequacy Decision processing for any data crossing the EU boundary), latency that doesn't help EU customers, and operational complexity disproportionate to the customer geography being served.
 
 This scope is deliberate. A space-cargo customer based in Bremen / Frankfurt / Brussels / Stockholm is best served by a Frankfurt-primary deployment with Ireland-standby, not by a globally-distributed edge-cached SaaS architecture. Targeting the actual business geography is the calibration; assuming "more regions = more better" would be a misread of the operational shape.
@@ -191,9 +185,9 @@ Failover and failback are **not symmetric**. The cost of failback depends on whi
 ## Related ADRs
 - ADR-0007 (single-region multi-AZ — the case-study scope decision this ADR's target supersedes for production deployments only; ADR-0007 stays as the case-study calibration)
 - ADR-0008 (reliability targets — RTO 15 min / RPO 5 min provide the budget against which this target's 5-8 min Lambda-driven RTO and < 1s RPO are measured)
-- ADR-0009 (DB topology Multi-AZ standby — the within-region replication that this ADR extends across regions via Aurora Global)
+- ADR-0007 (per-region 3-AZ posture — the in-region resilience this ADR extends across regions)
 - ADR-0024 (VPN cert provisioning — operator-laptop CA shared across regions)
-- ADR-0034 (build budget 22 → 24h — the budget that explicitly excluded multi-region from the case-study cycle)
+- ADR-0034 (delivery methodology — the PoV staging that scopes which architectural increments ship in case-study vs forker promotion)
 - ADR-0037 (secrets rotation deferred — same V2-target shape; production adoption picks both up)
 - ADR-0042 (DynamoDB Global Tables greenfield retrospective — the architectural alternative this ADR considered and rejected by existing-investment constraint, not by technical fit)
 - `docs/scaling_runbook.md` (the agent-executable spec for executing this ADR)

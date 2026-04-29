@@ -1,7 +1,8 @@
-# terraform/bootstrap — Phase-2 prerequisites
+# terraform/bootstrap — deployment prerequisites
 
 This module is **not** part of the case-study deliverable. It exists to
-unblock Phase-2 personal deployment per ADR-0015 § Phase-2 supersession.
+unblock cloud-acceptance deployment by provisioning the state backend +
+GitHub OIDC trust setup that the main composition depends on.
 
 ## What it provisions
 
@@ -21,8 +22,8 @@ and provisions the backend that the main composition then uses.
 
 The OIDC provider + GHA role piggyback on this module because they have the
 same lifecycle: provisioned once, rarely touched, and prerequisites for
-Phase-2 deployment. Keeping them together means one apply unblocks
-everything Phase 2 needs.
+the main composition's deployment. Keeping them together means one apply
+unblocks everything that the cloud-acceptance flow needs.
 
 ## One-time setup
 
@@ -105,7 +106,7 @@ provider — annoying but not catastrophic.
 
 ## Teardown
 
-If Phase-2 deployment is being abandoned and you want to clean up:
+If deployment is being abandoned and you want to clean up:
 
 ```bash
 # 1. First teardown the main composition (release state lock)

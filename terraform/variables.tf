@@ -1,10 +1,11 @@
 # variables.tf — inputs consumed by main.tf
 #
 # Defaults are case-study-shaped: single region, single environment tag,
-# placeholder cost-center / owner. Phase 1 build can override per workspace.
+# placeholder cost-center / owner. Forkers override per workspace.
 #
-# Pivot branch: ADR-0042 greenfield DynamoDB Global Tables target. RDS-related
-# variables removed; secondary-region + DynamoDB variables added.
+# Implements the ADR-0042 greenfield DynamoDB Global Tables target:
+# secondary-region + DynamoDB variables are first-class; no relational-DB
+# variables remain.
 
 variable "region" {
   description = "Primary AWS region; ADR-0042 greenfield primary, default Frankfurt"
@@ -67,7 +68,7 @@ variable "route53_zone_name" {
 variable "server_cert_arn" {
   description = "ACM certificate ARN for Client VPN endpoint server cert (primary region)"
   type        = string
-  default     = "" # Phase 1 fills in via separate ACM provisioning step
+  default     = "" # Operator fills in via separate ACM provisioning step (scripts/bootstrap-vpn-certs.sh)
 }
 
 variable "client_cert_arn" {
@@ -94,7 +95,7 @@ variable "alb_internal_hostname" {
   default     = "api.enclave.internal"
 }
 
-# ─── Phase 2.3/2.4 — Async worker + distributed cache ────────────────────────
+# ─── Async worker + distributed cache (ADR-0029 + ADR-0031) ─────────────────
 
 variable "image_tag" {
   description = "Container image tag (typically git short SHA, e.g. 'abc12345' or 'abc12345-dirty-7e33ff10' for uncommitted changes). Written by scripts/cloud-up.sh into image-tag.auto.tfvars. Default 'latest' is for backwards-compat; production paths should always pass an explicit tag for IMMUTABLE ECR + audit trail."

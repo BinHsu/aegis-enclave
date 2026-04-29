@@ -1,4 +1,4 @@
-# bootstrap/variables.tf — inputs for the Phase-2 prerequisite module.
+# bootstrap/variables.tf — inputs for the deployment prerequisite module.
 
 variable "region" {
   description = "AWS region — single-region eu-central-1 per ADR-0007"

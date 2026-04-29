@@ -9,7 +9,7 @@ Brief Task 4 asks for "cloud deployment guidelines and scripts" that explain how
 Two failure modes are easy to fall into:
 
 1. **Static markdown runbook** — "step 1: do X, step 2: do Y" — readable but not actionable by an AI agent and not particularly reviewable by a human either. Commodity output.
-2. **Full Terraform per destination cloud** — fakeable up to a point, but real cross-cloud Terraform requires real expertise in each cloud's primitives. Faking it is detectable, and writing it for real is out of the 22h budget (ADR-0028, originally 15h per ADR-0002) and the AWS-only target (ADR-0005).
+2. **Full Terraform per destination cloud** — fakeable up to a point, but real cross-cloud Terraform requires real expertise in each cloud's primitives. Faking it is detectable, and the AWS-only target (ADR-0005) is the deliberate scope.
 
 The third path is the differentiator: an **agent-executable spec** with a structured per-step schema. Each step has clear preconditions, declarative actions, verification commands, expected outputs, rollback paths, and a human-gate flag for irreversible operations. AI coding agents (Claude Code, Cursor, etc.) execute this format reliably *only* if the spec is written in agent-executable form — and the same structure is what makes the runbook reviewable by a human engineer.
 
@@ -47,7 +47,7 @@ The migration runbook (`docs/migration_runbook.md`) is an **agent-executable spe
 | Candidate | Why not |
 |---|---|
 | Static markdown runbook ("step 1: do X; step 2: do Y") | Not actionable by agents. Less reviewable by humans (no verification or rollback per step). Commodity output — every candidate ships this. |
-| Full Terraform code per destination cloud | Out of budget (ADR-0002). Requires real expertise per cloud (ADR-0005 explicitly chose AWS-only). Faked Terraform is detectable; real Terraform across N clouds is a multi-week project. |
+| Full Terraform code per destination cloud | Requires real expertise per cloud (ADR-0005 explicitly chose AWS-only). Faked Terraform is detectable; real Terraform across N clouds is a multi-week project. |
 | Pseudocode runbook (semi-structured but not parseable) | Neither human-friendly nor machine-friendly. Falls between two stools and serves neither audience. |
 | Terraform for AWS only + static markdown for everything else | Inconsistent. The runbook shape should match across destinations so the format itself becomes the portable artifact, not the AWS code. |
 

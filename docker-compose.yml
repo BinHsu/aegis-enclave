@@ -1,10 +1,11 @@
-# Phase 2.3/2.4 demo stack — VPN-gated cloud microservice template with
-# async worker + distributed cache.
+# Local-stack demo composition — VPN-gated cloud microservice template
+# with async worker + distributed cache.
 #
 # Services:
 #   dynamodb-local — Amazon DynamoDB Local (in-memory, sharedDb mode)
-#   ddb-bootstrap  — One-shot table-create task (profiles: bootstrap — replaces
-#                    postgres' auto-init.sql behaviour; aws CLI calls CreateTable)
+#   ddb-bootstrap  — One-shot table-create task (profiles: bootstrap — DDB
+#                    has no auto-DDL on container start, so this profile
+#                    runs `aws dynamodb create-table` once and exits)
 #   valkey         — Valkey 7 (Redis-compatible cache; local parity for ElastiCache Serverless)
 #   elasticmq      — ElasticMQ (SQS-compatible local queue; parity for AWS SQS)
 #   app            — FastAPI prime service (no host port published)
@@ -45,12 +46,10 @@ services:
     # the brief.
 
   ddb-bootstrap:
-    # One-shot table-create task. Replaces postgres' auto-init.sql semantics:
-    # docker-compose's postgres image auto-runs /docker-entrypoint-initdb.d/*.sql
-    # on first start, but DynamoDB Local has no equivalent — tables must be
-    # created via the API. This service runs `aws dynamodb create-table` once
-    # and exits. Profiles guard prevents accidental start on `docker compose up`;
-    # invoke manually:
+    # One-shot table-create task. DynamoDB has no auto-DDL on container
+    # start — tables must be created via the API. This service runs
+    # `aws dynamodb create-table` once and exits. Profiles guard prevents
+    # accidental start on `docker compose up`; invoke manually:
     #   docker compose --profile bootstrap run --rm ddb-bootstrap
     image: amazon/aws-cli:2.17.0
     container_name: enclave-ddb-bootstrap

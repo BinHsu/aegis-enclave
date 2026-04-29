@@ -1,10 +1,11 @@
 """aegis-enclave prime service — VPN-gated FastAPI application.
 
-Reachability: this service is reachable only through the VPN gateway in
-`docker-compose.yml` (Phase 1.2) or behind AWS Client VPN endpoint in
-production (per ADR-0006). No direct host-port exposure.
+Reachability: this service is reachable only through the WireGuard gateway
+in `docker-compose.yml` (local-stack verification harness) or behind the
+AWS Client VPN endpoint in cloud deployments (per ADR-0006). No direct
+host-port exposure.
 
-Async flow (Phase 2.3):
+Async flow (per ADR-0029):
     POST /primes → 202 Accepted + execution_id (job enqueued in SQS)
     GET  /primes/{exec_id} → {status, result?, error_message?}
 
@@ -17,7 +18,7 @@ GZip:
     to ~1.5-2 MB over the wire, fitting comfortably within ALB limits.
 
 Data layer (ADR-0042):
-    DynamoDB replaces PostgreSQL. execution_id is UUID4 string (not integer).
+    DynamoDB single-table executions row keyed by execution_id (UUID4 string).
     No ORM session — db.py exposes plain sync functions over boto3.
 """
 

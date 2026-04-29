@@ -20,15 +20,34 @@ class Status(StrEnum):
 
 
 class PrimeRangeRequest(BaseModel):
-    """Inclusive range to generate primes within."""
+    """Inclusive range to generate primes within.
 
-    start: int = Field(ge=2, description="Inclusive lower bound (>= 2).")
-    end: int = Field(ge=2, description="Inclusive upper bound (>= start).")
+    Absolute caps on both start and end (le=10^7) bind the schema contract
+    to the static `_SMALL_PRIMES` table's mathematical validity range
+    (sqrt(10^7) = 3163; trial division by primes <= 3163 is correct only
+    for n <= 10^7). Without the absolute cap, a request like
+    [10^9, 10^9 + 100] would have valid range size but trial division
+    against the static table would silently mis-classify composite n
+    as prime — a correctness bug, not just a performance question.
+    """
+
+    start: int = Field(
+        ge=2,
+        le=10_000_000,
+        description="Inclusive lower bound (2 <= start <= 10^7).",
+    )
+    end: int = Field(
+        ge=2,
+        le=10_000_000,
+        description="Inclusive upper bound (2 <= end <= 10^7).",
+    )
 
     @model_validator(mode="after")
     def _check_range(self) -> "PrimeRangeRequest":
         if self.start > self.end:
             raise ValueError(f"start ({self.start}) must be <= end ({self.end})")
+        # Range size cap is redundant given le=10^7 on both fields,
+        # kept as explicit defense-in-depth guard.
         if self.end - self.start > 10_000_000:
             raise ValueError("range size exceeds 10^7 — split into smaller windows")
         return self

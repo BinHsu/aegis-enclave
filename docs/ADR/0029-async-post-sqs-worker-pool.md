@@ -13,7 +13,7 @@ The Phase 1 architecture processed prime-range requests synchronously: `POST /pr
 
 3. **Compute and I/O concerns are conflated in one thread.** The HTTP handler, the prime computation, and the audit write share one execution context. A slow DB write causes a slow HTTP response; a long compute causes the health check to be delayed.
 
-The Phase 1 pre-flight cost-estimator (ADR-0020) was designed to mitigate (1) and (2) by rejecting requests estimated to exceed 30 s. ADR-0032 removes the estimator because three independent guard layers — schema cap, backpressure, worker timeout — provide equivalent protection without the estimator's estimation error. Removing the estimator requires the compute path to move to a worker that can absorb and bound long-running jobs outside the HTTP thread.
+The compute path must move to a worker that can absorb and bound long-running jobs outside the HTTP thread. The three-layer cost guard (ADR-0020 — schema cap, queue backpressure, worker SIGALRM) covers the same DoS-shape concerns without coupling them to the synchronous HTTP path.
 
 ## Decision
 
@@ -49,7 +49,7 @@ Client polling convention:
 ## Consequences
 
 **Positive:**
-- HTTP tier is decoupled from compute tier. `POST /primes` returns immediately (< 100 ms) regardless of range size. HTTP worker saturation is bounded by backpressure middleware (ADR-0032) before queue overflow, not by compute time.
+- HTTP tier is decoupled from compute tier. `POST /primes` returns immediately (< 100 ms) regardless of range size. HTTP worker saturation is bounded by backpressure middleware (per ADR-0020 L2) before queue overflow, not by compute time.
 - SQS visibility timeout (90 s) provides automatic redelivery if a worker fails mid-job. No application-level retry loop is required in the HTTP handler.
 - Worker auto-scaling can track queue depth independently of HTTP tier scaling — they share an image but have separate ECS services and scaling policies.
 - The audit table's status column (`queued → running → done | failed`) gives clients and operators a durable record of every job outcome, including failures with `error_message`.
@@ -61,10 +61,8 @@ Client polling convention:
 - Local stack adds ElasticMQ (ADR-0030) to provide SQS-protocol parity without a live AWS account.
 
 ## Related ADRs
-- ADR-0020 (superseded — synchronous cost estimator; the decoupling here makes the estimator redundant per ADR-0032)
-- ADR-0022 (superseded — synchronous drain semantics; ADR-0033 replaces with async drain)
+- ADR-0003 (PoC scope, prod hygiene — calibration this ADR sits inside)
+- ADR-0020 (compute load management — the three-layer cost guard whose L2 backpressure works above this queue)
 - ADR-0030 (ElasticMQ — local SQS parity for the queue this ADR introduces)
 - ADR-0031 (Valkey distributed cache — the cache layer the worker writes to after compute)
-- ADR-0032 (cost estimator removed — the guard that replaces the estimator, made possible by this async architecture)
 - ADR-0033 (async drain semantics — SIGALRM + SQS visibility + distinction between message recovery and worker recovery)
-- ADR-0003 (PoC scope, prod hygiene — calibration this ADR sits inside)

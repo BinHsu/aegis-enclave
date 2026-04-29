@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# cloud-up.sh — one-shot cloud deployment orchestrator for aegis-enclave Phase 2.5.
+# cloud-up.sh — one-shot cloud deployment orchestrator for aegis-enclave.
 #
 # Sequences the operator's deploy workflow into a single command:
 #   1. Pre-flight: AWS auth + docker daemon + terraform + tfvars present
 #   2. VPN PKI provisioning (idempotent — skip if cert-arns.auto.tfvars valid)
 #   3. ECR-target apply + image build + push (chicken-and-egg break)
-#   4. Full terraform apply (Phase 2.5 cloud-acceptance window starts here)
+#   4. Full terraform apply (cloud-acceptance window starts here per ADR-0034)
 #   5. Print operator next-steps (VPN config, ALB DNS, smoke command)
 #
-# Designed for the bounded apply-then-destroy window (≤ 3h, < $2 per ADR-0031
-# 3h-window cost framing). Pair with `make cloud-down` for collateral-free teardown.
+# Designed for a bounded apply-then-destroy window (per ADR-0034 + ADR-0031
+# cost framing). Pair with `make cloud-down` for collateral-free teardown.
 #
 # Usage:
 #   make cloud-up                              # uses OPERATOR=$(whoami)
@@ -46,7 +46,7 @@ CERT_TFVARS="$TF_DIR/cert-arns.auto.tfvars"
 OPERATOR="${OPERATOR:-$(whoami)}"
 START_TIME=$(date -u +%s)
 
-section "aegis-enclave — cloud-up (Phase 2.5 acceptance window)"
+section "aegis-enclave — cloud-up (cloud-acceptance window)"
 echo "Operator:    $OPERATOR"
 echo "Repo:        $REPO_ROOT"
 echo "Terraform:   $TF_DIR"
@@ -57,9 +57,9 @@ command -v terraform >/dev/null 2>&1 || fail "terraform not found in PATH (brew 
 command -v aws >/dev/null 2>&1       || fail "aws CLI not found in PATH (brew install awscli)"
 command -v docker >/dev/null 2>&1    || fail "docker not found in PATH (install Docker Desktop or OrbStack)"
 docker info >/dev/null 2>&1          || fail "docker daemon not running (start Docker Desktop / OrbStack?)"
-# easy-rsa is required by scripts/bootstrap-vpn-certs.sh (called from phase 4
-# below). Pre-flight here so we fail fast in step 1, not 10 minutes into the
-# flow when bootstrap-vpn-certs.sh tries to invoke easyrsa and dies cryptically.
+# easy-rsa is required by scripts/bootstrap-vpn-certs.sh (called from Step 1
+# below). Pre-flight here so we fail fast in pre-flight, not 10 minutes into
+# the flow when bootstrap-vpn-certs.sh tries to invoke easyrsa and dies cryptically.
 command -v easyrsa >/dev/null 2>&1   || fail "easyrsa not found in PATH (brew install easy-rsa) — required by bootstrap-vpn-certs.sh"
 ok "terraform / aws / docker / easy-rsa all present and ready"
 
@@ -153,7 +153,7 @@ REGION=$(grep -E '^region[[:space:]]*=' "$TFVARS" | sed -E 's/.*=[[:space:]]*"([
 REGION="${REGION:-eu-central-1}"
 ok "Region: $REGION"
 
-# ─── Phase 1: VPN PKI provisioning (idempotent) ────────────────────────────
+# ─── Step 1: VPN PKI provisioning (idempotent) ────────────────────────────
 section "4/6 — VPN PKI + ACM import"
 if [[ -f "$CERT_TFVARS" ]] && grep -q '^server_cert_arn = "arn:' "$CERT_TFVARS" \
                           && grep -q '^client_cert_arn = "arn:' "$CERT_TFVARS"; then
@@ -175,7 +175,7 @@ EOF
     ok "Wrote $CERT_TFVARS"
 fi
 
-# ─── Phase 2: Pre-deps apply + ECR + image push ────────────────────────────
+# ─── Step 2: Pre-deps apply + ECR + image push ────────────────────────────
 # Two reasons for the staged -target apply:
 #   1. ECR must exist before docker push (chicken-and-egg).
 #   2. ECS module's container_definitions for_each fails at plan time when
@@ -255,7 +255,7 @@ else
     ok "Image pushed: $ECR_URL:$IMAGE_TAG"
 fi
 
-# ─── Phase 3: Full terraform apply (remaining ~70 resources) ───────────────
+# ─── Step 3: Full terraform apply (remaining ~70 resources) ───────────────
 section "6/6 — Full terraform apply (remaining resources)"
 info "Pre-deps already applied above. ts_apply.sh will plan + prompt for the rest"
 info "(Client VPN, ALB, ECS service, Valkey, SQS, IAM, autoscaling, VPC endpoints)"
@@ -354,4 +354,4 @@ if [[ -n "$ALARM_EMAIL" ]]; then
 EOF
 fi
 
-ok "cloud-up complete — Phase 2.5 cost timer is running"
+ok "cloud-up complete — cloud-acceptance window cost timer is running"

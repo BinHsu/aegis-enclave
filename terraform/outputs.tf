@@ -1,7 +1,7 @@
 # outputs.tf — surfaced values from the composition.
 #
-# Branch: pivot/dynamodb-multi-region (ADR-0042 greenfield target).
-# RDS outputs replaced by DynamoDB outputs; multi-region outputs are
+# Implements the ADR-0042 greenfield DynamoDB target: DynamoDB outputs
+# replace any prior relational-DB outputs; multi-region outputs are
 # conditional and return null when secondary_region is empty.
 
 output "vpc_id" {
@@ -14,7 +14,7 @@ output "private_subnet_ids" {
   value       = module.vpc.private_subnets
 }
 
-# ─── DynamoDB (replaces RDS outputs) ──────────────────────────────────────
+# ─── DynamoDB executions table ────────────────────────────────────────────
 
 output "dynamodb_table_name" {
   description = "DynamoDB executions table name (ADR-0042). App + worker reach it via DYNAMODB_TABLE_NAME env var."
@@ -101,7 +101,7 @@ output "dynamodb_gateway_endpoint_id" {
   value       = aws_vpc_endpoint.dynamodb.id
 }
 
-# ─── Phase 2.3/2.4 — Async worker + distributed cache ────────────────────────
+# ─── Async worker + distributed cache (ADR-0029 + ADR-0031) ─────────────────
 
 output "valkey_endpoint" {
   description = "Primary ElastiCache Serverless Valkey endpoint (host:port) for the worker and app containers."

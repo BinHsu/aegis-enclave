@@ -324,7 +324,7 @@ class TestRunBootstrapReturnCodeBVA:
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Verify NO schema migration step (ADR-0042 supersedes ADR-0035)
+# Verify NO schema migration step (greenfield DDB path per ADR-0042)
 # ───────────────────────────────────────────────────────────────────────────
 
 
@@ -334,9 +334,8 @@ class TestBootstrapNoDatabaseMigration:
     def test_no_schema_migration_called(self) -> None:
         """run_bootstrap should complete without any DB create_all call."""
         cache = _mock_cache(exists_return=True)
-        # If any DB migration function is accidentally imported/called,
-        # this would fail (via AttributeError or ImportError on the deleted
-        # SQLAlchemy symbols). The simplest proof: run_bootstrap completes without error.
+        # DynamoDB has no DDL — bootstrap is cache-only. The simplest proof:
+        # run_bootstrap completes without error against a mocked cache.
         result = run_bootstrap(cache=cache)
         assert result == 0
 

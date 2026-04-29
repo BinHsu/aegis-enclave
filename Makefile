@@ -156,19 +156,19 @@ tfvars-init: ## Generate terraform.tfvars via interactive Q&A (AWS-aware CIDR + 
 	@./scripts/tfvars-init.sh
 
 .PHONY: cloud-up
-cloud-up: ## Phase 2.5 one-shot deploy — pre-flight + tfvars-init (if missing) + cert + ECR + image push + full apply
+cloud-up: ## Cloud-acceptance one-shot deploy — pre-flight + tfvars-init (if missing) + cert + ECR + image push + full apply
 	@./scripts/cloud-up.sh
 
 .PHONY: cloud-down
-cloud-down: ## Phase 2.5 one-shot teardown — drain ECR + destroy + ACM cleanup + collateral-free verify
+cloud-down: ## Cloud-acceptance one-shot teardown — drain ECR + destroy + ACM cleanup + collateral-free verify
 	@./scripts/cloud-down.sh
 
 .PHONY: cloud-smoke
-cloud-smoke: ## Phase 2.5 cloud-side 6-step smoke (POST + poll + cache hit + 422 + backpressure)
+cloud-smoke: ## Cloud-side 6-step smoke (POST + poll + cache hit + 422 + backpressure)
 	@./scripts/cloud-smoke.sh
 
 .PHONY: cloud-evidence
-cloud-evidence: ## Phase 2.5 evidence capture — CloudWatch metric widgets + worker/bootstrap logs + tf output
+cloud-evidence: ## Cloud-acceptance evidence capture — CloudWatch metric widgets + worker/bootstrap logs + tf output
 	@./scripts/cloud-evidence.sh
 
 .PHONY: dlq-triage
@@ -189,7 +189,7 @@ audit: _ensure-venv ## Run pip-audit against current venv deps for known CVEs (r
 	 exit $$RC
 
 .PHONY: tf-bootstrap
-tf-bootstrap: ## OPERATOR USE ONLY — provision Phase-2 prerequisites (state backend + GHA OIDC role)
+tf-bootstrap: ## OPERATOR USE ONLY — provision deployment prerequisites (state backend + GHA OIDC role)
 	@cd terraform/bootstrap && terraform init && terraform apply
 
 .PHONY: ts-bootstrap-certs
@@ -207,6 +207,10 @@ tf-apply-plan-only: ## OPERATOR USE — run all pre-flight checks then plan; no 
 .PHONY: clean
 clean: ## Tear down stack and remove Python caches
 	make down && find . -type d \( -name __pycache__ -o -name .pytest_cache -o -name .mypy_cache -o -name .ruff_cache \) -exec rm -rf {} +
+
+.PHONY: cloud-evidence-verify
+cloud-evidence-verify: ## Verify cloud-acceptance evidence is complete + non-empty + semantically valid before cloud-down
+	@./scripts/cloud-evidence-verify.sh
 
 .PHONY: pre-push-check
 pre-push-check: ## Scan diff vs origin/main for buyer-name leaks (CLAUDE.md § 6)

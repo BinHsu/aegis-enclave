@@ -5,10 +5,11 @@ Strategy
 - ``httpx.AsyncClient`` against the ASGI app via ``ASGITransport`` for async tests.
 - DynamoDB calls are mocked at the ``prime_service.db`` module level via
   ``unittest.mock.patch`` — endpoint tests are pure HTTP-layer verification.
-- Real DynamoDB integration is verified by ``make smoke`` (Phase 2.5).
-- ``execution_id`` is now a UUID4 string (ADR-0042).
+- Real DynamoDB integration is verified by ``make smoke`` and the
+  cloud-acceptance window scripts.
+- ``execution_id`` is a UUID4 string (per ADR-0042).
 
-Endpoints under test (Phase 2.3 async API):
+Endpoints under test (async API per ADR-0029):
 - GET /health          — ok/degraded behaviour, version reporting
 - POST /primes         — 202 Accepted + {execution_id, status: "queued"}
 - GET  /primes/{id}    — job status polling (queued/running/done/failed)
@@ -177,6 +178,11 @@ class TestComputePrimesEndpoint:
             ({"start": -5, "end": 10}, 422),  # negative start
             ({"start": 10, "end": 5}, 422),  # start > end → model_validator
             ({"start": 2, "end": 100_000_000}, 422),  # range > ceiling
+            # BVA at absolute end cap (10^7) — correctness binding for static
+            # _SMALL_PRIMES table; see ADR-0020 Decision section.
+            ({"start": 2, "end": 10_000_001}, 422),  # B+1: end > cap
+            # BVA at absolute start cap (10^7).
+            ({"start": 10_000_001, "end": 10_000_001}, 422),  # B+1: start > cap
             ({"start": "abc", "end": 10}, 422),  # invalid type
             ({"end": 10}, 422),  # missing start
             ({"start": 2}, 422),  # missing end

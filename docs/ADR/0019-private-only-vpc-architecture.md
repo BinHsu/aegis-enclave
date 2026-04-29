@@ -71,6 +71,7 @@ None of these are met by the prime-number generator deliverable. The application
 - ADR-0006 (VPN three-tier — ingress story; this ADR completes the picture for egress)
 - ADR-0010 (VPN ownership boundary — case-study self-contained vs production)
 - ADR-0012 (migration runbook spec — Track 1 destination clouds may not have PrivateLink-equivalent)
-- ADR-0015 (no real apply — this ADR is documented in code, not applied)
+- ADR-0015 (container orchestration shape — ECS Fargate runs inside this private VPC)
 - ADR-0016 (community Terraform modules — the VPC module supports private-only configuration via the `enable_nat_gateway = false` flag and absent `public_subnets`)
 - ADR-0018 (managed-default tool selection — this ADR is the network-egress instance of the principle)
+- ADR-0037 (secret minimization stance — this ADR's network isolation is the enforcement layer that makes "no service-to-service token" safe)

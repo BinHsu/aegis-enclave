@@ -6,14 +6,15 @@
 # (operator must type the literal word 'destroy', not just 'y' or 'yes').
 #
 # This script is the low-level destroy wrapper used by:
-#   - the Phase 2.5 case-study cloud-acceptance window (per ADR-0034 — bounded
-#     ≤ 3h apply-then-destroy with evidence capture; superseded ADR-0015's
-#     original plan-only stance)
+#   - the case-study cloud-acceptance window (per ADR-0034 — bounded
+#     apply-then-destroy with evidence capture; supersedes ADR-0015's
+#     original plan-only stance for that window)
 #   - operator production adoption (see docs/production_adoption.md)
 #
-# For the case-study window, prefer `make cloud-down` (orchestrates this script
-# plus ECR drain + ACM cert cleanup + local pki/ wipe + collateral verify).
-# For surgical destroy of just terraform-managed resources, call this directly.
+# For the cloud-acceptance window, prefer `make cloud-down` (orchestrates
+# this script plus ECR drain + ACM cert cleanup + local pki/ wipe +
+# collateral verify). For surgical destroy of just terraform-managed
+# resources, call this directly.
 #
 # Usage:
 #   ./scripts/ts_teardown.sh
@@ -53,8 +54,9 @@ echo "Terraform:  $TF_DIR"
 echo "tfvars:     $TFVARS"
 echo
 echo "${RED}${BOLD}WARNING:${RESET} This will destroy ALL infrastructure provisioned by terraform/."
-echo "         Includes RDS database (data loss), ECS service, ALB, VPC + endpoints,"
-echo "         Client VPN endpoint, ECR repository (and all images stored)."
+echo "         Includes the DynamoDB executions table (data loss), ECS services,"
+echo "         ALB, VPC + endpoints, Client VPN endpoint, ECR repository"
+echo "         (and all images stored), ElastiCache Serverless cache, SQS queues."
 
 # ─── Pre-flight: tools ─────────────────────────────────────────────────────
 section "1/5 — Tool presence"
@@ -103,8 +105,8 @@ trap '[[ -f "$PLAN_FILE" ]] && rm -f "$PLAN_FILE"' EXIT
 # service module's container_definitions for_each crashes with
 # 'var.container_definitions will be known only after apply'. Using state
 # alone (no refresh) lets terraform compute the destroy graph from cached
-# values. Trade-off: drift not detected, but case-study apply-then-destroy
-# doesn't drift in 3h.
+# values. Trade-off: drift not detected — acceptable for the bounded
+# apply-then-destroy window (no drift accumulates within the window).
 (cd "$TF_DIR" && terraform plan -destroy -refresh=false -var-file=terraform.tfvars -out="$PLAN_FILE")
 
 # ─── Confirm — strict ─────────────────────────────────────────────────────
@@ -115,8 +117,9 @@ echo "  AWS account: $ACCOUNT_ID"
 echo "  Region:      ${REGION:-<not parsed>}"
 echo "  Caller:      $ARN"
 echo
-echo "${RED}This is IRREVERSIBLE.${RESET} RDS data WILL BE LOST unless a final snapshot was"
-echo "configured (the case-study composition has skip_final_snapshot = true)."
+echo "${RED}This is IRREVERSIBLE.${RESET} DynamoDB table data WILL BE LOST. The"
+echo "case-study composition has point_in_time_recovery enabled, but PITR is"
+echo "wiped on table delete; export to S3 first if any rows must be preserved."
 echo
 printf "Type ${BOLD}destroy${RESET} (literally) to proceed: "
 read -r REPLY

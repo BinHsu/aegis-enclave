@@ -101,7 +101,8 @@ If the deployment graduates from case-study to long-running production:
 Either upgrade is single-digit hours of work at the point it becomes economical.
 
 ## Related
-- ADR-0006 — VPN three-tier story (informs why mutual-TLS was the case-study choice)
-- ADR-0015 — no real apply during case-study cycle (this ADR is in scope for the Phase-2 supersession block)
+- ADR-0006 — VPN three-tier story (informs why mutual-TLS was the chosen authn mode)
+- ADR-0015 — container orchestration shape (the cloud composition this VPN gates ingress to)
 - ADR-0019 — private-only VPC architecture (informs why public-DNS validation paths are out of bounds)
-- ADR-0023 — deferred auto-scaling (sister ADR for "what we left configuration-only for Phase 2")
+- ADR-0027 — internal ALB HTTPS self-signed cert (sibling pattern: provision out-of-band, import into ACM)
+- ADR-0037 — secret minimization stance (this ADR's mTLS path is the cert-based authn that replaces token-based ingress auth)

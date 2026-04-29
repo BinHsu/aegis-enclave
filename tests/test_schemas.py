@@ -2,8 +2,15 @@
 
 Strategy
 --------
-- **Boundary Value Analysis (BVA)** at every numeric threshold (start >= 2,
-  end >= 2, end - start <= 10_000_000) — three points per boundary (B-1, B, B+1).
+- **Boundary Value Analysis (BVA)** at every numeric threshold:
+    * start >= 2 (lower field bound)
+    * start <= 10^7 (upper field bound, absolute cap)
+    * end >= 2 (lower field bound)
+    * end <= 10^7 (upper field bound, absolute cap)
+    * start <= end (ordering)
+    * end - start <= 10^7 (redundant range-size guard, mathematically
+      unreachable given absolute caps but kept as explicit defense)
+  Three points per boundary (B-1, B, B+1).
   This is the same BVA discipline applied to ``primes.py`` (see ADR-0017
   "Prime Computation Strategy" for the layered-validation rationale).
 - **Equivalence partitioning** for invalid input classes (negative, zero,
@@ -69,22 +76,46 @@ class TestPrimeRangeRequestBoundaries:
         with pytest.raises(ValidationError, match="must be <= end"):
             PrimeRangeRequest(start=1_000_000, end=2)
 
-    # BVA at range-size ceiling
+    # BVA at end absolute cap = 10^7 (upper field bound)
+    def test_end_one_below_absolute_cap_accepted(self) -> None:
+        req = PrimeRangeRequest(start=2, end=_RANGE_CEILING - 1)
+        assert req.end == _RANGE_CEILING - 1
+
+    def test_end_at_absolute_cap_accepted(self) -> None:
+        req = PrimeRangeRequest(start=2, end=_RANGE_CEILING)
+        assert req.end == _RANGE_CEILING
+
+    def test_end_one_above_absolute_cap_rejected(self) -> None:
+        # New: absolute cap binds correctness — static _SMALL_PRIMES table
+        # only covers sqrt(10^7) = 3163; trial division for n > 10^7 would
+        # silently mis-classify composites. Schema cap closes that bug.
+        with pytest.raises(ValidationError, match="end"):
+            PrimeRangeRequest(start=2, end=_RANGE_CEILING + 1)
+
+    # BVA at start absolute cap = 10^7 (upper field bound)
+    def test_start_one_below_absolute_cap_accepted(self) -> None:
+        req = PrimeRangeRequest(start=_RANGE_CEILING - 1, end=_RANGE_CEILING - 1)
+        assert req.start == _RANGE_CEILING - 1
+
+    def test_start_at_absolute_cap_accepted(self) -> None:
+        req = PrimeRangeRequest(start=_RANGE_CEILING, end=_RANGE_CEILING)
+        assert req.start == _RANGE_CEILING
+
+    def test_start_one_above_absolute_cap_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="start"):
+            PrimeRangeRequest(start=_RANGE_CEILING + 1, end=_RANGE_CEILING + 1)
+
+    # BVA at range size — values now constrained by absolute caps to be
+    # mathematically <= 10^7 - 2; the redundant guard is unreachable.
+    def test_range_size_max_under_absolute_caps(self) -> None:
+        # Maximum achievable range size given le=10^7 on both fields:
+        # start=2, end=10^7 → range size = 10^7 - 2
+        req = PrimeRangeRequest(start=2, end=_RANGE_CEILING)
+        assert req.end - req.start == _RANGE_CEILING - 2
+
     def test_range_size_well_below_ceiling_accepted(self) -> None:
         req = PrimeRangeRequest(start=2, end=1_000_000)
         assert req.end - req.start == 999_998
-
-    def test_range_size_one_below_ceiling_accepted(self) -> None:
-        req = PrimeRangeRequest(start=2, end=2 + _RANGE_CEILING - 1)
-        assert req.end - req.start == _RANGE_CEILING - 1
-
-    def test_range_size_at_ceiling_accepted(self) -> None:
-        req = PrimeRangeRequest(start=2, end=2 + _RANGE_CEILING)
-        assert req.end - req.start == _RANGE_CEILING
-
-    def test_range_size_one_above_ceiling_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="range size"):
-            PrimeRangeRequest(start=2, end=2 + _RANGE_CEILING + 1)
 
 
 class TestPrimeRangeRequestTypeCoercion:

@@ -26,7 +26,7 @@ The "intentionally absent" list is part of the cover-note manifesto, not a hidde
 | Candidate | Why not |
 |---|---|
 | Full PoC, no hygiene | Skips the brief's "long-term, multiple developers" signal; reads as careless; loses the engineering-discipline read. |
-| Full production grade | Blows past "small application" and the 22h budget (per ADR-0028, originally 15h); reads as overengineered; risks signalling poor calibration. |
+| Full production grade | Blows past "small application" calibration; reads as overengineered; risks signalling poor calibration. |
 | Pure feature-fest with no hygiene | Anti-pattern in 2026 engineering culture; no senior reviewer would accept untyped, untested code as a deliverable. |
 | Hybrid with arbitrary cuts | Without explicit framing, every cut looks like an oversight rather than a choice. Needs a stated calibration — hence this ADR. |
 
@@ -37,5 +37,5 @@ The "intentionally absent" list is part of the cover-note manifesto, not a hidde
 - Any later request to add CI/CD, Prometheus, or "production hardening" must supersede this ADR explicitly — silent upgrades are blocked by `CLAUDE.md` § 4 (Calibration: production-shape, PoC-scale).
 
 ## Related ADRs
-- ADR-0002 (15-hour budget — superseded by ADR-0028 raising cap to 22 hours; the budget this calibration must fit inside)
-- ADR-0015 (no K8s, no real `terraform apply` — direct consequences of this calibration)
+- ADR-0015 (container orchestration shape — direct consequence of this calibration)
+- ADR-0034 (delivery methodology — the *how* sister to this ADR's *what*)

@@ -1,62 +1,48 @@
-# ADR-0015: No Kubernetes manifests; no real Terraform apply for the cloud target
+# ADR-0015: Container orchestration shape — ECS Fargate cloud + Docker Compose local parity
 
 ## Status
-Accepted (2026-04-25)
+Accepted (2026-04-28)
 
 ## Context
-Two scope-temptations sit at the edge of this deliverable: shipping Kubernetes manifests alongside Docker Compose, and running `terraform apply` against a real AWS account to capture screenshots of the deployed system. Both are tempting because both look like "more work, more signal." Both, on inspection, are over-scope.
 
-The brief itself is precise about what's required:
+This case-study uses ECS Fargate matched to workload scope and team size. Multi-account / IAM Identity Center / Organizations setup at production scale lives in the sister `aegis-aws-landing-zone` repo (aegis-* portfolio peer); this repo focuses on the application-shape decisions inside one account.
 
-- **Task 2 (orchestration)** says "Docker Compose / Kubernetes" — "or", not "and". One suffices.
-- **Task 3 (cloud)** says cloud deployment is "encouraged but not mandatory. **A list of clear instructions would suffice.**" — applying the Terraform is not required.
+The orchestration decision has two coupled claims that fall out of the same calibration:
 
-The Phase 1 calibration is "production-shape, PoC-scale" (ADR-0003). Kubernetes for two services is over-engineering at PoC scale; a real cloud apply produces evidence the brief doesn't ask for, while consuming budget the brief's other deliverables do need.
+1. **ECS Fargate, not K8s.** The K8s-default reflex assumes a platform team to absorb K8s operational tax: etcd backup, RBAC sprawl, ingress controller, cert-manager, CSI driver, Prometheus operator, EKS control-plane fee. The aegis-enclave workload — small audit-log + async compute service, no service mesh, no operators, no multi-cluster federation — does not justify any of that surface. ECS Fargate provides task scheduling, health-checked rolling deploys, IAM task roles, autoscaling, and CloudWatch integration as managed primitives — sufficient for the workload shape and below the platform-team threshold.
 
-Senior reviewers recognise scope-honest delivery. Adding K8s and a real apply would be visible as overengineering, not as effort. The differentiator at this scope is the migration runbook (ADR-0012), not a screenshot of a running ECS task.
+2. **Local Docker Compose parity.** Same Dockerfile + same boto3 client code paths against local ElasticMQ (SQS-shape per ADR-0030), dynamodb-local (DDB-shape per ADR-0042), and Valkey container — so local development matches cloud topology. Fast feedback loop, forker onboarding without an AWS account, integration testing without cloud cost.
 
-What we save by not doing K8s: ~1-1.5h cluster setup (kind + Calico CNI for NetworkPolicy support) + manifest writing + debug, plus the cognitive overhead of a second orchestration system in the same deliverable. What we save by not applying Terraform: ~2-2.5h for provider setup, IAM bootstrap, debug, screenshot capture, and teardown — plus AWS account exposure, since every apply leaves state to clean up.
+These two claims are coupled: ECS Fargate naturally enables Compose parity (plain containers, plain stdout logs, plain env-var config). K8s would force Kind / K3s / Minikube for local parity — much heavier dev setup, with Compose-incompatible primitives (Services, Ingress, ConfigMaps) that don't translate one-for-one.
 
 ## Decision
-Use **Docker Compose only** for orchestration — no Kubernetes manifests. Provide Terraform code for AWS as a **`plan`-only artifact** — no `terraform apply`. The Terraform code is built from community modules (ADR-0016) and is reviewable as code; the runbook (ADR-0012) carries the architectural differentiator. If the buyer asks "could you actually deploy this?", the answer is yes — here's the plan output, here's the runbook — which demonstrates capability without consuming budget on proof.
+
+**ECS Fargate** for the cloud target. Two services: `app` (HTTP API, `desired_count = 3` per AZ baseline) and `worker` (SQS consumer, `min = 3 / max = 9` autoscale on SQS depth per ADR-0023). One-shot bootstrap task for cache seeding. All tasks behind an internal ALB in private subnets (per ADR-0019).
+
+**Docker Compose** for local development. `docker-compose.yml` mirrors the production topology: app + worker + bootstrap + ElasticMQ + dynamodb-local + Valkey + WireGuard verification gateway. The forker quick-start path (smoke test, integration tests) runs entirely against Compose — no AWS account required.
+
+Same image, same code paths, same env-var contract across local and cloud. The only difference is endpoint URLs (`http://elasticmq:9324` vs SQS-managed-URL; `http://dynamodb-local:8000` vs DDB endpoint).
 
 ## Alternatives Considered
 
-| Candidate | Why not |
+| Alternative | Industry context |
 |---|---|
-| K8s manifests + kind cluster | ~1-1.5h with no signal gain at this scope; Docker Compose satisfies the brief; introduces a second orchestration system to maintain. |
-| K8s manifests as reference-only (committed but not run) | Still ~30 min to write meaningful manifests; reviewers can't tell whether they actually run, so the artifact is lower-trust than what it replaces. |
-| Real AWS apply with screenshots | Brief explicitly optional; ~2-2.5h cost; doesn't differentiate beyond what the runbook already does; leaks account IDs / IPs / ARNs into the repo; leaves AWS state to clean up. |
-| EKS instead of ECS Fargate in Terraform | $73/mo control plane fee + complexity; ECS Fargate is the appropriate-complexity managed primitive for case-study scope; EKS is a Phase 2 conversation if the buyer's actual workload demands it. |
+| **EKS** (managed K8s control plane) | Right call for orgs that already run K8s at platform scale. Worker node lifecycle / RBAC / ingress controller / cert-manager / CSI / Prometheus operator still fall on the team — control-plane being managed is only ~5% of the operational tax. Negative ROI for the aegis-enclave workload size. |
+| **Self-hosted K8s** (kops, kubeadm, kubespray) | Even more burden; only justified by very specific control requirements (air-gapped, regulated workloads requiring exact K8s version pinning). |
+| **Kind / K3s / Minikube for local parity** | Heavier than Compose for the parity target. Forker onboarding cost rises sharply. |
+| **EC2 + auto-scaling group + custom AMI** | Pre-Fargate pattern. Requires AMI lifecycle, patching cadence, capacity provisioning. Fargate eliminates this surface. |
+| **Lambda + EventBridge** | Right shape for very-short-duration, low-rate, stateless functions. The 60 s SIGALRM compute budget (ADR-0033) and persistent connections to Valkey + DDB favour persistent workers. |
 
 ## Consequences
-- Phase 1 budget stays within 22h (per ADR-0028; saves ~3-4h vs the maximalist version that ships K8s + a real apply).
-- Cloud account exposure minimised — no real state to clean up, no leaked identifiers in committed history.
-- The runbook (ADR-0012) carries the architectural differentiator, not the apply screenshot.
-- If a reviewer reads the absence of a real apply as "couldn't actually deploy", the cover note + the plan output + the runbook collectively answer that — and the answer is more senior than a screenshot would be: "we deliver code + verifiable plan, not real cloud state, because the brief asks for instructions."
-- Trade-off accepted: candidates who run a real apply may produce flashier deliverables. The compensating gain is that the artifact stays scope-honest, time-budget-honest, and account-hygiene-honest.
 
-## Phase 2 supersession — personal-AWS deployment (2026-04-25)
-
-The Phase-1 stance above remains in force for the **case-study deliverable cycle**: nothing the buyer reviews is the product of a real `terraform apply`. That stays correct.
-
-**For post-Phase-1 personal use** — the operator's own AWS account, deployed for hands-on verification rather than buyer review — the plan-only constraint is **superseded** by ADR-0023 (auto-scaling), ADR-0024 (cert provisioning), and ADR-0025 (state backend), which together specify everything required to make `terraform apply` succeed end-to-end:
-
-| Phase-2 unblock | ADR | Artefact |
-|---|---|---|
-| Auto-scaling configuration | ADR-0023 | HCL ready to paste into `module.ecs.services.app`; commented-out scaffold in `terraform/main.tf` |
-| VPN server + client root certs | ADR-0024 | `scripts/bootstrap-vpn-certs.sh` + ACM imports |
-| State backend (S3 + DynamoDB lock) | ADR-0025 | `terraform/bootstrap/` separately bootstrapped |
-| PR-time `terraform plan` via OIDC (Phase 2.5) | ADR-0026 | `.github/workflows/terraform-plan.yml` + GHA OIDC role bundled into bootstrap module |
-
-The order of operations is documented in ADR-0023 § Future direction: bootstrap state backend → import certs → first apply → connect via VPN → verify drain semantics (ADR-0022) end-to-end.
-
-**Phase 2.5 evidence capture — completed 2026-04-26.** The `terraform apply` ran against the operator's personal AWS account (eu-central-1); ~88 resources in ~30 minutes cumulative (staged apply). Smoke 6/6 green against the live deployed stack (POST 202 → poll done → primes count 25 in [2,100] → cache hit → 422 negative → 20-concurrent backpressure 0/20 503 at PoC load). Worker and bootstrap task CloudWatch log lines captured via `aws logs filter-log-events` (browser CloudWatch console was blocked by org-level SCP `cloudwatch:ListMetrics` deny — positive signal of org guardrails; API path used instead). Cost actual: ~$1.50 in the 3h window. Stack torn down via `make cloud-down`; collateral-free verified (VPC / Client VPN / ACM / ECR all empty post-destroy). Evidence committed to `docs/deployment_guide.md` § Phase 2.5 Cloud-acceptance evidence. The case-study artefact now includes a receipt of the real deployment per ADR-0035 (bootstrap task schema migration) and ADR-0036 (git-SHA image tagging).
+- **Cloud apply happens** (per ADR-0026 OIDC plan + operator's local `make cloud-up` apply). The case-study deliverable includes a real cloud-acceptance window; this is not a "plan-only forever" stance.
+- **Forker onboarding without AWS** is the default path. `docker compose up` + `make smoke` exercises the full topology locally. Cloud deployment is opt-in via `make cloud-up`.
+- **K8s migration path** lives in `docs/migration_runbook.md` Track 3. ECS → EKS is mechanical (same image, similar IAM-via-IRSA pattern); the runbook records the steps for forkers whose ops team has invested in K8s elsewhere.
+- **Coupling to ECS-specific primitives** (task definitions, service discovery via Cloud Map, ECS Exec) is shallow — the application code does not depend on ECS APIs. Migration to another container orchestrator is a Terraform rewrite, not an application rewrite.
 
 ## Related ADRs
-- ADR-0002 (15h time budget — superseded by ADR-0028 raising cap to 22h; the constraint this decision protects)
-- ADR-0003 (PoC-scope, production-hygiene calibration)
-- ADR-0012 (migration runbook is the architectural differentiator, not the apply)
-- ADR-0016 (community Terraform modules — the code that doesn't get applied)
-- ADR-0018 (managed-default tool selection — ECS Fargate is the managed-default for the compute-orchestration domain)
-- ADR-0023 / 0024 / 0025 / 0026 — Phase-2 supersession quartet (auto-scaling, certs, state backend, PR plan)
+- ADR-0003 (PoC scope, prod hygiene calibration — this ADR's calibration)
+- ADR-0019 (private-only VPC — the network this orchestration runs inside)
+- ADR-0023 (worker auto-scaling — the dynamic capacity layer over ECS Fargate)
+- ADR-0030 (ElasticMQ for local SQS parity — the Compose-equivalence pattern this ADR enables)
+- ADR-0042 (data store — DynamoDB Global Tables, with `amazon/dynamodb-local` for Compose parity)

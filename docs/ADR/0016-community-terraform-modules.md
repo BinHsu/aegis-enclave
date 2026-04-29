@@ -17,7 +17,7 @@ Senior reviewers recognise community modules instantly. Using them signals "I do
 Build the Terraform composition from `terraform-aws-modules/*` registry modules. Hand-rolled HCL is reserved for thin glue between modules. Modules in use:
 
 - `terraform-aws-modules/vpc/aws` — VPC + subnets + NAT + IGW
-- `terraform-aws-modules/rds/aws` — RDS PostgreSQL (Multi-AZ standby per ADR-0009)
+- DynamoDB tables (Global Tables replicas, per ADR-0042) — direct provider resources (`aws_dynamodb_table`)
 - `terraform-aws-modules/ecs/aws` + `terraform-aws-modules/alb/aws` — ECS Fargate cluster + internal ALB
 - `terraform-aws-modules/security-group/aws` — security group composition
 - AWS Client VPN endpoint via the AWS provider directly (no high-quality community module for this resource exists yet, but the resource itself is small)

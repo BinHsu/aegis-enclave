@@ -1,8 +1,55 @@
 # Design Document — aegis-enclave
 
+## 1.0 Service Specification
+
+```
+SERVICE: aegis-enclave prime computation service
+
+INPUT CONTRACT:
+  POST /primes        body: {start: int, end: int}
+                       constraints: 2 <= start <= end <= 10^7
+                       returns: 202 Accepted with execution_id
+
+  GET /primes/{id}    returns: {status, primes[]} when done
+                       polling-friendly; status ∈ {queued, running, done, failed}
+
+  GET /health         returns: 200 OK
+
+CAPACITY ENVELOPE (per region):
+  Worker pool baseline:           3 (one per AZ; ADR-0007)
+  Worker pool max:                9 (autoscale on SQS depth; ADR-0023)
+  Per-request range cap:          10^7 (10,000,000)
+  Per-task compute budget:        60s SIGALRM (ADR-0033)
+  Acceptable p99 queue wait:      5 min (Tier 2 ops support; ADR-0008)
+  Queue backpressure threshold:   5 × worker_count (ADR-0020)
+
+SLO TARGETS (Tier 2 ops support per ADR-0008):
+  RTO:                            15 min
+  RPO:                            5 min
+  p99 POST-to-202:                <100ms
+  p99 poll-to-done worst case:    <6min (5min queue + 60s compute)
+  Error budget:                   1.44%/0.6%/0.1% (multi-window burn rate)
+  Cache hit ratio:                >80%
+
+NOT DESIGNED FOR (deliberate scope boundaries):
+  - Tier 0/1 RTO <5 min
+  - Sustained burst >100 req/min (use auto-scaling promotion)
+  - Multi-tenant cost attribution (FinOps tier 2)
+  - Distributed tracing across SQS hop (Tier 3 promotion)
+  - K8s-native primitives (per ADR-0015)
+```
+
+Full implementation rationale follows in §§ 1.1+.
+
+## Delivery methodology — PoV iteration with validation gates
+
+The architectural progression in this design — single-AZ → multi-AZ → multi-region — is **deliberate PoV cadence with validation gates**, not three increments of equal effort. Each stage validates feasibility + verifiability before the next stage's commitment. Resource allocation per stage matches the demonstrated value at the prior gate. Engineering staff is part-time on this project (multiple parallel commitments); PoV staging optimizes for feasibility per available time slice.
+
+See [ADR-0034](ADR/0034-build-budget-22-to-24h-l4-expansion.md) for the methodology meta-decision.
+
 ## Scope and calibration
 
-`aegis-enclave` is calibrated as **production-shape engineering at PoC scale** (ADR-0003). The deliverable answers a case-study brief that mixes "small application" framing with "long-term, multiple developers" hygiene language; the calibration resolves that tension by holding hygiene at production grade while letting feature surface stay deliberately small. The build is hard-capped at 24 hours (originally 15h per ADR-0002, revised to 22h per ADR-0028, then to 24h per ADR-0034 to accommodate HTTPS at the internal ALB, the Phase 2.5 cloud-acceptance window, async L1-L3 implementation, distributed cache implementation, and range-coalescing L4 expansion) and every cut taken to fit that budget is recorded as its own ADR rather than silently omitted.
+`aegis-enclave` is calibrated as **production-shape engineering at PoC scale** (ADR-0003). The deliverable holds hygiene at production grade while letting feature surface stay deliberately small. Every cut is recorded as its own ADR rather than silently omitted.
 
 The following operations layers are **intentionally absent**, named so the reviewer reads deliberate deferral rather than oversight:
 
@@ -17,20 +64,13 @@ Every architectural claim below is anchored to a numbered ADR in [`docs/ADR/`](A
 
 ### 1.1 High availability
 
-The cloud composition (`main` branch) is deployed to a single AWS region (`eu-central-1`, Frankfurt) with three-AZ subnet distribution (per ADR-0007 reconsidered) and an RDS Multi-AZ standby. **Production target depends on the deployment starting point**:
+The production target is **multi-region active-active**: `eu-central-1` (Frankfurt) + `eu-west-1` (Ireland), DynamoDB Global Tables for the data layer, Route53 weighted routing 50/50, mirror compute stack per region (per [ADR-0042](ADR/0042-dynamodb-global-tables-greenfield-multi-region.md)). RTO ~60–300 s (DNS-only failover); no promotion step; no Lambda failover orchestration; no failback reconstitution complexity. RPO ~1 s typical (Global Tables async replication lag).
 
-- **Greenfield deployment** (no existing PG investment): the cloud-native production-grade target is multi-region **active-active** via DynamoDB Global Tables (ADR-0042), demonstrated on the `pivot/dynamodb-multi-region` branch. RTO ~60-300s (DNS-only); no Aurora promotion step; no Lambda failover orchestration; no failback Path 1/2 reconstitution. This is the canonical greenfield target.
-- **Existing PG-investment deployment** (case-study `main` branch starting point): the upgrade target is multi-region **active-passive** via Aurora Global Database (ADR-0040), with Lambda-driven failover and the operational complexity that path requires. Promotion runbook in `docs/scaling_runbook.md`.
+Per region, the in-region posture is **3-AZ** (per [ADR-0007](ADR/0007-single-region-multi-az.md)): three private subnets, ECS tasks spread one per AZ baseline, ALB target groups across all three, VPC endpoints provisioned in all three. Loss of one AZ leaves 2/3 capacity (33% degradation).
 
-Both branches realise the multi-region step in `docs/scaling_runbook.md` (ADR-0012); the agent-executable runbook bifurcates greenfield vs migration paths. The triggers that would move multi-region from documented-target into deployed-implementation are named explicitly in the Reliability section of the design — none of them are met at case-study scope:
+The combination — per-region 3-AZ + cross-region active-active — gives the SLO targets headroom. ADR-0008 calibrates aegis-enclave as Tier 2 ops support (industry RTO 1–4 h); the chosen 15 min RTO is conservative-of-Tier-2, then comfortably met by ~60–300 s DNS failover.
 
-1. Workload concurrency exceeding what a single region can absorb (e.g., simultaneous high-throughput streams from independent producers)
-2. Globally distributed clients requiring locally-terminated network paths for latency or jurisdiction reasons
-3. Regulatory requirements explicitly demanding geographic redundancy
-
-A senior practitioner's honest estimate for full multi-region active-active in Phase 1 — Aurora Global Database, cross-region peering, per-region ECS / ALB / Client VPN endpoints, Route 53 failover, cross-region IAM and KMS replication, plus a failover drill — lands at 10-14 hours. That consumes the bulk of the 22h budget for a capability the brief does not ask for. The reviewer reads "I have a Phase 2 plan" rather than "I forgot about scaling."
-
-Multi-AZ inside a single region is a different shape entirely. `multi_az = true` on the RDS module and multi-subnet target groups on ECS are one-line Terraform toggles. **It's free architectural credit; declining it would require its own ADR explanation.** The internal ALB spans both AZs, the ECS service can place tasks in either subnet, and the database has a synchronous hot standby in the second AZ. None of this costs additional design complexity beyond a few module arguments.
+Single-region deployment is the **local development PoC + forker quick-start** path. `docker-compose.yml` ships a single-stack environment for verification without AWS. Forkers promoting to production via the runbook gain multi-region as the architectural target; the runbook lives in `docs/scaling_runbook.md` (per [ADR-0012](ADR/0012-migration-runbook-agent-executable.md)).
 
 ### 1.2 Service-level objectives, RTO, RPO
 
@@ -38,16 +78,18 @@ The brief makes no quantitative reliability requirement, but a senior deliverabl
 
 | Indicator | Target | Rationale |
 |---|---|---|
-| Availability SLI | sum(2xx) / sum(non-5xx) over 30d rolling | 99.5 % — internal tooling, ~3.6h/month error budget |
-| Latency p99 (`/primes`, range ≤ 10⁶) | < 500 ms | Bounded by computation; not real-time |
-| Error rate | < 0.5 % | Aligned with availability budget |
-| Database write success | INSERT to `executions` table | 99.9 % — loss = audit gap |
-| RTO — service | ≤ 15 min | Multi-AZ ECS / RDS auto-failover ~2-5 min + manual buffer |
-| RTO — data corruption (PITR) | ≤ 1 hour | RDS PITR restore takes ~30-60 min |
-| RPO — DB writes | ≤ 5 min | RDS automated backup + transaction log |
-| RPO — in-flight transactions | < 1 min | Synchronous commit to multi-AZ replica |
+| Availability SLI | sum(2xx) / sum(non-5xx) over 30d rolling | 99.5% — internal tooling, ~3.6 h/month error budget |
+| Latency p99 — POST `/primes` | < 100 ms | API tier does no compute; bounded by DDB write + SQS enqueue |
+| Latency p99 — GET `/primes/{id}` | < 50 ms | DDB read only |
+| End-to-end p99 — poll-to-done | < 6 min worst case | 5 min queue wait + 60 s compute (ADR-0020 derivation) |
+| Cache hit ratio | > 80% | 30-min rolling window; below threshold triggers alarm |
+| 5xx error rate | < 0.5% | Multi-window burn-rate alarm at 1.44% (fast) and 0.6% (slow) per Google SRE Workbook (ADR-0041) |
+| RTO — service | ≤ 15 min | Conservative-of-Tier-2 (industry baseline 1–4 h). Met by per-region 3-AZ + cross-region active-active routing. |
+| RTO — data corruption (PITR) | ≤ 1 h | DynamoDB PITR continuous backup |
+| RPO — durable writes | ≤ 5 min | Met natively by DynamoDB Global Tables ~1 s replication lag |
+| RPO — in-flight transactions | < 1 s | Synchronous local-region commit; cross-region replication async |
 
-Each row traces back to a specific Terraform decision rather than standing as a free-floating number. RTO 15min is supported by `multi_az = true` on RDS (ADR-0009) — the synchronous hot standby auto-fails-over within ~2-5 minutes and the remaining buffer covers manual intervention. RPO < 1min on in-flight transactions falls out of the same synchronous-commit topology. RPO ≤ 5min on durable writes comes from RDS's automated backup and transaction log retention. The trace is the value of the table; the digits without the trace would be filler.
+Each row traces back to a specific Terraform decision rather than standing as a free-floating number. RTO 15 min is supported by per-region 3-AZ posture (ADR-0007) + cross-region active-active routing (ADR-0042) — DNS failover ~60–300 s well within budget. RPO < 1 s on in-flight transactions comes from local-region synchronous commit; RPO ≤ 5 min on durable writes is met natively by DynamoDB Global Tables ~1 s replication lag. The trace is the value of the table; the digits without the trace would be filler.
 
 ### 1.3 Out of scope (named, not forgotten)
 
@@ -57,7 +99,7 @@ The following operations layers are deliberately deferred under ADR-0003 and ADR
 - **Observability stack** — no Prometheus, no Grafana, no Loki, no centralised log aggregation
 - **Distributed tracing** — no OpenTelemetry collector, no APM
 - **Load testing** — no k6 / Locust / synthetic-traffic baseline
-- **Region-level DR drills** — multi-region runbook exists (`docs/scaling_runbook.md`, Phase 2) but no rehearsed drill
+- **Region-level DR drills** — multi-region runbook exists (`docs/scaling_runbook.md`) but no rehearsed drill in the case-study window
 - **Multi-environment promotion** — single `environment = "dev"` only; no dev → staging → prod gating
 - **SLA / OLA** — explicitly out of scope (ADR-0008); no external contractual surface, no team structure to bind
 
@@ -95,7 +137,7 @@ Brief Task 2 bundles a VPN gateway into the Docker Compose stack alongside the a
 
 In production at typical company scale, VPN is centralised platform infrastructure owned by a platform / network team. Key material and identity binding are managed once, not per service; audit logs aggregate centrally for compliance; HA, failover, and capacity planning are handled at the platform layer. Application services consume an existing VPN endpoint and express network policy via Security Groups — they do not provision the VPN themselves.
 
-The Phase 1 demo bundles the VPN container per the brief's wording. The production architecture decouples the VPN from the application service. The Terraform module structure makes this distinction operational: `module "vpn"` (and its underlying `aws_ec2_client_vpn_endpoint` resource) is a separable unit. In a production deployment it is replaced by a `data` source pointing at the existing corporate VPN endpoint, with the application module unchanged. The migration runbook (ADR-0012) splits into two tracks for the same reason: the application track and the VPN-modernisation track have different owners, different cadence, different blast radius.
+The local-development Compose stack bundles the VPN container as a self-contained verification fixture. The cloud production architecture decouples the VPN from the application service. The Terraform module structure makes this distinction operational: `module "vpn"` (and its underlying `aws_ec2_client_vpn_endpoint` resource) is a separable unit. In a production deployment it is replaced by a `data` source pointing at the existing corporate VPN endpoint, with the application module unchanged. The migration runbook (ADR-0012) splits into two tracks for the same reason: the application track and the VPN-modernisation track have different owners, different cadence, different blast radius.
 
 ### 2.5 Network egress posture
 
@@ -111,7 +153,7 @@ The principle is captured in ADR-0018 (managed-default tool selection) — pick 
 
 Observability is named in § 1.3 as deliberately out of scope: no Prometheus, no Grafana, no Loki, no centralised collector, no APM, no OpenTelemetry. That is the **scope** statement, not the **architecture** statement. The architecture statement — what the deployed system already emits, what it cannot answer with that emission alone, and what the upgrade path looks like — is below.
 
-This section is also the **evidence-capture spec for Phase 2.5**: the table in § 3.1 is what gets screenshotted into `docs/deployment_guide.md` while the cloud-acceptance window is live, before teardown.
+This section is also the **evidence-capture spec**: the table in § 3.1 is what gets screenshotted into `docs/deployment_guide.md` during the cloud-acceptance window.
 
 ### 3.1 What the cloud composition emits for free
 
@@ -125,7 +167,7 @@ Every primitive in the Terraform composition publishes a baseline of CloudWatch 
 | AWS Client VPN endpoint | `ActiveConnectionsCount`, `AuthenticationFailures`, `IngressBytes`, `EgressBytes` | Connection log: client cert CN, source IP, connect / disconnect timestamps |
 | VPC Flow Logs | (per-flow records) | All NIC-to-NIC traffic, including PrivateLink endpoint hits |
 
-Phase 2.5's cloud-acceptance gate consumes this baseline by combining four evidence sources, captured before the stack is destroyed:
+The cloud-acceptance gate consumes this baseline by combining four evidence sources, captured before the stack is destroyed:
 
 1. **Aggregate metric dashboards** — ALB `RequestCount` / `TargetResponseTime` / 5xx, ECS task CPU / memory, RDS CPU / connections, Client VPN active connections. One screenshot per dashboard captures system-level health.
 2. **Per-endpoint round-trip** — manual `curl` invocations against `/health`, `POST /primes`, and `GET /executions/{id}` with request and response bodies recorded. This is the per-endpoint correctness signal.
@@ -140,7 +182,7 @@ The ALB metrics aggregate across endpoints. For aegis-enclave specifically — t
 
 - **Per-endpoint latency.** A p99 spike on the ALB cannot tell whether `POST /primes` is degrading (expected under load) or `GET /health` is degrading (unexpected, likely a DB-connection or service-health canary). Mixed into one statistic, the smaller endpoint's signal is dominated and effectively invisible.
 - **Per-endpoint error rate.** A 5xx burst on `POST /primes` (e.g., a bad input range escaping validation) reads identically to a 5xx burst on `GET /executions/{id}` (e.g., DB unavailability). The remediation paths differ.
-- **Business-level dimensions.** Latency as a function of the requested range size (the dominant performance variable for `POST /primes`), cache hit vs miss for the prime-cache code path (ADR-0021), or per-tenant call patterns if multi-tenancy enters scope — none of these are visible from the ALB.
+- **Business-level dimensions.** Latency as a function of the requested range size (the dominant performance variable for `POST /primes`), cache hit vs miss for the prime-cache code path (ADR-0031), or per-tenant call patterns if multi-tenancy enters scope — none of these are visible from the ALB.
 - **Internal subsystem timing.** DB query duration, cache lookup duration, and computation time are a single black box from the ALB's perspective. Slow queries surface in the RDS slow-query log, but the linkage back to the API request that issued them is not.
 
 The gap is between **infrastructure observability** (already free) and **application observability** (requires a decision).
@@ -193,7 +235,7 @@ The migration runbook (`docs/migration_runbook.md`) is the right place to record
 
 ### 3.5 Calibration recap
 
-The architecture above mirrors the calibration shape in § 1.3: name the architecture, scope the implementation, leave deferred work as designed sketches rather than absent ones. **Phase 2.5.1 (2026-04-28, per ADR-0041)** promoted § 3.3's "sketch" to shipped Tier 1: SLI emission, CloudWatch Dashboard, multi-window burn-rate alarms, optional SNS email delivery. § 3.4's APM/distributed-tracing layer remains a deliberate Tier 3 V2 — the SQS message-attribute trace_id propagation work and ADOT collector are documented in the deployment_guide § Production hardening checklist, not implemented. The **scope statement** at § 1.3 (no Prometheus, no Grafana surface, no APM) still reads correctly: we have neither Prometheus the system nor Grafana the UI; we have CloudWatch the AWS-native equivalent, scoped to what a 3h apply-then-destroy evidence model can deliver as screenshots.
+The architecture above mirrors the calibration shape in § 1.3: name the architecture, scope the implementation. The shipped observability tier (per [ADR-0041](ADR/0041-observability-amp-amg-not-grafana-cloud.md)) is CloudWatch SLI emission via EMF + 6-panel dashboard + multi-window burn-rate alarms + opt-in SNS email delivery. The distributed-tracing layer (§ 3.4) remains a forker-promotion path documented in `production_adoption.md` § Observability at production scale. We have neither Prometheus the system nor Grafana the UI; we have CloudWatch the AWS-native equivalent, scoped to what an apply-then-destroy evidence model can deliver as screenshots.
 
 ## 4. Async architecture + cost guards
 
@@ -240,7 +282,7 @@ OPERATIONAL POSTURE
                     multi-tenant isolation
 ```
 
-See [ADR-0029](ADR/0029-async-post-sqs-worker-pool.md), [ADR-0031](ADR/0031-elasticache-serverless-valkey-zset-lua-coalescing.md), [ADR-0032](ADR/0032-cost-estimator-removed.md), [ADR-0033](ADR/0033-async-drain-semantics-sigalrm-sqs-redelivery.md) for the decisions behind each contract clause.
+See [ADR-0020](ADR/0020-unified-prime-cache-and-cost-estimator.md), [ADR-0029](ADR/0029-async-post-sqs-worker-pool.md), [ADR-0031](ADR/0031-elasticache-serverless-valkey-zset-lua-coalescing.md), [ADR-0033](ADR/0033-async-drain-semantics-sigalrm-sqs-redelivery.md) for the decisions behind each contract clause.
 
 ### 4.1 Load profile rationale
 
@@ -252,7 +294,7 @@ The service specification's "bursty internal-tools" framing is not a placeholder
 
 ### 4.2 Three-layer cost guard
 
-The Phase 1 pre-flight cost estimator (ADR-0020) is removed (ADR-0032). Three independent guard layers replace it, each addressing a distinct failure mode:
+The compute load management decision is the **three-layer defense** (per [ADR-0020](ADR/0020-unified-prime-cache-and-cost-estimator.md)). Each layer addresses a distinct failure mode:
 
 | Layer | Guard | Failure mode addressed | Why it suffices |
 |---|---|---|---|
@@ -260,9 +302,9 @@ The Phase 1 pre-flight cost estimator (ADR-0020) is removed (ADR-0032). Three in
 | **Backpressure** | Queue depth > `5 × worker_count` → 503 + `Retry-After: 60` | Queue saturation under sustained burst | Signals "try again in 60 s" to the client. Prevents SQS from accumulating an unbounded backlog when workers fall behind. Configurable via `backpressure_threshold_factor` env var. |
 | **Worker timeout** | SIGALRM 60 s per job → `status=failed` + `error_message` | Runaway compute within a single job | Bounds per-job wall time at the OS signal level, bypassing any Python-level cooperative-wait limitation. The audit row captures the failure for client polling. |
 
-The worst-case scenario after removing the estimator: a request that the estimator would have rejected enters the queue and times out after 60 s with `status=failed`. The client receives a structured failure response, not a connection reset. The SQS message is acknowledged — no redelivery loop. The estimator's role was to prevent this scenario; the three layers above make the scenario cheap and recoverable rather than preventing it.
+Worst-case shape: a request that L1 lets through (in-bounds size, exact compute cost unknown) enters the queue and times out after 60 s with `status=failed`. The client receives a structured failure response, not a connection reset. The SQS message is acknowledged — no redelivery loop. The three layers make this scenario cheap and recoverable rather than preventing it via estimation.
 
-Why the estimator was removed rather than adapted: in the distributed-cache architecture, `_known_max` is a cluster-level property, not a per-worker value. Querying Valkey for the current high-water mark on every POST would add a network round-trip to the "cheap pre-flight check," defeating its purpose. See ADR-0032 for the full analysis.
+Cost-estimator pattern (industry-known: estimate compute cost, reject if above threshold) is documented as Alternatives Considered in ADR-0020 — schema cap already serves the equivalent gate at O(1) decision cost; estimate-then-reject adds attack surface and code complexity. FinOps-style cost estimation is an infra-level concern, separate from request-level defense.
 
 ### 4.3 Worker compute budget rationale
 
@@ -312,7 +354,7 @@ The following capabilities are named but deferred to a future phase. Naming them
 
 ### 5.1 Multi-Fargate-task cache sharing motivation
 
-The Phase 1 per-worker cache (`_known_primes` in `primes.py`) warmed independently on each ECS task. With the async worker pool (ADR-0029, min=1 / max=3 tasks), cache hits are not shared across tasks. Concrete cost: Task A computes `[2, 10_000_000]` after a cache miss, taking ~3–5 s on 0.5 vCPU. Task B receives `[1_000_000, 5_000_000]` — a strict subset already computed by Task A — and repeats the compute from scratch.
+A per-worker in-process cache would warm independently on each ECS task. With the async worker pool (ADR-0029, baseline 3 / max 9 tasks per region), cache hits would not be shared across tasks. Concrete cost: Task A computes `[2, 10_000_000]` after a cache miss, taking ~3–5 s on 0.5 vCPU. Task B receives `[1_000_000, 5_000_000]` — a strict subset already computed by Task A — and repeats the compute from scratch.
 
 The distributed cache solves this by giving all workers a shared hit pool. The hit pool persists across ECS task lifecycle events (scale-in, rolling deploy, Spot eviction) — the cache is not lost when the worker that computed a range is replaced. This is the architectural motivation for a network cache at all: without cross-task sharing, the per-worker LRU already provides adequate hit rates for a single-task deployment.
 
@@ -320,19 +362,16 @@ The distributed cache solves this by giving all workers a shared hit pool. The h
 
 ElastiCache Serverless Valkey (ADR-0031) is the cache backend. The full alternatives analysis is in ADR-0031; this section summarises the cost framing for the acceptance window.
 
-**Cost framing — case-study Phase 2.5 (3h apply-then-destroy):**
+**Cost framing (per-hour, eu-central-1 list price):**
 
-> The 3h framing in this comparison table is the case-study's cost-ceiling for evidence capture, NOT a design constraint. A forker chooses their own duration based on the per-hour rates in [`docs/deployment_guide.md` § Cost shape](deployment_guide.md#cost-shape) (also surfaced on the README front page).
-
-
-| Option | 3h window cost estimate | Notes |
+| Option | Hourly cost | Notes |
 |---|---|---|
-| ElastiCache Serverless Valkey | < $0.10 | ECPU-seconds billed on actual usage; data storage billed per GB-hour (< 1 MB stored) |
-| ElastiCache provisioned (`cache.t3.micro`) | ~$0.05 | $0.017/hr × 3h; plus must be explicitly created and destroyed |
-| Amazon MemoryDB (provisioned, `db.t4g.small`) | ~$0.12 | ~$0.04/hr × 3h; durable writes unnecessary for a cache workload |
-| DynamoDB on-demand | ~$0.01 | Read/write unit pricing; cheap but lacks ZSET overlap semantics |
+| ElastiCache Serverless Valkey | ≥ $0.085/h (storage minimum) | ECPU-seconds billed on actual usage; data storage billed per GB-hour (< 1 MB stored at smoke load) |
+| ElastiCache provisioned (`cache.t3.micro`) | ~$0.017/h | Always-on; no scale-to-zero |
+| Amazon MemoryDB (provisioned, `db.t4g.small`) | ~$0.04/h | Durable writes unnecessary for a cache workload |
+| DynamoDB on-demand | ~$0/h idle | Per-request pricing; cheap but lacks ZSET overlap semantics |
 
-For the 3-hour acceptance window, cost differences are negligible. The decision driver is feature fit: ZSET + Lua atomicity for range-coalescing (ADR-0031) are native to Valkey and unavailable in DynamoDB without substantial workarounds. Serverless is the right operational shape for a PoC acceptance window (no cluster provisioning, scales to zero, one-line Terraform resource).
+The decision driver is feature fit: ZSET + Lua atomicity for range-coalescing (ADR-0031) are native to Valkey and unavailable in DynamoDB without substantial workarounds. Serverless is the right operational shape (no cluster provisioning, scales to near-zero, one-line Terraform resource).
 
 ### 5.3 ZSET key design and range-coalescing
 
@@ -444,7 +483,7 @@ After every cache miss + successful compute, the worker writes the result to Val
 
 **Merge cost vs. split:**
 
-The Lua merge is O(k) in the number of overlapping cache entries it merges, plus the prime-list union operation (O(n log n) sort for the merged list). For realistic internal-tools traffic (dozens to hundreds of distinct range requests), k ≤ 10 in practice. If traffic drives the ZSET member count into the thousands (e.g., a systematic sweep of non-overlapping ranges), the merge cost per write grows. Monitoring `ElastiCacheProcessingUnits` per request in the Phase 2.5 acceptance window gives the signal to decide whether the merge-on-write pattern remains appropriate or whether a separate compaction job (L5 deferred) is warranted.
+The Lua merge is O(k) in the number of overlapping cache entries it merges, plus the prime-list union operation (O(n log n) sort for the merged list). For realistic internal-tools traffic (dozens to hundreds of distinct range requests), k ≤ 10 in practice. If traffic drives the ZSET member count into the thousands (e.g., a systematic sweep of non-overlapping ranges), the merge cost per write grows. Monitoring `ElastiCacheProcessingUnits` per request in the cloud-acceptance window gives the signal to decide whether the merge-on-write pattern remains appropriate or whether a separate compaction job (deferred enhancement) is warranted.
 
 **L5 deferred cache enhancements:**
 
@@ -458,6 +497,6 @@ The Lua merge is O(k) in the number of overlapping cache entries it merges, plus
 
 - **Smoke test** — [`README.md` § Initial Acceptance](../README.md#initial-acceptance-smoke-test). Six paste-and-run commands (includes cache-hit and backpressure steps), two minutes, pass/fail visible without the candidate present.
 - **Cloud deployment walkthrough** — [`docs/deployment_guide.md`](deployment_guide.md). Architecture diagram, component table, network flow, plan-only Terraform usage.
-- **Cross-cloud migration spec** — [`docs/migration_runbook.md`](migration_runbook.md) (Phase 2). Agent-executable runbook with service-mapping table at the top; spec is invariant across destinations.
-- **Single-region → multi-region** — [`docs/scaling_runbook.md`](scaling_runbook.md) (Phase 2). Same agent-executable schema, second axis of extension.
+- **Cross-cloud migration spec** — [`docs/migration_runbook.md`](migration_runbook.md). Agent-executable runbook with service-mapping table at the top; spec is invariant across destinations.
+- **Single-region → multi-region** — [`docs/scaling_runbook.md`](scaling_runbook.md). Same agent-executable schema, second axis of extension.
 - **Every decision's full reasoning** — [`docs/ADR/`](ADR/) in numerical order. Each ADR carries Status, Context, Decision, Alternatives Considered, Consequences, and Related ADRs. When this document gestures at a choice, the ADR is the receipt.

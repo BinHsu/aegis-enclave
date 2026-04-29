@@ -1,4 +1,4 @@
-# terraform/bootstrap/main.tf — One-time provisioning of the Phase-2 prerequisites.
+# terraform/bootstrap/main.tf — One-time provisioning of the deployment prerequisites.
 #
 # What lives here:
 #   1. S3 bucket  + DynamoDB lock table  → state backend for `terraform/main.tf`
@@ -157,7 +157,7 @@ resource "aws_iam_role" "gha_terraform_plan" {
 }
 
 # ReadOnlyAccess covers the Describe/Get/List actions every Terraform plan
-# needs to refresh state (across EC2, ECS, RDS, ALB, ECR, IAM, etc.).
+# needs to refresh state (across EC2, ECS, DynamoDB, ALB, ECR, IAM, etc.).
 resource "aws_iam_role_policy_attachment" "gha_readonly" {
   role       = aws_iam_role.gha_terraform_plan.name
   policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"

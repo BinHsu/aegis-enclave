@@ -1,12 +1,10 @@
 """Prime number generation in a bounded range.
 
-Architecture change (Phase 2.3/2.4): the in-process unified monotonic cache
-(`_known_primes` / `_INITIAL_PREWARM_BOUND`) is removed. Pre-warming and
-range-coalescing are now performed by the distributed Valkey cache layer
-(`cache.py`) and the one-shot bootstrap task (`bootstrap.py`). This module
-is now a pure stateless compute kernel — each call to `primes_in_range`
-runs the appropriate algorithm from scratch (segmented sieve or trial
-division) with no mutable module-level state.
+This module is a pure stateless compute kernel — each call to
+`primes_in_range` runs the appropriate algorithm from scratch (segmented
+sieve or trial division) with no mutable module-level state. Pre-warming
+and range-coalescing live in the distributed Valkey cache layer
+(`cache.py`) and the one-shot bootstrap task (`bootstrap.py`).
 
 Algorithm selection:
     - end <= _SIEVE_THRESHOLD: segmented Sieve of Eratosthenes — O(n log log n)
@@ -14,14 +12,14 @@ Algorithm selection:
       no sieve memory allocation
 
 Compute budget:
-    - `_HARD_TIMEOUT_MS = 60_000` — pre-flight cost estimator rejects requests
-      whose estimated wall-clock cost would exceed this.
+    - `_HARD_TIMEOUT_MS = 60_000` — pre-flight estimator in `_validate`
+      rejects requests whose estimated wall-clock cost would exceed this.
     - `signal.alarm(60)` SIGALRM wrapper in `sieve_with_timeout` — catches
       CPU-bound infinite loops that `asyncio.wait_for` cannot interrupt.
       RATIONALE: queue redelivery rescues the SQS message, but NOT a stuck
       worker (CPU-bound Python loops hold the GIL and have no OOM path).
       Only SIGALRM interrupts a pure-Python CPU-bound loop. See the memory
-      note `feedback_safety_guard_recovery_test.md`.
+      note `feedback_safety_guard_recovery_test.md` (see also ADR-0033).
 
 Bounds:
     - start >= 2 (1 is not prime; reject explicitly)

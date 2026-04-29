@@ -16,10 +16,10 @@ Design:
       visibility timeout re-delivers after 90s.
 
 Data layer (ADR-0042):
-    DynamoDB replaces PostgreSQL. execution_id is a UUID4 string.
+    DynamoDB single-table executions row keyed by execution_id (UUID4 string).
     All DB helpers are synchronous boto3 calls; no asyncio.run() wrapping needed.
 
-SIGALRM rationale:
+SIGALRM rationale (ADR-0033):
     Queue redelivery rescues the SQS message but NOT a stuck worker. A CPU-bound
     Python loop holds the GIL and has no OOM path. Only SIGALRM can interrupt
     a pure-Python CPU-bound infinite loop (e.g. a pathological sieve bug).

@@ -16,10 +16,11 @@ Strategy
 - **Deterministic seeded fuzz**: per-layer fuzz tests use a fixed seed so
   failures are reproducible across runs.
 
-Architecture note: the in-process unified monotonic cache
-(``_INITIAL_PREWARM_BOUND`` / ``_known_primes`` / ``_known_max``) has been
-removed in Phase 2.3. ``primes_in_range`` is now a stateless compute kernel.
-The module-level ``_SMALL_PRIMES`` table is read-only after module load.
+Architecture note: the in-process monotonic cache
+(``_INITIAL_PREWARM_BOUND`` / ``_known_primes`` / ``_known_max``) was lifted
+out into the distributed Valkey cache (``cache.py``); ``primes_in_range``
+is now a stateless compute kernel. The module-level ``_SMALL_PRIMES`` table
+is read-only after module load.
 """
 
 from __future__ import annotations
@@ -131,8 +132,8 @@ class TestValidate:
 class TestEstimateComputeMs:
     """Per-layer cost-model coverage with BVA at every layer transition.
 
-    Note: in the Phase 2.3 stateless module, _estimate_compute_ms no longer
-    takes `known_max` — it computes from start/end directly.
+    Note: in the stateless module, _estimate_compute_ms no longer takes
+    `known_max` — it computes from start/end directly.
     """
 
     # Layer 1 (end <= _SIEVE_THRESHOLD): segmented sieve estimate
@@ -705,9 +706,9 @@ class TestIsPrimeWithKnown:
 
     def test_differential_against_sympy_small_range(self) -> None:
         for n in range(0, 1000):
-            assert _is_prime_with_known(n, _SMALL_PRIMES) == sympy_isprime(n), (
-                f"disagreement with sympy at n={n}"
-            )
+            assert _is_prime_with_known(n, _SMALL_PRIMES) == sympy_isprime(
+                n
+            ), f"disagreement with sympy at n={n}"
 
     def test_smallest_prime_above_million(self) -> None:
         assert _is_prime_with_known(1_000_003, _SMALL_PRIMES) is True

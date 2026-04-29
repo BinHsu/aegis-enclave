@@ -1,7 +1,7 @@
 # main.tf — composition for the aegis-enclave deployment.
 #
-# Branch: pivot/dynamodb-multi-region — implements ADR-0042 greenfield
-# DynamoDB Global Tables active-active multi-region target.
+# Implements the ADR-0042 greenfield DynamoDB Global Tables active-active
+# multi-region target.
 #
 # Topology (single-region scope: secondary_region = ""):
 #   - Primary VPC (3-AZ private subnets), ALB (private), ECS Fargate (app + worker)
@@ -16,8 +16,9 @@
 #   - DynamoDB `replica` block adds the secondary region (Global Tables active-active)
 #   - Optional Route53 weighted A records (50/50) with per-ALB health checks
 #
-# Plan-only deliverable per ADR-0015 outside the Phase 2.5 cloud-acceptance
-# window. Phase 2 cross-cloud migration spec lives in `docs/migration_runbook.md`.
+# Plan-only deliverable per ADR-0015 outside the bounded cloud-acceptance
+# window (ADR-0034 supersedes the original plan-only stance for that window).
+# Cross-cloud migration spec lives in `docs/migration_runbook.md`.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -38,11 +39,11 @@ terraform {
     }
   }
 
-  # ─── Phase-2 state backend (commented out; see ADR-0025) ──────────────
+  # ─── Remote state backend (commented out; see ADR-0025) ──────────────
   # Uncomment and fill in `bucket` + `dynamodb_table` from the outputs of
-  # `terraform/bootstrap/` after running it once. Phase-1 deliverable runs
-  # `terraform plan -backend=false`, so this stays commented for the
-  # case-study cycle.
+  # `terraform/bootstrap/` after running it once. The case-study deliverable
+  # runs `terraform plan -backend=false`, so this stays commented out by
+  # default; forkers adopting the deployment for production should enable it.
   #
   # backend "s3" {
   #   bucket         = "aegis-enclave-tfstate-xxxxxxxx"   # bootstrap output
@@ -227,9 +228,10 @@ module "app_sg" {
 }
 
 # ─── Data layer — DynamoDB Global Tables (ADR-0042) ────────────────────────
-# Replaces RDS PostgreSQL Multi-AZ. Dynamic `replica` block toggles to active-
-# active when secondary_region is non-empty. PAY_PER_REQUEST keeps the workload
-# bursty-shape friendly; stream enabled for V2 archival hooks.
+# Greenfield DDB choice (ADR-0042 supersedes any prior relational-DB plan).
+# Dynamic `replica` block toggles to active-active when secondary_region is
+# non-empty. PAY_PER_REQUEST keeps the workload bursty-shape friendly; stream
+# enabled for V2 archival hooks.
 resource "aws_dynamodb_table" "executions" {
   name         = var.dynamodb_table_name
   billing_mode = "PAY_PER_REQUEST"
@@ -343,9 +345,10 @@ module "alb" {
   internal           = true # not internet-facing — only VPN-reachable
   load_balancer_type = "application"
 
-  # Case-study Phase 2.5 = bounded apply-then-destroy (≤ 3h). Production
-  # deployments should override to true; the community alb module defaults
-  # to true (safe), but blocks `terraform destroy` for our cycle.
+  # Case-study cloud-acceptance window = bounded apply-then-destroy (per
+  # ADR-0034). Production deployments should override to true; the community
+  # alb module defaults to true (safe), but blocks `terraform destroy` for
+  # the bounded acceptance window.
   enable_deletion_protection = false
 
   # Three-layer timeout defence (ADR-0020): app wait_for is 30s + 10s, ALB
@@ -382,11 +385,11 @@ module "alb" {
       # the target lifecycle.
       create_attachment = false
 
-      # ADR-0022 — Drain semantics. Default 300s drains existing connections
-      # for 5 minutes after deregister, which is wildly long for a case-study
-      # PoC (and means rolling deploys block on the slowest in-flight request
-      # for 5 minutes). 60s matches the longest legitimate compute path
-      # (30s prime budget + 10s audit + slack).
+      # ADR-0033 — Drain semantics (API tier). Default 300s drains existing
+      # connections for 5 minutes after deregister, which is wildly long for
+      # this scope (and means rolling deploys block on the slowest in-flight
+      # request for 5 minutes). 60s matches the longest legitimate compute
+      # path (30s prime budget + 10s audit + slack).
       deregistration_delay = 60
 
       health_check = {
@@ -468,11 +471,11 @@ module "ecs" {
           ]
           # No secrets — DDB authn is IAM, not Secrets Manager.
 
-          # ADR-0022 — Drain semantics. ECS sends SIGTERM, waits stop_timeout,
-          # then SIGKILL. Set to 60s so it strictly exceeds uvicorn's
-          # `--timeout-graceful-shutdown 45` (Dockerfile) — a request that
-          # started just before SIGTERM still has 45s to finish before
-          # uvicorn drops it, and ECS waits another 15s before SIGKILL.
+          # ADR-0033 — Drain semantics (API tier). ECS sends SIGTERM, waits
+          # stop_timeout, then SIGKILL. Set to 60s so it strictly exceeds
+          # uvicorn's `--timeout-graceful-shutdown 45` (Dockerfile) — a
+          # request that started just before SIGTERM still has 45s to finish
+          # before uvicorn drops it, and ECS waits another 15s before SIGKILL.
           stop_timeout = 60
 
           # Explicit log_configuration mirroring worker / bootstrap pattern.
@@ -586,7 +589,7 @@ resource "aws_ec2_client_vpn_authorization_rule" "vpc_access" {
   description            = "Authorize VPN clients to reach VPC services"
 }
 
-# ─── Phase 2.3 — Async job queue (SQS) ──────────────────────────────────────
+# ─── Async job queue (SQS) — per ADR-0029 ────────────────────────────────────
 # Queue for prime-computation jobs. Visibility timeout = compute_budget × 1.5
 # so a message re-delivers if the worker crashes without acking.
 
@@ -977,7 +980,7 @@ resource "aws_sqs_queue" "primes" {
   })
 }
 
-# ─── Phase 2.4 — Distributed cache (ElastiCache Serverless Valkey) ──────────
+# ─── Distributed cache (ElastiCache Serverless Valkey) — per ADR-0031 ───────
 
 resource "aws_security_group" "valkey" {
   name        = "aegis-enclave-valkey-sg"
@@ -1205,8 +1208,8 @@ resource "aws_cloudwatch_log_group" "app" {
 # ─── ECS task definition: cache_bootstrap (ADR-0042 env vars) ────────────────
 # One-shot task — triggered by null_resource after Valkey is ready.
 # 256 CPU / 512 MB — bootstrap just runs a sieve + single Redis write.
-# ADR-0042: bootstrap no longer migrates schema (DDB tables are terraform-
-# managed). Scope narrows to cache pre-warm only. ADR-0035 superseded.
+# Bootstrap scope is cache pre-warm only — DDB tables are terraform-managed
+# (no schema migration step needed in the greenfield path per ADR-0042).
 
 resource "aws_ecs_task_definition" "cache_bootstrap" {
   family                   = "aegis-enclave-cache-bootstrap"

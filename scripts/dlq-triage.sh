@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # dlq-triage.sh — operator-facing DLQ inspection and selective replay.
 #
-# Phase 2.5 ADR-0038 records the design rationale: auto-retry on a DLQ
-# polling worker is an anti-pattern (failed messages thrash main queue ↔
-# DLQ indefinitely). Production-shape DLQ handling is:
+# ADR-0038 records the design rationale: auto-retry on a DLQ polling
+# worker is an anti-pattern (failed messages thrash main queue ↔ DLQ
+# indefinitely). Production-shape DLQ handling is:
 #   1. CloudWatch alarm on DLQ depth > 0  → operator notified
 #   2. Manual triage via THIS script      → understand failure pattern
 #   3. Optional selective replay          → after fixing root cause
@@ -22,9 +22,9 @@
 #   ./scripts/dlq-triage.sh --purge      # delete ALL DLQ messages (after triage)
 #
 # Requirements:
-#   - VPN connected (DLQ + RDS reachable from operator's terminal)
-#   - psql + jq + aws CLI in PATH
-#   - terraform state present (for queue URLs + RDS endpoint)
+#   - VPN connected (DLQ + DynamoDB reachable from operator's terminal)
+#   - jq + aws CLI in PATH
+#   - terraform state present (for queue URLs + DDB table name)
 #
 # Exit codes:
 #   0 — triage completed (zero or more messages handled)
@@ -122,14 +122,13 @@ while IFS=$'\t' read -r msg_id receipt body; do
     printf "  range:        [%s, %s]\n" "${start:-?}" "${end:-?}"
     printf "  body:         %s\n" "$body"
 
-    # Show the recorded error_message from the executions table.
-    # Read RDS via psql (operator must be on VPN; psql + the secret
-    # DB password are out-of-band setup). For the case-study PoC we
-    # print a stub note; the full implementation requires fetching
-    # the secret from Secrets Manager and constructing the psql connect.
+    # Show the recorded error_message from the executions table (DynamoDB).
+    # The operator must be on the VPN and have IAM perms for dynamodb:GetItem
+    # against the executions table. We print a hint command; the operator
+    # runs it manually after deciding which message(s) to inspect.
     if [[ -n "$exec_id" ]]; then
-        printf "  audit DB lookup: ${YELLOW}see executions.id=${exec_id}${RESET} via VPN+psql\n"
-        printf "    (cmd: psql -h \$RDS_ENDPOINT -U postgres -c \"SELECT status, error_message FROM executions WHERE id = ${exec_id};\")\n"
+        printf "  audit DB lookup: ${YELLOW}see executions.execution_id=${exec_id}${RESET} via VPN+aws-cli\n"
+        printf "    (cmd: aws dynamodb get-item --region %s --table-name aegis-enclave-executions --key '{\"execution_id\":{\"S\":\"%s\"}}')\n" "$REGION" "$exec_id"
     fi
 
     # Per-message replay decision

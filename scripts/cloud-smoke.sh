@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cloud-smoke.sh — Phase 2.5 6-step smoke against the cloud-deployed prime service.
+# cloud-smoke.sh — 6-step smoke against the cloud-deployed prime service.
 #
 # Mirrors test-client/smoke.sh's 6-step pattern but adjusts curl for the
 # HTTPS internal-ALB self-signed ACM-imported cert path (--cacert + --resolve
@@ -71,7 +71,7 @@ ms_now() {
     fi
 }
 
-section "aegis-enclave — cloud smoke (Phase 2.5)"
+section "aegis-enclave — cloud smoke"
 
 # ─── Pre-flight: tools + state ────────────────────────────────────────────
 section "0/6 — Pre-flight"
