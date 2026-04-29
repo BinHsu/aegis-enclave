@@ -40,6 +40,7 @@ section() { printf "\n${BOLD}── %s ──${RESET}\n" "$*"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TF_DIR="$REPO_ROOT/terraform"
+PKI_DIR="$REPO_ROOT/pki"
 TFVARS="$TF_DIR/terraform.tfvars"
 CERT_TFVARS="$TF_DIR/cert-arns.auto.tfvars"
 
@@ -327,6 +328,51 @@ info "Pre-deps already applied above. ts_apply.sh will plan + prompt for the res
 info "(Client VPN, ALB, ECS service, Valkey, SQS, IAM, autoscaling, VPC endpoints)"
 "$SCRIPT_DIR/ts_apply.sh"
 
+# ─── Auto-generate ready-to-connect .ovpn files (one per region) ───────────
+# AWS-exported .ovpn does NOT include the client cert + key; openvpn refuses
+# without them ("No client-side authentication method is specified"). Append
+# them inline so operator can `sudo openvpn --config pki/<file>.ovpn` directly,
+# no manual heredoc step.
+section "Generating VPN client configs (one per region)"
+generate_ovpn() {
+    local region="$1"
+    local vpn_id="$2"
+    local out="$PKI_DIR/${OPERATOR}-${region}.ovpn"
+
+    if [[ -z "$vpn_id" ]] || [[ "$vpn_id" == "(output not present)" ]]; then
+        warn "skipping $region: VPN endpoint ID not in terraform output"
+        return
+    fi
+
+    info "exporting VPN config: $region → $out"
+    aws ec2 export-client-vpn-client-configuration \
+        --profile "$AWS_PROFILE" --region "$region" \
+        --client-vpn-endpoint-id "$vpn_id" \
+        --output text > "$out"
+
+    # Append client cert + key for mutual-TLS auth
+    {
+        echo
+        echo '<cert>'
+        cat "$PKI_DIR/pki/issued/${OPERATOR}.crt"
+        echo '</cert>'
+        echo '<key>'
+        cat "$PKI_DIR/pki/private/${OPERATOR}.key"
+        echo '</key>'
+    } >> "$out"
+
+    chmod 600 "$out"  # contains private key — restrict perms
+    ok "ready: sudo openvpn --config $out"
+}
+
+PRIMARY_VPN_ID=$(cd "$TF_DIR" && terraform output -raw client_vpn_endpoint_id 2>/dev/null || echo "")
+generate_ovpn "$REGION" "$PRIMARY_VPN_ID"
+
+if [[ -n "$SECONDARY_REGION" ]]; then
+    SECONDARY_VPN_ID=$(cd "$TF_DIR" && terraform output -raw secondary_client_vpn_endpoint_id 2>/dev/null || echo "")
+    generate_ovpn "$SECONDARY_REGION" "$SECONDARY_VPN_ID"
+fi
+
 # ─── Print operator next-steps ─────────────────────────────────────────────
 section "Cloud is UP — next steps"
 ALB_DNS=$(cd "$TF_DIR" && terraform output -raw alb_dns_name 2>/dev/null || echo "(output not present)")
@@ -352,11 +398,14 @@ cat <<EOF
   AWS_PROFILE export inside this script is subshell-only and doesn't carry
   back to your terminal):
 
-    1. Download VPN client config (single-line, copy-paste safe):
-       aws ec2 export-client-vpn-client-configuration --profile $AWS_PROFILE --region $REGION --client-vpn-endpoint-id $VPN_ID --output text > pki/$OPERATOR.ovpn
-       Append the operator's client cert + key (in pki/$OPERATOR/) into the .ovpn
+    1. VPN client configs already generated (cert + key inlined, ready to use):
+         primary:   pki/${OPERATOR}-${REGION}.ovpn
+$(if [[ -n "$SECONDARY_REGION" ]]; then echo "         secondary: pki/${OPERATOR}-${SECONDARY_REGION}.ovpn"; fi)
 
-    2. Connect via Tunnelblick or 'sudo openvpn --config pki/$OPERATOR.ovpn'
+    2. Connect to ONE region at a time (don't mount both VPNs simultaneously —
+       macOS routing collision):
+         sudo openvpn --config pki/${OPERATOR}-${REGION}.ovpn
+$(if [[ -n "$SECONDARY_REGION" ]]; then echo "       (or for secondary): sudo openvpn --config pki/${OPERATOR}-${SECONDARY_REGION}.ovpn"; fi)
 
     3. Run smoke test:
          AWS_PROFILE=$AWS_PROFILE make cloud-smoke
