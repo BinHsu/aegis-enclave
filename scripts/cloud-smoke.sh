@@ -47,6 +47,19 @@ section() { printf "\n${BOLD}── %s ──${RESET}\n" "$*"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TF_DIR="$REPO_ROOT/terraform"
+TFVARS="$TF_DIR/terraform.tfvars"
+
+# Resolve AWS_PROFILE: env var > tfvars persisted (terraform output uses
+# provider auth which honours AWS_PROFILE). No prompt — smoke is a fast probe;
+# operator who hasn't run cloud-up yet won't have tfvars and will fail at the
+# terraform-output step with a clear error.
+if [[ -z "${AWS_PROFILE:-}" ]] && [[ -f "$TFVARS" ]]; then
+    AWS_PROFILE_FROM_TFVARS=$( (grep -E '^aws_profile[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
+    if [[ -n "$AWS_PROFILE_FROM_TFVARS" ]]; then
+        export AWS_PROFILE="$AWS_PROFILE_FROM_TFVARS"
+        info "Using AWS_PROFILE=$AWS_PROFILE (from $TFVARS)"
+    fi
+fi
 
 ENDPOINT_HOST="${ENDPOINT_HOST:-api.enclave.internal}"
 BACKPRESSURE_N="${BACKPRESSURE_N:-20}"

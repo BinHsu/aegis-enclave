@@ -60,6 +60,17 @@ command -v aws >/dev/null 2>&1       || fail "aws CLI not found in PATH"
 PROFILES_AVAIL=$(aws configure list-profiles 2>/dev/null || true)
 SSO_SESSIONS_AVAIL=$(grep -E '^\[sso-session ' ~/.aws/config 2>/dev/null | sed 's/^\[sso-session \(.*\)\]/\1/' || true)
 
+# Resolve AWS_PROFILE: env var > tfvars persisted > interactive prompt.
+# Per memory feedback_explicit_over_implicit.md: read explicitly, log source.
+# Subshell with `|| true` per feedback_pipefail_optional_input_must_or_true.md.
+if [[ -z "${AWS_PROFILE:-}" ]] && [[ -f "$TFVARS" ]]; then
+    AWS_PROFILE_FROM_TFVARS=$( (grep -E '^aws_profile[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
+    if [[ -n "$AWS_PROFILE_FROM_TFVARS" ]]; then
+        export AWS_PROFILE="$AWS_PROFILE_FROM_TFVARS"
+        info "Using AWS_PROFILE=$AWS_PROFILE (from $TFVARS)"
+    fi
+fi
+
 if [[ -z "${AWS_PROFILE:-}" ]]; then
     if [[ -n "$PROFILES_AVAIL" ]]; then
         printf "Available AWS profiles:\n"

@@ -121,6 +121,12 @@ variable "compute_budget_seconds" {
   default     = 60
 }
 
+variable "aws_profile" {
+  description = "AWS CLI profile name for operator-side scripts (cloud-up / cloud-down / cloud-evidence / cloud-smoke). NOT used by Terraform itself — provider auth comes from the env at apply time. Operator-only metadata; safe to leave empty for forkers in env-based auth."
+  type        = string
+  default     = ""
+}
+
 variable "alarm_email" {
   description = "Email address for SLO alarm notifications via SNS. Empty string (default) disables email delivery; alarms still fire and are visible in CloudWatch Console + EventBridge audit trail (per ADR-0041 — alerting is opt-in to avoid forker getting unsolicited mail). Set via `tfvars-init.sh` prompt or `TF_ALARM_EMAIL` env var. Subscriber must click the AWS confirmation email after first apply before notifications deliver."
   type        = string

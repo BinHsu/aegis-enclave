@@ -389,6 +389,7 @@ cat > "$TFVARS" <<EOF
 # Edit freely; this file is gitignored. Cert ARNs are written separately to
 # cert-arns.auto.tfvars by scripts/cloud-up.sh.
 
+aws_profile           = "$AWS_PROFILE"
 region                = "$REGION"
 secondary_region      = "$SECONDARY_REGION"
 environment           = "$ENVIRONMENT"

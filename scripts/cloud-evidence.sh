@@ -11,16 +11,25 @@
 #   - terraform output (state-as-evidence)
 #   - summary.md stub for browser-side screenshots + manual notes
 #
-# Output layout:
+# Output layout (region-suffixed for forker portability):
 #   evidence/<UTC-timestamp>/
-#     metrics/01-sqs-visible.png
-#     metrics/02-ecs-desired-count.png
-#     metrics/03-elasticache-bytes.png
-#     metrics/04-elasticache-ecpu.png
-#     metrics/05-alb-target-response-time.png
-#     metrics/06-ddb-throttles.png
-#     logs/worker.log
-#     logs/bootstrap.log
+#     metrics-<primary-region>/01-sqs-visible.png
+#     metrics-<primary-region>/02-ecs-worker-utilization.png
+#     metrics-<primary-region>/03-elasticache-bytes.png
+#     metrics-<primary-region>/04-elasticache-ecpu.png
+#     metrics-<primary-region>/05-alb-target-response-time.png
+#     metrics-<primary-region>/06-ddb-throttles.png
+#     metrics-<secondary-region>/01-sqs-visible.png       (multi-region only)
+#     metrics-<secondary-region>/06-ddb-throttles.png     (multi-region only)
+#     logs/worker-<primary-region>.log
+#     logs/worker-<secondary-region>.log                  (multi-region only)
+#     logs/bootstrap-<primary-region>.log
+#     logs/worker-cache-counters-<region>.txt             (one per region)
+#     logs/bootstrap-counters.txt
+#     ddb-<primary-region>.json                           (Global Tables Replicas[] proof)
+#     ddb-<secondary-region>.json                         (multi-region only)
+#     r53-hc-<key>-<id>-status.json                       (multi-region + route53_zone_name)
+#     vpn-utun.txt                                        (always; empty body = no tunnel)
 #     terraform-output.json
 #     summary.md
 #
@@ -53,10 +62,11 @@ section() { printf "\n${BOLD}── %s ──${RESET}\n" "$*"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TF_DIR="$REPO_ROOT/terraform"
+TFVARS="$TF_DIR/terraform.tfvars"
 
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 EVIDENCE_DIR="$REPO_ROOT/evidence/$TS"
-mkdir -p "$EVIDENCE_DIR/metrics" "$EVIDENCE_DIR/logs"
+mkdir -p "$EVIDENCE_DIR/logs"
 
 section "aegis-enclave — cloud-acceptance evidence capture"
 echo "Output: $EVIDENCE_DIR"
@@ -66,6 +76,27 @@ command -v aws >/dev/null 2>&1       || fail "aws CLI not found"
 command -v terraform >/dev/null 2>&1 || fail "terraform not found"
 command -v jq >/dev/null 2>&1        || fail "jq not found"
 command -v base64 >/dev/null 2>&1    || fail "base64 not found"
+
+# Resolve AWS_PROFILE: env var > tfvars persisted > interactive prompt.
+# Per memory feedback_explicit_over_implicit.md: read explicitly, log source.
+# Subshell with `|| true` per feedback_pipefail_optional_input_must_or_true.md.
+if [[ -z "${AWS_PROFILE:-}" ]] && [[ -f "$TFVARS" ]]; then
+    AWS_PROFILE_FROM_TFVARS=$( (grep -E '^aws_profile[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
+    if [[ -n "$AWS_PROFILE_FROM_TFVARS" ]]; then
+        export AWS_PROFILE="$AWS_PROFILE_FROM_TFVARS"
+        info "Using AWS_PROFILE=$AWS_PROFILE (from $TFVARS)"
+    fi
+fi
+if [[ -z "${AWS_PROFILE:-}" ]] && [[ -t 0 ]]; then
+    PROFILES_AVAIL=$(aws configure list-profiles 2>/dev/null || true)
+    if [[ -n "$PROFILES_AVAIL" ]]; then
+        printf "Available AWS profiles:\n"
+        echo "$PROFILES_AVAIL" | sed 's/^/  - /'
+    fi
+    printf "Enter AWS_PROFILE [default]: "
+    read -r AWS_PROFILE_INPUT
+    export AWS_PROFILE="${AWS_PROFILE_INPUT:-default}"
+fi
 
 CALLER_JSON=$(aws sts get-caller-identity 2>&1) \
     || fail "AWS auth failed (check AWS_PROFILE / aws sso login)"
@@ -78,26 +109,43 @@ REGION=$(grep -E '^region[[:space:]]*=' "$TF_DIR/terraform.tfvars" 2>/dev/null \
          | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
 REGION="${REGION:-eu-central-1}"
 
+# Multi-region: secondary_region empty = single-region scope; non-empty drives
+# the per-region branches below (DDB describe, secondary worker log, secondary
+# metric panels, Route53 health checks).
+SECONDARY_REGION=$( (grep -E '^secondary_region[[:space:]]*=' "$TF_DIR/terraform.tfvars" 2>/dev/null || true) \
+                   | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
+
 (cd "$TF_DIR" && terraform state list 2>/dev/null | head -1 >/dev/null) \
     || fail "no terraform state — run cloud-up first (exit 2)"
 
-ok "AWS account: $ACCOUNT_ID  /  region: $REGION"
+ok "AWS account: $ACCOUNT_ID  /  primary region: $REGION"
+if [[ -n "$SECONDARY_REGION" ]]; then
+    ok "secondary region: $SECONDARY_REGION (multi-region capture mode)"
+else
+    info "secondary_region empty — single-region capture"
+fi
 
-# Helper: capture a metric widget PNG. Args: $1 = filename, $2 = widget JSON.
+# Always create metrics dir for the primary region (region-suffixed scheme).
+mkdir -p "$EVIDENCE_DIR/metrics-${REGION}"
+[[ -n "$SECONDARY_REGION" ]] && mkdir -p "$EVIDENCE_DIR/metrics-${SECONDARY_REGION}"
+
+# Helper: capture a metric widget PNG.
+# Args: $1 = region, $2 = filename, $3 = widget JSON.
+# Output: $EVIDENCE_DIR/metrics-<region>/<filename>.
 capture_metric() {
-    local fname="$1" widget="$2"
-    local out="$EVIDENCE_DIR/metrics/$fname"
-    if aws cloudwatch get-metric-widget-image --region "$REGION" \
+    local region="$1" fname="$2" widget="$3"
+    local out="$EVIDENCE_DIR/metrics-${region}/$fname"
+    if aws cloudwatch get-metric-widget-image --region "$region" \
          --metric-widget "$widget" --output text --query 'MetricWidgetImage' 2>/dev/null \
          | base64 -d > "$out" 2>/dev/null; then
         if [[ -s "$out" ]]; then
-            ok "metric: $fname ($(wc -c <"$out" | tr -d ' ') bytes)"
+            ok "metric ($region): $fname ($(wc -c <"$out" | tr -d ' ') bytes)"
         else
             rm -f "$out"
-            warn "metric: $fname empty — resource may not exist yet"
+            warn "metric ($region): $fname empty — resource may not exist yet"
         fi
     else
-        warn "metric: $fname capture failed — resource may not exist yet"
+        warn "metric ($region): $fname capture failed — resource may not exist yet"
     fi
 }
 
@@ -145,9 +193,9 @@ for ns in AWS/SQS AWS/ECS AWS/ElastiCache AWS/ApplicationELB AWS/DynamoDB; do
 done
 
 # 01: SQS visible messages
-section "3/6 — Capture metric widgets"
+section "3/6 — Capture metric widgets (primary region: $REGION)"
 if [[ -n "$SQS_NAME" ]]; then
-    capture_metric "01-sqs-visible.png" '{
+    capture_metric "$REGION" "01-sqs-visible.png" '{
       "metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","'"$SQS_NAME"'",{"label":"visible"}]],
       "period":60,"stat":"Average","width":1024,"height":400,
       "title":"SQS '"$SQS_NAME"' — ApproximateNumberOfMessagesVisible","yAxis":{"left":{"min":0}}}'
@@ -157,7 +205,7 @@ fi
 
 # 02: ECS Worker CPU + Memory utilization
 if [[ -n "$WORKER_SVC" && -n "$WORKER_CLUSTER" ]]; then
-    capture_metric "02-ecs-worker-utilization.png" '{
+    capture_metric "$REGION" "02-ecs-worker-utilization.png" '{
       "metrics":[
         ["AWS/ECS","CPUUtilization","ServiceName","'"$WORKER_SVC"'","ClusterName","'"$WORKER_CLUSTER"'",{"label":"CPU%"}],
         [".","MemoryUtilization",".","'"$WORKER_SVC"'",".","'"$WORKER_CLUSTER"'",{"label":"Mem%"}]
@@ -170,13 +218,13 @@ fi
 
 # 03: ElastiCache Serverless BytesUsedForCache (uses CacheName, NOT CacheClusterId)
 if [[ -n "$VALKEY_NAME" ]]; then
-    capture_metric "03-elasticache-bytes.png" '{
+    capture_metric "$REGION" "03-elasticache-bytes.png" '{
       "metrics":[["AWS/ElastiCache","BytesUsedForCache","CacheName","'"$VALKEY_NAME"'"]],
       "period":60,"stat":"Average","width":1024,"height":400,
       "title":"ElastiCache Serverless '"$VALKEY_NAME"' — BytesUsedForCache"}'
 
     # 04: ElastiCache ProcessingUnits (Serverless-specific metric, CacheName dim)
-    capture_metric "04-elasticache-ecpu.png" '{
+    capture_metric "$REGION" "04-elasticache-ecpu.png" '{
       "metrics":[["AWS/ElastiCache","ElastiCacheProcessingUnits","CacheName","'"$VALKEY_NAME"'"]],
       "period":60,"stat":"Sum","width":1024,"height":400,
       "title":"ElastiCache Serverless '"$VALKEY_NAME"' — ProcessingUnits (eCPU)"}'
@@ -186,7 +234,7 @@ fi
 
 # 05: ALB TargetResponseTime — needs both LoadBalancer + TargetGroup arn suffixes
 if [[ -n "$ALB_ARN_SUFFIX" && -n "$TG_ARN_SUFFIX" ]]; then
-    capture_metric "05-alb-target-response-time.png" '{
+    capture_metric "$REGION" "05-alb-target-response-time.png" '{
       "metrics":[
         ["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","'"$ALB_ARN_SUFFIX"'","TargetGroup","'"$TG_ARN_SUFFIX"'",{"label":"target ms"}],
         [".","RequestCount",".",".",".",".",{"label":"requests","stat":"Sum","yAxis":"right"}]
@@ -203,7 +251,7 @@ fi
 # spike there is the headline signal for an under-provisioned PAY_PER_REQUEST
 # table or a partition-key hot-spot.
 if [[ -n "$DDB_TABLE_NAME" ]]; then
-    capture_metric "06-ddb-throttles.png" '{
+    capture_metric "$REGION" "06-ddb-throttles.png" '{
       "metrics":[
         ["AWS/DynamoDB","ConsumedReadCapacityUnits","TableName","'"$DDB_TABLE_NAME"'",{"label":"RCU","stat":"Sum"}],
         [".","ConsumedWriteCapacityUnits",".","'"$DDB_TABLE_NAME"'",{"label":"WCU","stat":"Sum"}],
@@ -215,53 +263,117 @@ else
     warn "skip 06: dynamodb_table_name output missing"
 fi
 
+# ─── Secondary region metric panels (multi-region only) ────────────────────
+# Best-effort capture: only panels for which terraform exposes the bare
+# CloudWatch dimension identifier in secondary outputs are captured. SQS
+# bare-name is derivable from the URL (last path segment); ECS cluster name
+# has a dedicated secondary output. ECS service / Valkey CacheName / ALB
+# arn_suffix / TG arn_suffix are not exported per-region in outputs.tf, so
+# panels 02 / 03 / 04 / 05 are skipped on secondary. Panel 06 (DynamoDB) uses
+# the same TableName (Global Tables share the table identity); the per-region
+# metrics are captured against each region endpoint.
+if [[ -n "$SECONDARY_REGION" ]]; then
+    section "3b/6 — Capture metric widgets (secondary region: $SECONDARY_REGION)"
+
+    SECONDARY_SQS_URL=$(cd "$TF_DIR" && terraform output -raw secondary_sqs_primes_url 2>/dev/null || echo "")
+    SECONDARY_SQS_NAME=""
+    if [[ -n "$SECONDARY_SQS_URL" ]] && [[ "$SECONDARY_SQS_URL" != "null" ]]; then
+        SECONDARY_SQS_NAME=$(echo "$SECONDARY_SQS_URL" | sed -E 's|.*/([^/]+)$|\1|')
+    fi
+    SECONDARY_ECS_CLUSTER=$(cd "$TF_DIR" && terraform output -raw secondary_ecs_cluster_name 2>/dev/null || echo "")
+    [[ "$SECONDARY_ECS_CLUSTER" == "null" ]] && SECONDARY_ECS_CLUSTER=""
+
+    info "Secondary dimensions:"
+    info "  SQS QueueName:                 ${SECONDARY_SQS_NAME:-MISSING}"
+    info "  ECS ClusterName:               ${SECONDARY_ECS_CLUSTER:-MISSING}"
+    info "  DynamoDB TableName:            ${DDB_TABLE_NAME:-MISSING} (Global Tables — same TableName both regions)"
+    info "  (ECS service / Valkey CacheName / ALB arn_suffix not exported per-region — panels 02/03/04/05 skipped)"
+
+    if [[ -n "$SECONDARY_SQS_NAME" ]]; then
+        capture_metric "$SECONDARY_REGION" "01-sqs-visible.png" '{
+          "metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","'"$SECONDARY_SQS_NAME"'",{"label":"visible"}]],
+          "period":60,"stat":"Average","width":1024,"height":400,
+          "title":"SQS '"$SECONDARY_SQS_NAME"' ('"$SECONDARY_REGION"') — ApproximateNumberOfMessagesVisible","yAxis":{"left":{"min":0}}}'
+    else
+        warn "skip secondary 01: secondary_sqs_primes_url output missing"
+    fi
+
+    if [[ -n "$DDB_TABLE_NAME" ]]; then
+        capture_metric "$SECONDARY_REGION" "06-ddb-throttles.png" '{
+          "metrics":[
+            ["AWS/DynamoDB","ConsumedReadCapacityUnits","TableName","'"$DDB_TABLE_NAME"'",{"label":"RCU","stat":"Sum"}],
+            [".","ConsumedWriteCapacityUnits",".","'"$DDB_TABLE_NAME"'",{"label":"WCU","stat":"Sum"}],
+            [".","ThrottledRequests",".","'"$DDB_TABLE_NAME"'",{"label":"throttles","yAxis":"right","stat":"Sum"}]
+          ],
+          "period":60,"stat":"Sum","width":1024,"height":400,
+          "title":"DynamoDB '"$DDB_TABLE_NAME"' ('"$SECONDARY_REGION"' replica) — RCU/WCU + Throttles"}'
+    fi
+fi
+
 # ─── 4. CloudWatch log excerpts + cache-hit ground-truth counters ─────────
 section "4/6 — CloudWatch log excerpts + cache_hit/compute_done ground truth"
 START_MS=$(( ($(date +%s) - 3600) * 1000 ))
+SHORT_START_MS=$(( ($(date +%s) - 600) * 1000 ))  # last 10 min — used for cache counter window
 
-# Worker logs — full excerpt for forensic browsing
-WORKER_LG="/ecs/aegis-enclave-worker"
-if aws logs describe-log-groups --region "$REGION" --log-group-name-prefix "$WORKER_LG" \
-     --query 'logGroups[0].logGroupName' --output text 2>/dev/null \
-     | grep -q "$WORKER_LG"; then
-    aws logs filter-log-events --region "$REGION" \
-        --log-group-name "$WORKER_LG" \
+# Helper: capture worker log + cache counters from one region.
+# Sets globals HIT_COUNT / COMPUTE_COUNT (primary region only — used in summary).
+fetch_worker_log() {
+    local region="$1" out_file="$2" is_primary="$3"
+    local lg="/ecs/aegis-enclave-worker"
+    if ! aws logs describe-log-groups --region "$region" --log-group-name-prefix "$lg" \
+           --query 'logGroups[0].logGroupName' --output text 2>/dev/null \
+           | grep -q "$lg"; then
+        warn "log group $lg not found in $region (worker may not have logged yet)"
+        return 0
+    fi
+    aws logs filter-log-events --region "$region" \
+        --log-group-name "$lg" \
         --start-time "$START_MS" \
         --output text \
         --query 'events[*].[timestamp,message]' \
-        > "$EVIDENCE_DIR/logs/worker.log" 2>/dev/null \
-        && ok "worker logs: $(wc -l <"$EVIDENCE_DIR/logs/worker.log" | tr -d ' ') lines" \
-        || warn "worker log fetch failed"
+        > "$out_file" 2>/dev/null \
+        && ok "worker logs ($region): $(wc -l <"$out_file" | tr -d ' ') lines → $(basename "$out_file")" \
+        || warn "worker log fetch failed in $region"
 
-    # Cache assertion ground truth — count cache_hit vs compute_done events.
-    # cloud-smoke.sh references this as the authoritative cache verification
-    # (smoke timer is wall-clock + network jitter; worker log is structlog
-    # event stream from inside the worker process). With the new 7-step smoke
-    # we expect ≥1 of each in a 5-min window after smoke runs.
-    SHORT_START_MS=$(( ($(date +%s) - 600) * 1000 ))  # last 10 min
-    HIT_COUNT=$(aws logs filter-log-events --region "$REGION" \
-                  --log-group-name "$WORKER_LG" \
-                  --start-time "$SHORT_START_MS" \
-                  --filter-pattern '"cache_hit"' \
-                  --query 'events | length(@)' --output text 2>/dev/null || echo "?")
-    COMPUTE_COUNT=$(aws logs filter-log-events --region "$REGION" \
-                      --log-group-name "$WORKER_LG" \
-                      --start-time "$SHORT_START_MS" \
-                      --filter-pattern '"compute_done"' \
-                      --query 'events | length(@)' --output text 2>/dev/null || echo "?")
-    ok "worker cache events (last 10min): cache_hit=$HIT_COUNT  compute_done=$COMPUTE_COUNT"
-    echo "cache_hit_count=$HIT_COUNT" > "$EVIDENCE_DIR/logs/worker-cache-counters.txt"
-    echo "compute_done_count=$COMPUTE_COUNT" >> "$EVIDENCE_DIR/logs/worker-cache-counters.txt"
-    if [[ "$HIT_COUNT" == "0" ]]; then
-        warn "0 cache_hit events — either bootstrap didn't seed, find_covering didn't match,"
-        warn "or smoke wasn't run within the last 10 min. Check bootstrap.log + worker.log."
+    local hits computes
+    hits=$(aws logs filter-log-events --region "$region" \
+             --log-group-name "$lg" \
+             --start-time "$SHORT_START_MS" \
+             --filter-pattern '"cache_hit"' \
+             --query 'events | length(@)' --output text 2>/dev/null || echo "?")
+    computes=$(aws logs filter-log-events --region "$region" \
+                 --log-group-name "$lg" \
+                 --start-time "$SHORT_START_MS" \
+                 --filter-pattern '"compute_done"' \
+                 --query 'events | length(@)' --output text 2>/dev/null || echo "?")
+    ok "worker cache events ($region, last 10min): cache_hit=$hits  compute_done=$computes"
+    {
+        echo "region=$region"
+        echo "cache_hit_count=$hits"
+        echo "compute_done_count=$computes"
+    } > "$EVIDENCE_DIR/logs/worker-cache-counters-${region}.txt"
+
+    if [[ "$is_primary" == "1" ]]; then
+        HIT_COUNT="$hits"
+        COMPUTE_COUNT="$computes"
+        if [[ "$hits" == "0" ]]; then
+            warn "0 cache_hit events in primary — either bootstrap didn't seed, find_covering didn't match,"
+            warn "or smoke wasn't run within the last 10 min. Check bootstrap-${region}.log + worker-${region}.log."
+        fi
     fi
-else
-    warn "log group $WORKER_LG not found (worker may not have logged yet)"
+}
+
+# Worker logs — full excerpt for forensic browsing (per region).
+fetch_worker_log "$REGION" "$EVIDENCE_DIR/logs/worker-${REGION}.log" "1"
+if [[ -n "$SECONDARY_REGION" ]]; then
+    fetch_worker_log "$SECONDARY_REGION" "$EVIDENCE_DIR/logs/worker-${SECONDARY_REGION}.log" "0"
 fi
 
-# Bootstrap logs — proves schema migration + cache pre-warm completed
+# Bootstrap logs — proves schema migration + cache pre-warm completed (primary
+# only; ADR-0042 architecture has bootstrap task in primary region — DDB
+# Global Tables auto-replicates, no secondary-region bootstrap required).
 BOOT_LG="/ecs/aegis-enclave-bootstrap"
+BOOTSTRAP_LOG="$EVIDENCE_DIR/logs/bootstrap-${REGION}.log"
 if aws logs describe-log-groups --region "$REGION" --log-group-name-prefix "$BOOT_LG" \
      --query 'logGroups[0].logGroupName' --output text 2>/dev/null \
      | grep -q "$BOOT_LG"; then
@@ -270,14 +382,14 @@ if aws logs describe-log-groups --region "$REGION" --log-group-name-prefix "$BOO
         --start-time "$START_MS" \
         --output text \
         --query 'events[*].[timestamp,message]' \
-        > "$EVIDENCE_DIR/logs/bootstrap.log" 2>/dev/null \
-        && ok "bootstrap logs: $(wc -l <"$EVIDENCE_DIR/logs/bootstrap.log" | tr -d ' ') lines" \
+        > "$BOOTSTRAP_LOG" 2>/dev/null \
+        && ok "bootstrap logs ($REGION): $(wc -l <"$BOOTSTRAP_LOG" | tr -d ' ') lines → $(basename "$BOOTSTRAP_LOG")" \
         || warn "bootstrap log fetch failed"
 
     # Bootstrap idempotency proof — count schema_ensured + bootstrap_done/skip
-    SCHEMA_COUNT=$(grep -c '"schema_ensured"' "$EVIDENCE_DIR/logs/bootstrap.log" 2>/dev/null || echo "0")
-    BOOT_DONE=$(grep -c '"bootstrap_done"' "$EVIDENCE_DIR/logs/bootstrap.log" 2>/dev/null || echo "0")
-    BOOT_SKIP=$(grep -c '"bootstrap_skip"' "$EVIDENCE_DIR/logs/bootstrap.log" 2>/dev/null || echo "0")
+    SCHEMA_COUNT=$(grep -c '"schema_ensured"' "$BOOTSTRAP_LOG" 2>/dev/null || echo "0")
+    BOOT_DONE=$(grep -c '"bootstrap_done"' "$BOOTSTRAP_LOG" 2>/dev/null || echo "0")
+    BOOT_SKIP=$(grep -c '"bootstrap_skip"' "$BOOTSTRAP_LOG" 2>/dev/null || echo "0")
     ok "bootstrap events: schema_ensured=$SCHEMA_COUNT  bootstrap_done=$BOOT_DONE  bootstrap_skip=$BOOT_SKIP"
     echo "schema_ensured_count=$SCHEMA_COUNT" > "$EVIDENCE_DIR/logs/bootstrap-counters.txt"
     echo "bootstrap_done_count=$BOOT_DONE" >> "$EVIDENCE_DIR/logs/bootstrap-counters.txt"
@@ -289,6 +401,79 @@ fi
 # Terraform state outputs (folded into this section)
 (cd "$TF_DIR" && terraform output -json) > "$EVIDENCE_DIR/terraform-output.json"
 ok "terraform-output.json: $(wc -c <"$EVIDENCE_DIR/terraform-output.json" | tr -d ' ') bytes"
+
+# ─── 4b. DDB describe-table per region (Global Tables Replicas[] proof) ────
+# Multi-region active-active proof: each region's DDB endpoint reports the
+# Replicas[] array with the OTHER region(s). cloud-evidence-verify.sh asserts
+# Replicas[] non-empty as the configured-correctly check.
+# Full region string in filename (ddb-<region>.json) for forker portability —
+# avoids hardcoded region nicknames (fra/ire) that don't transfer to
+# us-west-2 / ap-southeast-1 / etc.
+section "4b/6 — DDB describe-table per region (Global Tables Replicas[] proof)"
+if [[ -n "$DDB_TABLE_NAME" ]]; then
+    aws dynamodb describe-table --region "$REGION" \
+        --table-name "$DDB_TABLE_NAME" \
+        > "$EVIDENCE_DIR/ddb-${REGION}.json" 2>/dev/null \
+        && ok "ddb-${REGION}.json: $(wc -c <"$EVIDENCE_DIR/ddb-${REGION}.json" | tr -d ' ') bytes" \
+        || warn "ddb describe-table ($REGION) failed"
+
+    if [[ -n "$SECONDARY_REGION" ]]; then
+        aws dynamodb describe-table --region "$SECONDARY_REGION" \
+            --table-name "$DDB_TABLE_NAME" \
+            > "$EVIDENCE_DIR/ddb-${SECONDARY_REGION}.json" 2>/dev/null \
+            && ok "ddb-${SECONDARY_REGION}.json: $(wc -c <"$EVIDENCE_DIR/ddb-${SECONDARY_REGION}.json" | tr -d ' ') bytes" \
+            || warn "ddb describe-table ($SECONDARY_REGION) failed — Global Tables replica may not be ACTIVE yet"
+    fi
+else
+    warn "skip DDB describe: dynamodb_table_name output missing"
+fi
+
+# ─── 4c. Route53 health-check status (multi-region only, opt-in zone) ──────
+# health-check IDs come from terraform output route53_health_check_ids (a map
+# {primary: <id>, secondary: <id>}). When secondary_region is empty OR
+# route53_zone_name was empty in tfvars, the map is {} — gracefully skip.
+section "4c/6 — Route53 health-check status (multi-region only)"
+HC_JSON=$(cd "$TF_DIR" && terraform output -json route53_health_check_ids 2>/dev/null || echo "{}")
+if [[ "$HC_JSON" != "{}" ]] && [[ -n "$HC_JSON" ]]; then
+    # Iterate each (key, id) pair. Route53 health-check API is global (us-east-1)
+    # — pass --region us-east-1 explicitly so the call works regardless of
+    # operator's default-region config.
+    echo "$HC_JSON" | jq -r 'to_entries[] | "\(.key) \(.value)"' | while read -r key hc_id; do
+        [[ -z "$hc_id" ]] && continue
+        out="$EVIDENCE_DIR/r53-hc-${key}-${hc_id}-status.json"
+        if aws route53 get-health-check-status --region us-east-1 \
+             --health-check-id "$hc_id" > "$out" 2>/dev/null; then
+            ok "r53 health-check ($key=$hc_id) → $(basename "$out")"
+        else
+            warn "r53 get-health-check-status failed for $key=$hc_id"
+            rm -f "$out"
+        fi
+    done
+else
+    info "no Route53 health checks (multi-region disabled or route53_zone_name empty in tfvars) — skip gracefully"
+fi
+
+# ─── 4d. VPN handshake / utun capture (always — empty file documents "no VPN") ─
+# Captured-but-empty file is itself evidence ("no active VPN at evidence-capture
+# time"). macOS path: ifconfig | grep utun. Linux fallback: wg show.
+section "4d/6 — VPN handshake (utun / wg show)"
+VPN_OUT="$EVIDENCE_DIR/vpn-utun.txt"
+{
+    echo "# vpn-utun.txt — captured $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "# Empty body below = no active VPN tunnel at evidence-capture time"
+    echo "# (still valid evidence: documents the operator's connectivity state)"
+    echo "---"
+    if command -v ifconfig >/dev/null 2>&1; then
+        echo "## ifconfig | grep -A2 utun (macOS)"
+        ifconfig 2>/dev/null | grep -A2 -E '^utun[0-9]+:' || echo "(no utun interface)"
+    fi
+    if command -v wg >/dev/null 2>&1; then
+        echo
+        echo "## wg show (Linux WireGuard)"
+        wg show 2>/dev/null || echo "(wg show — none / requires sudo)"
+    fi
+} > "$VPN_OUT"
+ok "vpn-utun.txt: $(wc -c <"$VPN_OUT" | tr -d ' ') bytes (empty body = no active tunnel)"
 
 # ─── 5. SLO dashboard panels (API path, SCP-resilient) ────────────────────
 # AWS Console UI for CloudWatch Dashboards typically requires
@@ -416,28 +601,34 @@ cat > "$EVIDENCE_DIR/summary.md" <<EOF
 # Cloud-Acceptance Evidence — $TS
 
 ## Operator
-- Account: $ACCOUNT_ID
-- Region:  $REGION
-- Caller:  $ARN
+- Account:   $ACCOUNT_ID
+- Primary:   $REGION
+- Secondary: ${SECONDARY_REGION:-(single-region scope)}
+- Caller:    $ARN
 
 ## Captured (machine-readable)
-- 6 CloudWatch metric widgets — AWS-native services (metrics/*.png) — chrome-sparse, API-fetched
+- CloudWatch AWS-native metric panels (primary): metrics-${REGION}/0[1-6]-*.png — chrome-sparse, API-fetched
+$(if [[ -n "$SECONDARY_REGION" ]]; then echo "- CloudWatch AWS-native metric panels (secondary, best-effort): metrics-${SECONDARY_REGION}/*.png — only SQS + DDB exposed via terraform outputs in this iteration"; fi)
 - 5 SLO dashboard panels — application SLI (slo/0[1-5]-*.png) — API path; Console may be SCP-blocked
 - 1 alarm state snapshot (slo/06-alarm-state.json) — current OK/ALARM state for every aegis-enclave-* alarm
 - 1 alarm history excerpt (slo/07-alarm-history-fast-burn.json) — state transitions in last 1h, captures deliberate-trigger evidence
-- Worker CloudWatch logs ($([[ -f "$EVIDENCE_DIR/logs/worker.log" ]] && echo "captured" || echo "MISSING — log group not present"))
-- Bootstrap CloudWatch logs ($([[ -f "$EVIDENCE_DIR/logs/bootstrap.log" ]] && echo "captured" || echo "MISSING — log group not present"))
-- Cache assertion counters: logs/worker-cache-counters.txt (cache_hit vs compute_done)
+- Worker CloudWatch logs (primary): $([[ -f "$EVIDENCE_DIR/logs/worker-${REGION}.log" ]] && echo "captured" || echo "MISSING")
+$(if [[ -n "$SECONDARY_REGION" ]]; then echo "- Worker CloudWatch logs (secondary): $([[ -f "$EVIDENCE_DIR/logs/worker-${SECONDARY_REGION}.log" ]] && echo "captured" || echo "MISSING")"; fi)
+- Bootstrap CloudWatch logs (primary): $([[ -f "$EVIDENCE_DIR/logs/bootstrap-${REGION}.log" ]] && echo "captured" || echo "MISSING")
+- Cache assertion counters: logs/worker-cache-counters-<region>.txt (cache_hit vs compute_done, per region)
 - Bootstrap idempotency counters: logs/bootstrap-counters.txt
+- DDB describe-table (Global Tables Replicas[] proof): ddb-${REGION}.json$(if [[ -n "$SECONDARY_REGION" ]]; then echo " + ddb-${SECONDARY_REGION}.json"; fi)
+- Route53 health-check status: r53-hc-*-status.json (one per HC ID; absent if multi-region disabled or route53_zone_name empty)
+- VPN tunnel state: vpn-utun.txt (always written; empty body documents "no active tunnel at evidence time")
 - terraform-output.json (full state surface)
 
-## Cache assertion (from worker log, last 10 min)
+## Cache assertion (from worker log, last 10 min, primary region)
 - cache_hit:    ${HIT_COUNT:-N/A}
 - compute_done: ${COMPUTE_COUNT:-N/A}
 - Interpretation: with the 7-step cloud-smoke, expect ≥1 cache_hit (step 3 +
   step 5) and ≥2 compute_done (step 1 cache-miss + step 4 partial-overlap).
   All-zero cache_hit → bootstrap pre-warm did not complete OR find_covering
-  did not match — read bootstrap.log + worker.log for diagnosis.
+  did not match — read bootstrap-${REGION}.log + worker-${REGION}.log for diagnosis.
 
 ## Bootstrap idempotency (from bootstrap log)
 - schema_ensured:  ${SCHEMA_COUNT:-N/A}  (each apply triggers schema check)

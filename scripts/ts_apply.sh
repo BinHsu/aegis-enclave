@@ -105,6 +105,15 @@ ok "no placeholder ARNs detected"
 
 # ─── AWS authentication ────────────────────────────────────────────────────
 section "4/6 — AWS authentication"
+# Resolve AWS_PROFILE: env var > tfvars persisted. Per memory
+# feedback_explicit_over_implicit.md: read explicitly, log source.
+if [[ -z "${AWS_PROFILE:-}" ]] && [[ -f "$TFVARS" ]]; then
+    AWS_PROFILE_FROM_TFVARS=$( (grep -E '^aws_profile[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
+    if [[ -n "$AWS_PROFILE_FROM_TFVARS" ]]; then
+        export AWS_PROFILE="$AWS_PROFILE_FROM_TFVARS"
+        info "Using AWS_PROFILE=$AWS_PROFILE (from $TFVARS)"
+    fi
+fi
 CALLER_JSON=$(aws sts get-caller-identity 2>&1) || fail "aws sts get-caller-identity failed:
 $CALLER_JSON"
 ACCOUNT_ID=$(echo "$CALLER_JSON" | grep -oE '"Account":[^,}]*' | sed -E 's/.*"([0-9]+)".*/\1/')

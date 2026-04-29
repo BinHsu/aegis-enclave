@@ -48,6 +48,17 @@ section() { printf "\n${BOLD}── %s ──${RESET}\n" "$*"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TF_DIR="$REPO_ROOT/terraform"
+TFVARS="$TF_DIR/terraform.tfvars"
+
+# Resolve AWS_PROFILE: env var > tfvars persisted > leave unset (aws CLI uses
+# default). Per memory feedback_explicit_over_implicit.md: read explicitly.
+if [[ -z "${AWS_PROFILE:-}" ]] && [[ -f "$TFVARS" ]]; then
+    AWS_PROFILE_FROM_TFVARS=$( (grep -E '^aws_profile[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
+    if [[ -n "$AWS_PROFILE_FROM_TFVARS" ]]; then
+        export AWS_PROFILE="$AWS_PROFILE_FROM_TFVARS"
+        info "Using AWS_PROFILE=$AWS_PROFILE (from $TFVARS)"
+    fi
+fi
 
 MODE="interactive"
 case "${1:-}" in
