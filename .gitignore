@@ -19,6 +19,16 @@ cover_note_*.md
 # Internal evaluation reports (third-party reviewer perspective; per-cycle, contains buyer name)
 report.md
 report_*.md
+report.pdf
+
+# Per-cycle report build script — references buyer-personalised report_skeleton.md;
+# path coupling makes it operator-side, not forker-template (forker writes their own).
+scripts/build-report.sh
+
+# Per-cycle rendered diagram assets for the report PDF (architecture + flow PNGs
+# rendered from in-repo mermaid source via mermaid.ink); the mermaid source is
+# committed under docs/ + README.md and is the canonical artefact.
+report_assets/
 
 # Case-study report template (per-cycle, may contain buyer-specific framing — see CLAUDE.md § 6)
 docs/case_study_report_template.md
