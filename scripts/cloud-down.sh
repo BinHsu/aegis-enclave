@@ -265,6 +265,17 @@ if [[ -f "$IMAGE_TAG_TFVARS" ]]; then
     ok "removed $IMAGE_TAG_TFVARS"
 fi
 
+# Also remove operator's terraform.tfvars. The whole point of a cloud-down →
+# cloud-up cycle is "reset to fresh state"; leaving stale tfvars means the
+# next cloud-up silently inherits prior config (region, owner, tags) and
+# skips tfvars-init's prompts — defeating the reset intent. Operators who
+# want config persistence across cycles can keep it in TF_* env vars or
+# version-control terraform.tfvars.example as their template.
+if [[ -f "$TFVARS" ]]; then
+    rm -f "$TFVARS"
+    ok "removed $TFVARS (next cloud-up will re-prompt via tfvars-init)"
+fi
+
 # ─── Step 5: Optionally wipe local PKI ─────────────────────────────────────
 section "5/6 — Local PKI cleanup"
 if [[ -d "$PKI_DIR" ]]; then
