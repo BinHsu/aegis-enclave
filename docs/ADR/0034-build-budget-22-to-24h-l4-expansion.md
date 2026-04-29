@@ -29,7 +29,7 @@ Stages observed in this delivery:
 |---|---|---|
 | 1 | Single-AZ Compose stack + smoke test | `make smoke` 6/6 green; security boundary test passes |
 | 2 | Multi-AZ cloud composition + Phase 2.5 cloud-acceptance | `make cloud-up` end-to-end + 6/6 cloud-smoke + collateral-free `make cloud-down` |
-| 3 | Multi-region active-active + workload-tier reframe | `pivot/dynamodb-multi-region` branch's full doc-and-ADR rewrite reads as senior-architect day-1 design |
+| 3 | Multi-region active-active + workload-tier reframe | full doc-and-ADR rewrite from the predecessor [single-region PostgreSQL posture](https://github.com/BinHsu/aegis-enclave/tree/branches/pg-single-region) reads as senior-architect day-1 design |
 
 Each stage's resource allocation matches the value demonstrated at the prior gate. The "engineer is part-time" constraint forces staging anyway — sequential delivery against parallel commitments cannot collapse into all-at-once even if the methodology preferred it.
 
