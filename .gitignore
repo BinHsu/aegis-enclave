@@ -20,6 +20,9 @@ cover_note_*.md
 report.md
 report_*.md
 
+# Case-study report template (per-cycle, may contain buyer-specific framing — see CLAUDE.md § 6)
+docs/case_study_report_template.md
+
 # Phase 2.5 cloud-acceptance evidence artifacts (per-run; AWS account IDs, ARNs,
 # private IPs, CloudWatch metric snapshots). Selected screenshots/excerpts get
 # pasted into docs/deployment_guide.md by hand; the full dump never commits.

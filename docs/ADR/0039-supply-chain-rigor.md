@@ -13,7 +13,7 @@ The composition has three independent supply-chain surfaces, each with a default
 
 A fourth surface is tooling installation — how the operator gets `uv`, `easyrsa`, `pandoc`, etc. The looser default is `curl <url> | sh` (executes a remote script with no signature verification). The hardened alternative is Homebrew (signed bottles via Apple's `notarization` chain on macOS) or distribution package managers (apt/dnf with GPG-signed repos on Linux).
 
-For a deliverable that ships on a private GitHub repo and may be forked to a forker's AWS account or an buyer staging environment, supply-chain attestation matters because:
+For a deliverable that ships on a private GitHub repo and may be forked to a forker's AWS account or a buyer's staging environment, supply-chain attestation matters because:
 
 - **Reproducibility.** A reviewer cloning the repo six months later should land on the same dependency versions that passed the Phase 2.5 acceptance gate — not whatever the package registry has by then.
 - **Audit traceability.** Aerospace / defense-adjacent contexts ask "what code is actually running?" The answer should be a content-addressed manifest, not a moving tag.
@@ -57,7 +57,7 @@ Four exact-pin disciplines, each with its mechanism and the looser default it re
 | **Module-level `terraform-version` constraint only** | Weak: pins Terraform binary version but not module versions. Doesn't address the actual drift surface. |
 | **BuildKit attestation enabled (default)** | Useful for SLSA provenance attestation in upstream supply-chain pipelines (where the manifest moves through a gating system that reads attestation). For our PoC where the consumer of the manifest is just ECS task launch, the attestation adds entropy without value, while breaking the IMMUTABLE re-push idempotency. Rejected. |
 | **Skip `--sbom=false`, rely on `trivy fs` post-build** | Trivy scans filesystem-level dependencies, which catches CVEs in installed packages. Doesn't address the manifest-determinism concern (orthogonal). We do both: `--sbom=false` for determinism, `make audit` (pip-audit) for CVEs. |
-| **`curl install.sh \| sh` for uv installation** | The astral.sh-blessed path. Gets you the latest uv on any platform without Homebrew. But it's an unsigned remote script execution. For a deliverable that buyer-side or a forker-side reviewer might run, the signed-Homebrew path is the senior default. Recommended in README Prerequisites with the curl option as fallback. |
+| **`curl install.sh \| sh` for uv installation** | The astral.sh-blessed path. Gets you the latest uv on any platform without Homebrew. But it's an unsigned remote script execution. For a deliverable that a buyer-side or forker-side reviewer might run, the signed-Homebrew path is the senior default. Recommended in README Prerequisites with the curl option as fallback. |
 
 ## Consequences
 
