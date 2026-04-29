@@ -179,6 +179,27 @@ fi
 
 # ─── Step 4: Delete ACM-imported VPN certs ─────────────────────────────────
 section "4/6 — Delete ACM-imported VPN certs (out-of-tfstate cleanup)"
+
+# Helper: discover ACM certs tagged with our project + owner via Resource
+# Groups Tagging API. AND-semantics across all tag-filters — narrow enough
+# to never delete other projects' or other operators' imports (per memory
+# feedback_no_destructive_shared_path_recovery.md).
+discover_tagged_acm_certs() {
+    local region="$1"
+    local owner="$2"
+    aws resourcegroupstaggingapi get-resources \
+        --profile "$AWS_PROFILE" --region "$region" \
+        --resource-type-filters "acm:certificate" \
+        --tag-filters "Key=Project,Values=aegis-enclave" \
+                      "Key=Owner,Values=$owner" \
+                      "Key=ImportedBy,Values=bootstrap-vpn-certs.sh" \
+        --query 'ResourceTagMappingList[].ResourceARN' --output text 2>/dev/null \
+        | tr '\t' '\n' | grep -v '^$' || true
+}
+
+# Used to AND-filter discovery; falls back to whoami when tfvars missing.
+OWNER_TAG=$( (grep -E '^owner[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
+[[ -z "$OWNER_TAG" ]] && OWNER_TAG="$(whoami)"
 if [[ -f "$CERT_TFVARS" ]]; then
     # Primary region certs
     SERVER_ARN=$( (grep -E '^server_cert_arn = "arn:' "$CERT_TFVARS" 2>/dev/null || true) | sed -E 's/.*"(arn:[^"]+)".*/\1/')
@@ -213,8 +234,28 @@ if [[ -f "$CERT_TFVARS" ]]; then
     rm -f "$CERT_TFVARS"
     ok "removed $CERT_TFVARS"
 else
-    info "no $CERT_TFVARS — nothing to clean (skipping)"
+    info "no $CERT_TFVARS — falling back to tag-discovery"
 fi
+
+# Tag-fallback discovery — catches certs that bootstrap-vpn-certs.sh imported
+# but cert-arns.auto.tfvars never recorded (e.g., operator rm'd the file
+# between cloud-up and cloud-down). AND-filter on Project + Owner +
+# ImportedBy ensures we only delete OUR imports, not strangers'.
+for fb_region in "$REGION" "$SECONDARY_REGION"; do
+    [[ -z "$fb_region" ]] && continue
+    DISCOVERED=$(discover_tagged_acm_certs "$fb_region" "$OWNER_TAG")
+    if [[ -n "$DISCOVERED" ]]; then
+        info "tag-discovery in $fb_region (Project=aegis-enclave, Owner=$OWNER_TAG, ImportedBy=bootstrap-vpn-certs.sh):"
+        for arn in $DISCOVERED; do
+            info "  delete: $arn"
+            if aws acm delete-certificate --profile "$AWS_PROFILE" --region "$fb_region" --certificate-arn "$arn" 2>/dev/null; then
+                ok "  deleted: $arn"
+            else
+                warn "  delete failed (may already be gone): $arn"
+            fi
+        done
+    fi
+done
 
 # Also remove image-tag.auto.tfvars (written by cloud-up.sh; tracks the git-sha
 # tag deployed). Out-of-tfstate, gitignored, no AWS dependency.

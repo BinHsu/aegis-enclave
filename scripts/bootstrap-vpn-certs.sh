@@ -174,6 +174,11 @@ cd "$REPO_ROOT"
 
 # ─── ACM import: server cert ─────────────────────────────────────────────────
 section "5/6 — ACM import: server certificate"
+# OPERATOR is the first --operator value (for tagging; multi-operator doesn't
+# expand here — the import tag tracks the user who provisioned the cert pair,
+# distinct from per-operator client certs which can have their own owner).
+PRIMARY_OPERATOR="${OPERATORS[0]:-${OPERATOR:-$(whoami)}}"
+
 SERVER_ARN=$(aws acm import-certificate \
     --region "$REGION" \
     --certificate     "fileb://$PKI_DIR/pki/issued/server.crt" \
@@ -184,6 +189,18 @@ SERVER_ARN=$(aws acm import-certificate \
     || fail "ACM server cert import failed:
 $SERVER_ARN"
 ok "server_cert_arn: $SERVER_ARN"
+
+# Tag for cloud-down fallback discovery (4-dim AND filter — narrow enough to
+# never delete other projects' / other operators' imports). Tags are best-
+# effort: failure to tag is non-fatal because cert-arns.auto.tfvars is the
+# primary cleanup path; tags are belt-and-braces.
+aws acm add-tags-to-certificate --region "$REGION" \
+    --certificate-arn "$SERVER_ARN" \
+    --tags Key=Project,Value=aegis-enclave \
+           Key=Owner,Value="$PRIMARY_OPERATOR" \
+           Key=Component,Value=client-vpn-server-cert \
+           Key=ImportedBy,Value=bootstrap-vpn-certs.sh \
+    >/dev/null 2>&1 || warn "tagging server cert failed (non-fatal; cert-arns.auto.tfvars is primary cleanup path)"
 
 # ─── ACM import: CA root ─────────────────────────────────────────────────────
 section "6/6 — ACM import: CA root (for mutual-TLS client validation)"
@@ -199,6 +216,14 @@ CLIENT_ARN=$(aws acm import-certificate \
     || fail "ACM CA root import failed:
 $CLIENT_ARN"
 ok "client_cert_arn: $CLIENT_ARN"
+
+aws acm add-tags-to-certificate --region "$REGION" \
+    --certificate-arn "$CLIENT_ARN" \
+    --tags Key=Project,Value=aegis-enclave \
+           Key=Owner,Value="$PRIMARY_OPERATOR" \
+           Key=Component,Value=client-vpn-ca-root \
+           Key=ImportedBy,Value=bootstrap-vpn-certs.sh \
+    >/dev/null 2>&1 || warn "tagging CA cert failed (non-fatal; cert-arns.auto.tfvars is primary cleanup path)"
 
 # ─── Output summary ──────────────────────────────────────────────────────────
 section "Done — paste into terraform/terraform.tfvars"
