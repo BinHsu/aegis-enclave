@@ -131,24 +131,42 @@ if [[ "$RESOURCE_COUNT" == "0" ]]; then
 fi
 ok "$RESOURCE_COUNT resource(s) currently in tfstate"
 
-# ─── Step 2: Drain ECR images ──────────────────────────────────────────────
+# ─── Step 2: Drain ECR images (primary + secondary regions) ────────────────
 section "2/6 — Drain ECR images (otherwise terraform destroy fails on ECR)"
-if (cd "$TF_DIR" && terraform state list 2>/dev/null | grep -q '^module\.ecr\.'); then
-    ECR_NAME=$(cd "$TF_DIR" && terraform output -raw ecr_repository_url 2>/dev/null | sed -E 's|.*/([^/]+)$|\1|')
-    if [[ -n "$ECR_NAME" ]]; then
-        IMAGE_IDS=$(aws ecr list-images --repository-name "$ECR_NAME" --region "$REGION" \
-                    --query 'imageIds[*]' --output json 2>/dev/null || echo "[]")
-        if [[ "$IMAGE_IDS" != "[]" && -n "$IMAGE_IDS" ]]; then
-            info "Deleting all images in $ECR_NAME"
-            aws ecr batch-delete-image --repository-name "$ECR_NAME" --region "$REGION" \
-                --image-ids "$IMAGE_IDS" --output text >/dev/null
-            ok "ECR images drained"
-        else
-            ok "ECR repository $ECR_NAME already empty"
-        fi
+
+# Drain by terraform output URL, not by state-path grep — multi-region has
+# both `module.ecr` (primary) and `aws_ecr_repository.secondary` (secondary)
+# which the old `^module\.ecr\.` filter missed. Output-based detection works
+# regardless of resource path / module nesting.
+drain_ecr_region() {
+    local region="$1"
+    local repo_url="$2"
+    if [[ -z "$repo_url" ]] || [[ "$repo_url" == "null" ]]; then
+        return 0  # output absent or null = no ECR in this region
     fi
-else
-    info "module.ecr not in state — skipping ECR drain"
+    local repo_name
+    repo_name=$(echo "$repo_url" | sed -E 's|.*/([^/]+)$|\1|')
+    [[ -z "$repo_name" ]] && return 0
+
+    local image_ids
+    image_ids=$(aws ecr list-images --repository-name "$repo_name" --region "$region" \
+                  --query 'imageIds[*]' --output json 2>/dev/null || echo "[]")
+    if [[ "$image_ids" != "[]" ]] && [[ -n "$image_ids" ]]; then
+        info "Deleting all images in $region/$repo_name"
+        aws ecr batch-delete-image --repository-name "$repo_name" --region "$region" \
+            --image-ids "$image_ids" --output text >/dev/null 2>&1 || true
+        ok "drained $region/$repo_name"
+    else
+        ok "$region/$repo_name already empty (or repo gone)"
+    fi
+}
+
+PRIMARY_ECR_URL=$(cd "$TF_DIR" && terraform output -raw ecr_repository_url 2>/dev/null || echo "")
+drain_ecr_region "$REGION" "$PRIMARY_ECR_URL"
+
+if [[ -n "$SECONDARY_REGION" ]]; then
+    SECONDARY_ECR_URL=$(cd "$TF_DIR" && terraform output -raw secondary_ecr_repository_url 2>/dev/null || echo "")
+    drain_ecr_region "$SECONDARY_REGION" "$SECONDARY_ECR_URL"
 fi
 
 # ─── Step 3: terraform destroy (via ts_teardown.sh strict-confirm wrapper) ─
