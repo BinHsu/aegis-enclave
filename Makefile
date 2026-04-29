@@ -224,7 +224,7 @@ pre-push-check: ## Scan diff vs origin/main for buyer-name leaks (CLAUDE.md § 6
 	if [ -z "$$PATTERN" ]; then \
 	  echo "Empty .leakguard — nothing to scan against"; exit 2; \
 	fi; \
-	if git diff origin/main..HEAD | grep -iE "$$PATTERN"; then \
+	if git diff origin/main..HEAD | grep -E '^\+' | grep -v '^+++' | grep -iE "$$PATTERN"; then \
 	  echo 'BUYER-SPECIFIC TOKEN LEAK — DO NOT PUSH'; exit 1; \
 	else \
 	  echo 'clean'; \
