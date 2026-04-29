@@ -69,7 +69,7 @@ section "Metric panel PNGs (>= ${PNG_MIN_BYTES} bytes — non-sparse)"
 
 for panel in \
     01-sqs-visible.png \
-    02-ecs-desired-count.png \
+    02-ecs-worker-utilization.png \
     03-elasticache-bytes.png \
     04-elasticache-ecpu.png \
     05-alb-target-response-time.png \
