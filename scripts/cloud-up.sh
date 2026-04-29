@@ -333,6 +333,30 @@ else
     ok "Image pushed: $ECR_URL:$IMAGE_TAG"
 fi
 
+# Multi-region: replicate the image tag to secondary ECR so secondary ECS can
+# pull. Without this, secondary tasks fail with CannotPullContainerError and
+# secondary ALB returns 503 (no healthy targets).
+if [[ -n "$SECONDARY_REGION" ]]; then
+    SECONDARY_ECR_URL=$(cd "$TF_DIR" && terraform output -raw secondary_ecr_repository_url 2>/dev/null || echo "")
+    if [[ -n "$SECONDARY_ECR_URL" ]]; then
+        info "Multi-region: replicating $IMAGE_TAG to secondary ECR ($SECONDARY_REGION)"
+        if aws ecr describe-images --region "$SECONDARY_REGION" --repository-name aegis-enclave \
+             --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+            ok "Secondary ECR already has '$IMAGE_TAG' — skipping replicate"
+        else
+            aws ecr get-login-password --region "$SECONDARY_REGION" | \
+                docker login --username AWS --password-stdin "$SECONDARY_ECR_URL" >/dev/null \
+                || fail "Docker login to secondary ECR failed"
+            docker tag "$ECR_URL:$IMAGE_TAG" "$SECONDARY_ECR_URL:$IMAGE_TAG"
+            docker push "$SECONDARY_ECR_URL:$IMAGE_TAG" >/dev/null \
+                || fail "ECR push to secondary failed ($SECONDARY_ECR_URL:$IMAGE_TAG)"
+            ok "Image replicated to secondary: $SECONDARY_ECR_URL:$IMAGE_TAG"
+        fi
+    else
+        warn "secondary_region set but secondary_ecr_repository_url output missing — secondary ECS will fail to pull"
+    fi
+fi
+
 # ─── Step 3: Full terraform apply (remaining ~70 resources) ───────────────
 section "6/6 — Full terraform apply (remaining resources)"
 info "Pre-deps already applied above. ts_apply.sh will plan + prompt for the rest"
