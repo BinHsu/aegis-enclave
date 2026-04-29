@@ -179,19 +179,19 @@ fi
 # Two reasons for the staged -target apply:
 #   1. ECR must exist before docker push (chicken-and-egg).
 #   2. ECS module's container_definitions for_each fails at plan time when
-#      module.rds + module.vpc outputs are unknown — terraform infers the
-#      whole map as 'unknown' and bails ("for_each map includes keys derived
-#      from resource attributes that cannot be determined until apply").
-#      Pre-applying VPC+RDS+ECR makes those refs resolvable, the full apply
-#      then plans cleanly.
+#      aws_dynamodb_table.executions + module.vpc outputs are unknown —
+#      terraform infers the whole map as 'unknown' and bails ("for_each map
+#      includes keys derived from resource attributes that cannot be determined
+#      until apply"). Pre-applying VPC + DynamoDB table + ECR makes those refs
+#      resolvable, the full apply then plans cleanly.
 section "5/6 — Pre-deps apply + image push"
-warn "🚨 Cost timer starts NOW — provisioning VPC + RDS + ECR (~10-12 min first time)"
+warn "🚨 Cost timer starts NOW — provisioning VPC + DynamoDB table + ECR (~1-2 min first time)"
 info "terraform init"
 (cd "$TF_DIR" && terraform init -backend=false -input=false >/dev/null)
-info "terraform apply -target=module.vpc -target=module.rds -target=module.ecr -auto-approve"
-info "(VPC ~1 min, ECR ~10 sec, RDS Multi-AZ ~8-12 min for first creation)"
+info "terraform apply -target=module.vpc -target=aws_dynamodb_table.executions -target=module.ecr -auto-approve"
+info "(VPC ~1 min, ECR ~10 sec, DynamoDB on-demand table ~10s — no AZ provisioning latency)"
 (cd "$TF_DIR" && terraform apply \
-    -target=module.vpc -target=module.rds -target=module.ecr \
+    -target=module.vpc -target=aws_dynamodb_table.executions -target=module.ecr \
     -auto-approve -input=false)
 ECR_URL=$(cd "$TF_DIR" && terraform output -raw ecr_repository_url)
 ok "Pre-deps applied. ECR repository: $ECR_URL"
@@ -304,7 +304,7 @@ cat <<EOF
        Console UI. AWS Console UI for the SLO dashboard MAY be SCP-blocked at
        the org level — that is expected; the API path is the canonical source.
        Targets captured into evidence/<TS>/:
-         - metrics/   AWS-native panels (SQS / ECS / Valkey / ALB / RDS)
+         - metrics/   AWS-native panels (SQS / ECS / Valkey / ALB / DynamoDB)
          - slo/       Application SLI panels (latency / error rate / cache hit
                       ratio / compute duration / volume / alarm state JSON)
          - logs/      Worker + bootstrap CloudWatch logs + cache_hit:compute_done

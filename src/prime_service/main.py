@@ -15,6 +15,10 @@ Backpressure:
 GZip:
     GZipMiddleware(minimum_size=1000) reduces 7 MB max raw response
     to ~1.5-2 MB over the wire, fitting comfortably within ALB limits.
+
+Data layer (ADR-0042):
+    DynamoDB replaces PostgreSQL. execution_id is UUID4 string (not integer).
+    No ORM session — db.py exposes plain sync functions over boto3.
 """
 
 from __future__ import annotations
@@ -28,16 +32,13 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import structlog
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from botocore.exceptions import ClientError
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.gzip import GZipMiddleware
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from prime_service import __version__
 from prime_service.db import (
-    Execution,
     get_execution,
-    get_session,
     health_check,
     insert_queued_execution,
 )
@@ -186,11 +187,8 @@ async def backpressure_middleware(
 
 
 @app.get("/health", response_model=HealthResponse)
-async def health(session: AsyncSession = Depends(get_session)) -> HealthResponse:
-    try:
-        ok = await health_check(session)
-    except (OperationalError, SQLAlchemyError):
-        ok = False
+async def health() -> HealthResponse:
+    ok = health_check()
     return HealthResponse(
         status="ok" if ok else "degraded",
         db="reachable" if ok else "unreachable",
@@ -201,20 +199,22 @@ async def health(session: AsyncSession = Depends(get_session)) -> HealthResponse
 @app.post("/primes", response_model=PrimeRangeResponse, status_code=202)
 async def compute_primes(
     req: PrimeRangeRequest,
-    session: AsyncSession = Depends(get_session),
 ) -> PrimeRangeResponse:
     """Accept a prime-range request, enqueue it, and return 202 + execution_id.
 
     The computation is performed asynchronously by the worker container.
     Poll GET /primes/{execution_id} to retrieve the result.
+    execution_id is a UUID4 string (ADR-0042).
     """
+    execution_id = str(uuid.uuid4())
+
     try:
-        execution_id = await insert_queued_execution(
-            session,
+        insert_queued_execution(
+            execution_id=execution_id,
             range_start=req.start,
             range_end=req.end,
         )
-    except SQLAlchemyError as exc:
+    except ClientError as exc:
         log.error("insert_queued_failed", error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -222,8 +222,7 @@ async def compute_primes(
         ) from exc
 
     # Bind execution_id into contextvars — all subsequent logs in this request
-    # auto-include it via the merge_contextvars processor. Avoids the
-    # forget-to-pass-execution_id bug class on new log lines.
+    # auto-include it via the merge_contextvars processor.
     structlog.contextvars.bind_contextvars(execution_id=execution_id)
 
     try:
@@ -232,8 +231,6 @@ async def compute_primes(
     except Exception as exc:  # noqa: BLE001
         log.error("enqueue_failed", error=str(exc))
         # Queue is unavailable — still return 202 so the client can poll.
-        # The worker will pick up the job when the queue recovers (or the
-        # operator can manually re-enqueue). The audit row exists as the record.
 
     log.info("job_queued", start=req.start, end=req.end)
     return PrimeRangeResponse(execution_id=execution_id, status=Status.queued)
@@ -241,50 +238,56 @@ async def compute_primes(
 
 @app.get("/primes/{execution_id}", response_model=ExecutionResponse)
 async def get_primes_result(
-    execution_id: int,
-    session: AsyncSession = Depends(get_session),
+    execution_id: str,
 ) -> ExecutionResponse:
     """Return the current state of a queued prime-computation job."""
     structlog.contextvars.bind_contextvars(execution_id=execution_id)
-    row: Execution | None = await get_execution(session, execution_id)
+    row = get_execution(execution_id)
     if row is None:
         log.info("job_query_not_found")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"execution {execution_id} not found",
         )
-    log.info("job_query", status=row.status)
+    row_status = row["status"]
+    log.info("job_query", status=row_status)
+
+    # Convert Decimal list back to int for the response
+    primes: list[int] | None = None
+    if row_status == Status.done.value:
+        raw_primes = row.get("primes", [])
+        primes = [int(p) for p in raw_primes]
+
     return ExecutionResponse(
-        id=row.id,
-        status=Status(row.status),
-        result=row.primes if row.status == Status.done.value else None,
-        error_message=row.error_message,
+        id=execution_id,
+        status=Status(row_status),
+        result=primes,
+        error_message=row.get("error_message"),
     )
 
 
 @app.get("/executions/{execution_id}")
 async def fetch_execution(
-    execution_id: int,
-    session: AsyncSession = Depends(get_session),
-) -> dict:  # type: ignore[type-arg]
+    execution_id: str,
+) -> dict[str, Any]:
     """Legacy: return raw execution audit detail by id."""
     structlog.contextvars.bind_contextvars(execution_id=execution_id)
-    row = await get_execution(session, execution_id)
+    row = get_execution(execution_id)
     if row is None:
         log.info("execution_query_not_found")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"execution {execution_id} not found",
         )
-    log.info("execution_query", status=row.status)
+    log.info("execution_query", status=row["status"])
     return {
-        "id": row.id,
-        "range_start": row.range_start,
-        "range_end": row.range_end,
-        "primes_count": row.primes_count,
-        "primes": row.primes or [],
-        "duration_ms": row.duration_ms,
-        "created_at": row.created_at.isoformat() if row.created_at else None,
-        "status": row.status,
-        "error_message": row.error_message,
+        "id": row["execution_id"],
+        "range_start": int(row.get("range_start", 0)),
+        "range_end": int(row.get("range_end", 0)),
+        "primes_count": int(row.get("primes_count", 0)),
+        "primes": [int(p) for p in row.get("primes", [])],
+        "duration_ms": int(row.get("duration_ms", 0)),
+        "created_at": str(row.get("created_at", "")),
+        "status": row["status"],
+        "error_message": row.get("error_message"),
     }

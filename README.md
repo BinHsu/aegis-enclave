@@ -130,6 +130,101 @@ Per-traffic items (SQS, CloudWatch logs, ECS bootstrap one-shot, eCPU) are < 0.1
 
 ## Architecture
 
+### Greenfield production target — dual-region active-active (ADR-0042)
+
+```mermaid
+graph TB
+    Op[Operator on Client VPN]
+    CB[Build / CI<br/>CodeBuild / GHA / dev laptop<br/>public internet access]
+
+    subgraph R53[Route53 weighted A records - 50/50 + health check - TTL 60s]
+        DNS[api.enclave.example]
+    end
+
+    subgraph FRA[eu-central-1 Frankfurt]
+        CVPN_FRA[Client VPN endpoint<br/>mTLS]
+        ALB_FRA[Internal ALB<br/>HTTPS :443]
+        subgraph ECS_FRA[ECS Fargate cluster - 3 AZs]
+            API_FRA[app service<br/>desired=3]
+            WK_FRA[worker service<br/>min=3 max=9<br/>SQS-depth autoscale]
+            BS_FRA[bootstrap task<br/>one-shot]
+        end
+        SQS_FRA[(SQS<br/>region-local)]
+        VK_FRA[(ElastiCache Serverless<br/>Valkey ZSET)]
+        DDB_FRA[(DynamoDB<br/>Global Tables<br/>replica)]
+    end
+
+    subgraph IRE[eu-west-1 Ireland]
+        CVPN_IRE[Client VPN endpoint<br/>mTLS]
+        ALB_IRE[Internal ALB<br/>HTTPS :443]
+        subgraph ECS_IRE[ECS Fargate cluster - 3 AZs]
+            API_IRE[app service<br/>desired=3]
+            WK_IRE[worker service<br/>min=3 max=9<br/>SQS-depth autoscale]
+            BS_IRE[bootstrap task<br/>one-shot]
+        end
+        SQS_IRE[(SQS<br/>region-local)]
+        VK_IRE[(ElastiCache Serverless<br/>Valkey ZSET)]
+        DDB_IRE[(DynamoDB<br/>Global Tables<br/>replica)]
+    end
+
+    subgraph XREGION[AWS backbone - cross-region]
+        ECR_REP[ECR replication<br/>FRA primary -> IRE mirror]
+        DDB_SYNC[DynamoDB Global Tables<br/>active-active multi-master<br/>~1s replication lag]
+    end
+
+    Op --> DNS
+    DNS -->|weighted 50%| CVPN_FRA
+    DNS -->|weighted 50%| CVPN_IRE
+    CB ==>|push image| ECR_REP
+
+    CVPN_FRA --> ALB_FRA
+    ALB_FRA --> API_FRA
+    API_FRA --> SQS_FRA
+    API_FRA --> DDB_FRA
+    SQS_FRA --> WK_FRA
+    WK_FRA --> VK_FRA
+    WK_FRA --> DDB_FRA
+    BS_FRA -.seed.-> VK_FRA
+
+    CVPN_IRE --> ALB_IRE
+    ALB_IRE --> API_IRE
+    API_IRE --> SQS_IRE
+    API_IRE --> DDB_IRE
+    SQS_IRE --> WK_IRE
+    WK_IRE --> VK_IRE
+    WK_IRE --> DDB_IRE
+    BS_IRE -.seed.-> VK_IRE
+
+    DDB_FRA <-->|multi-master replication| DDB_SYNC
+    DDB_IRE <-->|multi-master replication| DDB_SYNC
+
+    style Op fill:#e1f5fe,color:#000
+    style DNS fill:#fff9c4,color:#000
+    style CVPN_FRA fill:#e1f5fe,color:#000
+    style CVPN_IRE fill:#e1f5fe,color:#000
+    style ALB_FRA fill:#fff3e0,color:#000
+    style ALB_IRE fill:#fff3e0,color:#000
+    style API_FRA fill:#e8f5e9,color:#000
+    style API_IRE fill:#e8f5e9,color:#000
+    style WK_FRA fill:#fce4ec,color:#000
+    style WK_IRE fill:#fce4ec,color:#000
+    style BS_FRA fill:#f3e5f5,color:#000
+    style BS_IRE fill:#f3e5f5,color:#000
+    style SQS_FRA fill:#fff9c4,color:#000
+    style SQS_IRE fill:#fff9c4,color:#000
+    style VK_FRA fill:#e8f5e9,color:#000
+    style VK_IRE fill:#e8f5e9,color:#000
+    style DDB_FRA fill:#fce4ec,color:#000
+    style DDB_IRE fill:#fce4ec,color:#000
+    style DDB_SYNC fill:#fce4ec,color:#000
+    style ECR_REP fill:#f5f5f5,color:#000
+    style CB fill:#fff9c4,color:#000
+```
+
+**Failover semantics (DNS-only, no promotion step):** Route53 health check detects failure in 3 x 30s = 90s; DNS TTL expires over 60-300s. RTO ~60-300s, RPO ~1s (Global Tables replication lag). Both regions are active writers always — no Aurora-style promotion, no Lambda automation, no failback complexity. See [ADR-0042](docs/ADR/0042-dynamodb-global-tables-greenfield-multi-region.md).
+
+### Local development stack
+
 ```mermaid
 flowchart LR
     Op[Operator / Client]
@@ -140,36 +235,36 @@ flowchart LR
         SQS[ElasticMQ<br/>:9324]
         WK[Worker<br/>SQS consumer]
         VK[(Valkey<br/>:6379)]
-        DB[(PostgreSQL<br/>executions table)]
+        DDB[(DynamoDB Local<br/>:8001)]
         BS[Bootstrap<br/>one-shot]
         TC[Test-Client Container<br/>verification only]
 
         WG --> API
-        API --> DB
+        API --> DDB
         API --> SQS
         SQS --> WK
         WK --> VK
-        WK --> DB
+        WK --> DDB
         BS -.seed.-> VK
         TC -.peer.-> WG
         TC --> API
     end
 
     Op -. WireGuard tunnel .-> WG
-    Op -. ❌ direct .-> API
-    Op -. ❌ direct .-> DB
+    Op -. blocked direct .-> API
+    Op -. blocked direct .-> DDB
 
     style WG fill:#e1f5fe,color:#000
     style API fill:#e8f5e9,color:#000
     style SQS fill:#fff9c4,color:#000
     style WK fill:#fce4ec,color:#000
     style VK fill:#e8f5e9,color:#000
-    style DB fill:#fff3e0,color:#000
+    style DDB fill:#fce4ec,color:#000
     style BS fill:#f3e5f5,color:#000
     style TC fill:#f3e5f5,color:#000
 ```
 
-The deployable cloud topology mirrors this shape with managed primitives — see [`docs/deployment_guide.md`](docs/deployment_guide.md).
+The cloud topology detail (subnets, VPC endpoints, PrivateLink) is in [`docs/deployment_guide.md`](docs/deployment_guide.md).
 
 ---
 

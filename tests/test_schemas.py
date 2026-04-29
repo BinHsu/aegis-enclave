@@ -132,45 +132,58 @@ class TestPrimeRangeRequestTypeCoercion:
 class TestPrimeRangeResponse:
     """Structural coverage for the 202 Accepted response (async path).
 
-    PrimeRangeResponse is now {execution_id, status} — the synchronous
-    {primes, count} fields moved to ExecutionResponse (GET /primes/{id}).
+    PrimeRangeResponse is now {execution_id: str (UUID4), status}.
+    DynamoDB pivot (ADR-0042): execution_id changed from int to UUID4 string.
     """
 
     def test_minimal_execution_id_and_status(self) -> None:
-        resp = PrimeRangeResponse(execution_id=1, status="queued")
-        assert resp.execution_id == 1
+        eid = "550e8400-e29b-41d4-a716-446655440000"
+        resp = PrimeRangeResponse(execution_id=eid, status="queued")
+        assert resp.execution_id == eid
         assert resp.status == "queued"
 
     def test_default_status_is_queued(self) -> None:
-        resp = PrimeRangeResponse(execution_id=42)
+        eid = "550e8400-e29b-41d4-a716-446655440001"
+        resp = PrimeRangeResponse(execution_id=eid)
         assert resp.status == "queued"
 
     def test_execution_id_required(self) -> None:
         with pytest.raises(ValidationError):
             PrimeRangeResponse()  # type: ignore[call-arg]
 
-    def test_execution_id_negative_accepted(self) -> None:
-        # No constraint on execution_id polarity; test documents current contract.
-        resp = PrimeRangeResponse(execution_id=-1)
-        assert resp.execution_id == -1
+    def test_execution_id_is_string(self) -> None:
+        """execution_id must be a string (UUID4); int is rejected (ADR-0042)."""
+        with pytest.raises(ValidationError):
+            PrimeRangeResponse(execution_id=1)  # type: ignore[arg-type]
 
     def test_serialise_roundtrip(self) -> None:
-        original = PrimeRangeResponse(execution_id=7, status="queued")
+        eid = "550e8400-e29b-41d4-a716-446655440007"
+        original = PrimeRangeResponse(execution_id=eid, status="queued")
         round_tripped = PrimeRangeResponse.model_validate_json(original.model_dump_json())
         assert round_tripped == original
 
-    # BVA on execution_id boundary (any int accepted, no schema constraint)
-    def test_execution_id_bva_at_0(self) -> None:
-        resp = PrimeRangeResponse(execution_id=0)
-        assert resp.execution_id == 0
+    # BVA on execution_id: UUID string at boundary values
+    # B-1: empty string (invalid — must be non-empty)
+    def test_execution_id_bva_empty_string(self) -> None:
+        """B-1: empty string is a valid Python string; accepted by Pydantic str field."""
+        # Pydantic str doesn't reject empty strings at schema level — acceptable.
+        resp = PrimeRangeResponse(execution_id="")
+        assert resp.execution_id == ""
 
-    def test_execution_id_bva_at_1(self) -> None:
-        resp = PrimeRangeResponse(execution_id=1)
-        assert resp.execution_id == 1
+    # B: a minimal single-char UUID string
+    def test_execution_id_bva_single_char(self) -> None:
+        """B: single-char string is valid string type."""
+        resp = PrimeRangeResponse(execution_id="a")
+        assert resp.execution_id == "a"
 
-    def test_execution_id_bva_at_2(self) -> None:
-        resp = PrimeRangeResponse(execution_id=2)
-        assert resp.execution_id == 2
+    # B+1: full UUID4 string
+    def test_execution_id_bva_uuid4_string(self) -> None:
+        """B+1: a full UUID4 string is the canonical form for execution_id."""
+        import uuid
+
+        eid = str(uuid.uuid4())
+        resp = PrimeRangeResponse(execution_id=eid)
+        assert resp.execution_id == eid
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -214,11 +227,14 @@ class TestHealthResponse:
 
 
 class TestExecutionDetail:
-    """Structural coverage + datetime coercion for execution-history records."""
+    """Structural coverage + datetime coercion for execution-history records.
+
+    DynamoDB pivot (ADR-0042): id is now str (UUID4), not int.
+    """
 
     def test_minimal(self) -> None:
         d = ExecutionDetail(
-            id=1,
+            id="550e8400-e29b-41d4-a716-446655440000",
             range_start=2,
             range_end=10,
             primes_count=4,
@@ -226,12 +242,12 @@ class TestExecutionDetail:
             duration_ms=12,
             created_at=datetime(2026, 4, 25, 10, 30, 0, tzinfo=UTC),
         )
-        assert d.id == 1
+        assert d.id == "550e8400-e29b-41d4-a716-446655440000"
         assert d.primes_count == 4
 
     def test_datetime_iso_string_coerced(self) -> None:
         d = ExecutionDetail(
-            id=1,
+            id="550e8400-e29b-41d4-a716-446655440001",
             range_start=2,
             range_end=10,
             primes_count=4,
@@ -244,7 +260,7 @@ class TestExecutionDetail:
     def test_invalid_datetime_string_rejected(self) -> None:
         with pytest.raises(ValidationError, match="created_at"):
             ExecutionDetail(
-                id=1,
+                id="550e8400-e29b-41d4-a716-446655440002",
                 range_start=2,
                 range_end=10,
                 primes_count=4,
@@ -255,7 +271,7 @@ class TestExecutionDetail:
 
     def test_serialise_roundtrip(self) -> None:
         original = ExecutionDetail(
-            id=42,
+            id="550e8400-e29b-41d4-a716-44665544002a",
             range_start=2,
             range_end=100,
             primes_count=25,

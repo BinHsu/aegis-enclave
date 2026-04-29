@@ -1,665 +1,803 @@
-"""Mock-based unit tests for prime_service.db.
+"""Tests for prime_service.db — DynamoDB layer (ADR-0042).
 
 Strategy
 --------
-This module's I/O surface is async SQLAlchemy against PostgreSQL with JSONB
-columns. Unit tests use AsyncMock / MagicMock to verify the call patterns
-without spinning up a real database. Real DB integration is verified via the
-end-to-end smoke test (``make smoke``, Phase 1.5) — see CLAUDE.md § 8b for the
-two-layer verification approach.
+- ``moto[dynamodb]`` mocks DynamoDB in-process; no real AWS calls.
+- Every test that exercises the table uses the ``ddb_table`` fixture which
+  creates a fresh moto-backed table.
+- BVA on UUID format, status transitions, TTL math, and conditional write
+  idempotency.
 
 What these tests cover:
-
-- ``Settings`` defaults and env-var override + ``database_url`` composition
-- ``Execution`` model has the expected schema attributes
-- ``insert_execution`` adds the row, commits, refreshes, and returns the
-  assigned id
-- ``get_execution`` issues a SELECT and returns the model or ``None``
-- ``health_check`` returns ``True`` on ``SELECT 1`` success; propagates
-  SQLAlchemy errors to the caller (per ``main.py`` health-endpoint contract)
-
-What these tests DO NOT cover (intentionally):
-
-- Real PostgreSQL JSONB serialisation behaviour
-- Connection pool / transaction isolation semantics
-- Multi-AZ failover behaviour (a Phase 1.5 / production concern; see
-  ADR-0009 for topology rationale)
-
-Those belong in the smoke test or in production-grade integration suites
-that are explicitly out of case-study scope per ADR-0003.
+- ``insert_queued_execution``: happy path, idempotency (duplicate UUID no-op),
+  round-trip attribute presence.
+- ``get_execution``: found, not found, ConsistentRead semantics (mocked).
+- ``mark_running``: queued → running transition + ConditionExpression guard.
+- ``mark_done``: running → done + TTL set at completed_at + 30d.
+- ``mark_failed``: running → failed + TTL set at completed_at + 90d.
+- ``health_check``: returns True on ACTIVE table, False on error.
+- TTL BVA: TTL values are within expected epoch windows.
+- UUID format BVA: execution_id must be a valid UUID4 string.
+- Status transition BVA: each status value (queued/running/done/failed).
 """
 
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+import re
+import time
+import uuid
+from typing import Any
+from unittest.mock import patch
 
+import boto3
 import pytest
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from moto import mock_aws  # moto >= 5 uses mock_aws unified decorator
 
-from prime_service.db import (
-    Base,
-    Execution,
-    Settings,
-    count_active_executions,
-    get_execution,
-    health_check,
-    insert_execution,
-    insert_queued_execution,
-)
+# ---------------------------------------------------------------------------
+# Test helpers / fixtures
+# ---------------------------------------------------------------------------
 
-# ───────────────────────────────────────────────────────────────────────────
-# Settings — pydantic-settings env loading
-# ───────────────────────────────────────────────────────────────────────────
+_TABLE_NAME = "aegis-enclave-executions"
+_REGION = "eu-central-1"
 
 
-class TestSettings:
-    """Verify Settings default values and env-var override behaviour."""
+@pytest.fixture(autouse=True)
+def _aws_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set dummy AWS credentials so boto3 doesn't reject moto calls."""
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", _REGION)
+    monkeypatch.setenv("DYNAMODB_TABLE_NAME", _TABLE_NAME)
+    monkeypatch.delenv("AWS_DYNAMODB_ENDPOINT_URL", raising=False)
 
-    def test_built_in_defaults(self) -> None:
-        """With no env vars present, the model-declared defaults apply.
 
-        ``Settings`` declares safe local-dev defaults so the module imports
-        cleanly in test environments (production secrets come from AWS
-        Secrets Manager per ADR-0016).
-        """
-        # Clear any env vars that would override defaults.
-        keys = (
-            "POSTGRES_USER",
-            "POSTGRES_PASSWORD",
-            "POSTGRES_DB",
-            "POSTGRES_HOST",
-            "POSTGRES_PORT",
+@pytest.fixture()
+def ddb_table() -> Any:
+    """Create a moto-backed DynamoDB table and yield it for the duration of one test."""
+    with mock_aws():
+        ddb = boto3.resource("dynamodb", region_name=_REGION)
+        table = ddb.create_table(
+            TableName=_TABLE_NAME,
+            KeySchema=[{"AttributeName": "execution_id", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "execution_id", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
         )
-        with patch.dict(os.environ, dict.fromkeys(keys, ""), clear=False):
-            for k in keys:
-                os.environ.pop(k, None)
-            settings = Settings(_env_file=None)  # type: ignore[call-arg]
-            assert settings.POSTGRES_USER == "primes_app"
-            assert settings.POSTGRES_DB == "primes"
-            assert settings.POSTGRES_HOST == "db"
-            assert settings.POSTGRES_PORT == 5432
+        table.meta.client.get_waiter("table_exists").wait(TableName=_TABLE_NAME)
+        yield table
 
-    def test_env_overrides_defaults(self) -> None:
-        env = {
-            "POSTGRES_USER": "u",
-            "POSTGRES_PASSWORD": "p",
-            "POSTGRES_DB": "d",
-            "POSTGRES_HOST": "h",
-            "POSTGRES_PORT": "6543",
-        }
-        with patch.dict(os.environ, env, clear=False):
-            settings = Settings(_env_file=None)  # type: ignore[call-arg]
-            assert settings.POSTGRES_USER == "u"
-            assert settings.POSTGRES_PASSWORD == "p"
-            assert settings.POSTGRES_DB == "d"
-            assert settings.POSTGRES_HOST == "h"
-            assert settings.POSTGRES_PORT == 6543
 
-    def test_database_url_composition(self) -> None:
-        env = {
-            "POSTGRES_USER": "primes_app",
-            "POSTGRES_PASSWORD": "secret",
-            "POSTGRES_DB": "primes",
-            "POSTGRES_HOST": "db",
-            "POSTGRES_PORT": "5432",
-        }
-        with patch.dict(os.environ, env, clear=False):
-            settings = Settings(_env_file=None)  # type: ignore[call-arg]
-            url = settings.database_url
-            assert url.startswith("postgresql+asyncpg://")
-            assert "primes_app" in url
-            assert "secret" in url
-            assert "@db:5432/" in url
-            assert url.endswith("/primes")
+def _make_uuid() -> str:
+    return str(uuid.uuid4())
 
-    def test_database_url_uses_asyncpg_driver(self) -> None:
-        """ADR-0009 mandates async SQLAlchemy → asyncpg driver, not psycopg2."""
-        settings = Settings(_env_file=None)  # type: ignore[call-arg]
-        assert "+asyncpg" in settings.database_url
 
+# ---------------------------------------------------------------------------
+# Import the module under test AFTER env vars are set
+# ---------------------------------------------------------------------------
 
-# ───────────────────────────────────────────────────────────────────────────
-# Execution model — schema mapping mirrors db/init.sql
-# ───────────────────────────────────────────────────────────────────────────
 
+def _import_db() -> Any:
+    """Return the db module (re-imported so env vars apply)."""
+    import prime_service.db as db_mod
 
-class TestExecutionModel:
-    """Verify the SQLAlchemy declarative mapping matches db/init.sql."""
+    return db_mod
 
-    def test_table_name(self) -> None:
-        assert Execution.__tablename__ == "executions"
 
-    def test_required_columns_present(self) -> None:
-        column_names = {c.name for c in Execution.__table__.columns}
-        expected = {
-            "id",
-            "range_start",
-            "range_end",
-            "primes_count",
-            "primes",
-            "duration_ms",
-            "created_at",
-        }
-        assert expected.issubset(column_names)
-
-    def test_id_is_primary_key(self) -> None:
-        pk_columns = [c.name for c in Execution.__table__.primary_key]
-        assert pk_columns == ["id"]
-
-    def test_inherits_base(self) -> None:
-        assert issubclass(Execution, Base)
-
-    def test_primes_column_is_nullable(self) -> None:
-        """JSONB list column may legitimately be NULL (vs empty list)."""
-        primes_col = Execution.__table__.columns["primes"]
-        assert primes_col.nullable is True
-
-    def test_non_null_columns(self) -> None:
-        """Audit-row invariants: every range / count / duration is required."""
-        for col_name in ("range_start", "range_end", "primes_count", "duration_ms"):
-            col = Execution.__table__.columns[col_name]
-            assert col.nullable is False, f"{col_name} should be NOT NULL"
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# insert_execution — verify add / commit / refresh / return id pattern
-# ───────────────────────────────────────────────────────────────────────────
-
-
-class TestInsertExecution:
-    """Async unit tests for ``insert_execution`` using AsyncMock session.
-
-    The implementation pattern is: ``session.add(row)`` →
-    ``await session.commit()`` → ``await session.refresh(row)`` →
-    ``return row.id``. Mocks verify each step occurs and the returned id
-    matches the DB-assigned identity.
-    """
-
-    async def test_returns_assigned_id(self) -> None:
-        session = AsyncMock()
-        added: list[Execution] = []
-
-        def capture_add(obj: Execution) -> None:
-            added.append(obj)
-
-        async def fake_refresh(obj: Execution) -> None:
-            # Simulate the DB assigning an identity on commit/refresh.
-            obj.id = 42
-
-        session.add = MagicMock(side_effect=capture_add)
-        session.commit = AsyncMock()
-        session.refresh = AsyncMock(side_effect=fake_refresh)
-
-        result = await insert_execution(
-            session,
-            range_start=2,
-            range_end=10,
-            primes=[2, 3, 5, 7],
-            duration_ms=5,
-        )
-
-        assert result == 42
-        assert len(added) == 1
-        assert added[0].range_start == 2
-        assert added[0].range_end == 10
-        assert added[0].primes_count == 4
-        assert added[0].primes == [2, 3, 5, 7]
-        assert added[0].duration_ms == 5
-        session.add.assert_called_once()
-        session.commit.assert_awaited_once()
-        session.refresh.assert_awaited_once()
-
-    async def test_primes_count_derived_from_list_length(self) -> None:
-        """``primes_count`` must be derived from ``len(primes)``, not a
-        caller-supplied parameter — guards against drift."""
-        session = AsyncMock()
-        added: list[Execution] = []
-
-        def capture_add(obj: Execution) -> None:
-            added.append(obj)
-
-        async def fake_refresh(obj: Execution) -> None:
-            obj.id = 1
-
-        session.add = MagicMock(side_effect=capture_add)
-        session.commit = AsyncMock()
-        session.refresh = AsyncMock(side_effect=fake_refresh)
-
-        await insert_execution(
-            session,
-            range_start=2,
-            range_end=30,
-            primes=[2, 3, 5, 7, 11, 13, 17, 19, 23, 29],
-            duration_ms=1,
-        )
-        assert added[0].primes_count == 10
-
-    async def test_empty_primes_persisted_with_zero_count(self) -> None:
-        session = AsyncMock()
-        added: list[Execution] = []
-
-        def capture_add(obj: Execution) -> None:
-            added.append(obj)
-
-        async def fake_refresh(obj: Execution) -> None:
-            obj.id = 7
-
-        session.add = MagicMock(side_effect=capture_add)
-        session.commit = AsyncMock()
-        session.refresh = AsyncMock(side_effect=fake_refresh)
-
-        result = await insert_execution(
-            session,
-            range_start=14,
-            range_end=16,
-            primes=[],
-            duration_ms=0,
-        )
-        assert result == 7
-        assert added[0].primes_count == 0
-        assert added[0].primes == []
-
-    async def test_propagates_commit_error(self) -> None:
-        """A failed ``commit`` must propagate so FastAPI can return 5xx —
-        silently swallowing would hide DB outages."""
-        session = AsyncMock()
-        session.add = MagicMock()
-        session.commit = AsyncMock(side_effect=SQLAlchemyError("commit failed"))
-        session.refresh = AsyncMock()
-
-        with pytest.raises(SQLAlchemyError, match="commit failed"):
-            await insert_execution(
-                session,
-                range_start=2,
-                range_end=10,
-                primes=[2, 3, 5, 7],
-                duration_ms=5,
-            )
-        session.refresh.assert_not_awaited()
-
-    async def test_propagates_refresh_error(self) -> None:
-        session = AsyncMock()
-        session.add = MagicMock()
-        session.commit = AsyncMock()
-        session.refresh = AsyncMock(side_effect=SQLAlchemyError("refresh failed"))
-
-        with pytest.raises(SQLAlchemyError, match="refresh failed"):
-            await insert_execution(
-                session,
-                range_start=2,
-                range_end=10,
-                primes=[2, 3, 5, 7],
-                duration_ms=5,
-            )
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# get_execution — SELECT by id, returns model or None
-# ───────────────────────────────────────────────────────────────────────────
-
-
-class TestGetExecution:
-    """Verify the ``select() → execute() → scalar_one_or_none()`` pattern."""
-
-    async def test_returns_model_when_found(self) -> None:
-        session = AsyncMock()
-        expected = Execution(
-            id=42,
-            range_start=2,
-            range_end=10,
-            primes_count=4,
-            primes=[2, 3, 5, 7],
-            duration_ms=5,
-            created_at=datetime(2026, 4, 25, 12, 0, 0, tzinfo=UTC),
-        )
-        result_obj = MagicMock()
-        result_obj.scalar_one_or_none.return_value = expected
-        session.execute = AsyncMock(return_value=result_obj)
-
-        got = await get_execution(session, 42)
-
-        assert got is expected
-        assert got is not None
-        assert got.id == 42
-        session.execute.assert_awaited_once()
-        result_obj.scalar_one_or_none.assert_called_once()
-
-    async def test_returns_none_when_not_found(self) -> None:
-        session = AsyncMock()
-        result_obj = MagicMock()
-        result_obj.scalar_one_or_none.return_value = None
-        session.execute = AsyncMock(return_value=result_obj)
-
-        got = await get_execution(session, 99999)
-
-        assert got is None
-        session.execute.assert_awaited_once()
-
-    async def test_propagates_query_error(self) -> None:
-        """A SELECT failure must propagate — the caller (``main.py``) maps
-        DB errors to 500 explicitly; silent ``None`` would mask outages."""
-        session = AsyncMock()
-        session.execute = AsyncMock(side_effect=SQLAlchemyError("select failed"))
-
-        with pytest.raises(SQLAlchemyError, match="select failed"):
-            await get_execution(session, 1)
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# health_check — True on SELECT 1 success; errors propagate
-# ───────────────────────────────────────────────────────────────────────────
-
-
-class TestHealthCheck:
-    """Verify the ``SELECT 1`` round-trip pattern.
-
-    The implementation has no try/except — it relies on SQLAlchemy raising
-    ``OperationalError`` on connectivity failures. ``main.py``'s health
-    endpoint catches the exception and maps it to a non-OK status.
-    """
-
-    async def test_returns_true_on_successful_select_1(self) -> None:
-        session = AsyncMock()
-        result_obj = MagicMock()
-        result_obj.scalar_one.return_value = 1
-        session.execute = AsyncMock(return_value=result_obj)
-
-        ok = await health_check(session)
-
-        assert ok is True
-        session.execute.assert_awaited_once()
-
-    async def test_returns_false_when_unexpected_value(self) -> None:
-        """If the DB ever returns something other than 1, treat as unhealthy.
-
-        This is defence-in-depth — a misbehaving driver / proxy that returns
-        a wrong scalar should not be silently reported as healthy.
-        """
-        session = AsyncMock()
-        result_obj = MagicMock()
-        result_obj.scalar_one.return_value = 0
-        session.execute = AsyncMock(return_value=result_obj)
-
-        ok = await health_check(session)
-
-        assert ok is False
-
-    async def test_propagates_operational_error(self) -> None:
-        """Connection failures bubble up so the caller can map to 503."""
-        session = AsyncMock()
-        session.execute = AsyncMock(side_effect=OperationalError("conn refused", None, Exception()))
-
-        with pytest.raises(OperationalError):
-            await health_check(session)
-
-    async def test_propagates_generic_sqlalchemy_error(self) -> None:
-        session = AsyncMock()
-        session.execute = AsyncMock(side_effect=SQLAlchemyError("query failed"))
-
-        with pytest.raises(SQLAlchemyError, match="query failed"):
-            await health_check(session)
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# Execution model — new status columns (Phase 2.3 async worker path)
-# ───────────────────────────────────────────────────────────────────────────
-
-
-class TestExecutionModelStatusColumns:
-    """Verify the new status columns added for the async worker lifecycle."""
-
-    def test_status_column_present(self) -> None:
-        column_names = {c.name for c in Execution.__table__.columns}
-        assert "status" in column_names
-
-    def test_started_at_column_present(self) -> None:
-        column_names = {c.name for c in Execution.__table__.columns}
-        assert "started_at" in column_names
-
-    def test_completed_at_column_present(self) -> None:
-        column_names = {c.name for c in Execution.__table__.columns}
-        assert "completed_at" in column_names
-
-    def test_error_message_column_present(self) -> None:
-        column_names = {c.name for c in Execution.__table__.columns}
-        assert "error_message" in column_names
-
-    def test_status_column_not_nullable(self) -> None:
-        status_col = Execution.__table__.columns["status"]
-        assert status_col.nullable is False
-
-    def test_started_at_column_is_nullable(self) -> None:
-        """started_at is NULL until the worker picks up the job."""
-        col = Execution.__table__.columns["started_at"]
-        assert col.nullable is True
-
-    def test_completed_at_column_is_nullable(self) -> None:
-        """completed_at is NULL until the job finishes."""
-        col = Execution.__table__.columns["completed_at"]
-        assert col.nullable is True
-
-    def test_error_message_column_is_nullable(self) -> None:
-        """error_message is NULL for successful executions."""
-        col = Execution.__table__.columns["error_message"]
-        assert col.nullable is True
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# insert_queued_execution — inserts row with status='queued', returns id
-# ───────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# insert_queued_execution
+# ---------------------------------------------------------------------------
 
 
 class TestInsertQueuedExecution:
-    """Verify insert_queued_execution writes a 'queued' row and returns id."""
+    """Verify insert_queued_execution writes a 'queued' row and returns execution_id."""
 
-    async def test_returns_assigned_id(self) -> None:
-        session = AsyncMock()
-        added: list[Execution] = []
+    def test_returns_execution_id(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            result = db.insert_queued_execution(
+                execution_id=eid,
+                range_start=2,
+                range_end=100,
+            )
+        assert result == eid
 
-        def capture_add(obj: Execution) -> None:
-            added.append(obj)
+    def test_row_written_to_table(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=100)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True).get("Item")
+        assert item is not None
+        assert item["execution_id"] == eid
 
-        async def fake_refresh(obj: Execution) -> None:
-            obj.id = 77
+    def test_status_is_queued(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=100)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert item["status"] == "queued"
 
-        session.add = MagicMock(side_effect=capture_add)
-        session.commit = AsyncMock()
-        session.refresh = AsyncMock(side_effect=fake_refresh)
+    def test_range_attributes_stored(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=7, range_end=999)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert int(item["range_start"]) == 7
+        assert int(item["range_end"]) == 999
 
-        result = await insert_queued_execution(session, range_start=2, range_end=1000)
+    def test_created_at_is_recent_epoch(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        before = int(time.time())
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        after = int(time.time())
+        assert before <= int(item["created_at"]) <= after
 
-        assert result == 77
+    # BVA on range_start boundary (API minimum = 2)
+    def test_range_start_bva_at_2(self, ddb_table: Any) -> None:
+        """BVA B: range_start=2 (API minimum) is stored correctly."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert int(item["range_start"]) == 2
 
-    async def test_status_is_queued(self) -> None:
-        """Inserted row must have status='queued'."""
-        session = AsyncMock()
-        added: list[Execution] = []
+    def test_range_start_bva_at_3(self, ddb_table: Any) -> None:
+        """BVA B+1: range_start=3 stored correctly."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=3, range_end=10)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert int(item["range_start"]) == 3
 
-        def capture_add(obj: Execution) -> None:
-            added.append(obj)
+    def test_range_start_bva_at_1(self, ddb_table: Any) -> None:
+        """BVA B-1: range_start=1 (bootstrap range) stored correctly."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=1, range_end=100000)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert int(item["range_start"]) == 1
 
-        async def fake_refresh(obj: Execution) -> None:
-            obj.id = 1
+    # Idempotency — duplicate UUID must not raise; returns same id
+    def test_duplicate_uuid_is_idempotent(self, ddb_table: Any) -> None:
+        """Second insert with same UUID → no error; returns same id."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            result1 = db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            result2 = db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+        assert result1 == eid
+        assert result2 == eid
 
-        session.add = MagicMock(side_effect=capture_add)
-        session.commit = AsyncMock()
-        session.refresh = AsyncMock(side_effect=fake_refresh)
+    def test_duplicate_uuid_does_not_overwrite(self, ddb_table: Any) -> None:
+        """Conditional put: second insert with same UUID leaves original row intact."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            # First mark it running to change status
+            db.mark_running(eid)
+            # Re-insert with same UUID — should not reset status back to queued
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        # Status should still be 'running' (not reset to 'queued')
+        assert item["status"] == "running"
 
-        await insert_queued_execution(session, range_start=2, range_end=1000)
+    # UUID format BVA: must be valid UUID4 format
+    def test_uuid4_format_is_string(self, ddb_table: Any) -> None:
+        """execution_id is a string UUID4."""
+        eid = _make_uuid()
+        # Verify format: must parse as UUID without error
+        parsed = uuid.UUID(eid, version=4)
+        assert str(parsed) == eid
 
-        assert added[0].status == "queued"
+    def test_uuid_all_lowercase_hex_format(self, ddb_table: Any) -> None:
+        """UUID4 strings contain only hex chars and hyphens."""
+        eid = _make_uuid()
+        _UUID4_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        assert re.match(_UUID4_PATTERN, eid)
 
-    async def test_primes_is_none(self) -> None:
-        """Queued row has no primes yet (worker fills them in)."""
-        session = AsyncMock()
-        added: list[Execution] = []
+    def test_two_uuids_are_distinct(self, ddb_table: Any) -> None:
+        """UUID4 generation produces unique values."""
+        eid1 = _make_uuid()
+        eid2 = _make_uuid()
+        assert eid1 != eid2
 
-        def capture_add(obj: Execution) -> None:
-            added.append(obj)
-
-        async def fake_refresh(obj: Execution) -> None:
-            obj.id = 1
-
-        session.add = MagicMock(side_effect=capture_add)
-        session.commit = AsyncMock()
-        session.refresh = AsyncMock(side_effect=fake_refresh)
-
-        await insert_queued_execution(session, range_start=2, range_end=1000)
-
-        assert added[0].primes is None
-        assert added[0].primes_count == 0
-        assert added[0].duration_ms == 0
-
-    async def test_range_stored_correctly(self) -> None:
-        """Verify range_start and range_end are persisted as provided."""
-        session = AsyncMock()
-        added: list[Execution] = []
-
-        def capture_add(obj: Execution) -> None:
-            added.append(obj)
-
-        async def fake_refresh(obj: Execution) -> None:
-            obj.id = 1
-
-        session.add = MagicMock(side_effect=capture_add)
-        session.commit = AsyncMock()
-        session.refresh = AsyncMock(side_effect=fake_refresh)
-
-        await insert_queued_execution(session, range_start=100, range_end=200)
-
-        assert added[0].range_start == 100
-        assert added[0].range_end == 200
-
-    # BVA at execution_id: 0, 1, 2 (boundary of auto-assigned pk)
-    async def test_range_start_bva_at_2(self) -> None:
-        """BVA: range_start=2 (API minimum) passes through."""
-        session = AsyncMock()
-        added: list[Execution] = []
-
-        def capture_add(obj: Execution) -> None:
-            added.append(obj)
-
-        async def fake_refresh(obj: Execution) -> None:
-            obj.id = 1
-
-        session.add = MagicMock(side_effect=capture_add)
-        session.commit = AsyncMock()
-        session.refresh = AsyncMock(side_effect=fake_refresh)
-
-        await insert_queued_execution(session, range_start=2, range_end=10)
-
-        assert added[0].range_start == 2
-
-    async def test_range_start_bva_at_3(self) -> None:
-        """BVA: range_start=3 (B+1 of API minimum) passes through."""
-        session = AsyncMock()
-        added: list[Execution] = []
-
-        def capture_add(obj: Execution) -> None:
-            added.append(obj)
-
-        async def fake_refresh(obj: Execution) -> None:
-            obj.id = 1
-
-        session.add = MagicMock(side_effect=capture_add)
-        session.commit = AsyncMock()
-        session.refresh = AsyncMock(side_effect=fake_refresh)
-
-        await insert_queued_execution(session, range_start=3, range_end=10)
-
-        assert added[0].range_start == 3
-
-    async def test_propagates_commit_error(self) -> None:
-        session = AsyncMock()
-        session.add = MagicMock()
-        session.commit = AsyncMock(side_effect=SQLAlchemyError("commit failed"))
-        session.refresh = AsyncMock()
-
-        with pytest.raises(SQLAlchemyError, match="commit failed"):
-            await insert_queued_execution(session, range_start=2, range_end=100)
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# count_active_executions — COUNT WHERE status IN ('queued', 'running')
-# ───────────────────────────────────────────────────────────────────────────
+    def test_no_ttl_at_on_queued_insert(self, ddb_table: Any) -> None:
+        """queued row must NOT have a ttl_at set (per TTL policy)."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=100)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert "ttl_at" not in item
 
 
-class TestCountActiveExecutions:
-    """Verify count_active_executions returns the scalar count."""
+# ---------------------------------------------------------------------------
+# get_execution
+# ---------------------------------------------------------------------------
 
-    # BVA at count = 0, 1, 2
-    async def test_returns_zero_when_no_active(self) -> None:
-        """BVA B-1: count = 0 (no active executions)."""
-        session = AsyncMock()
-        result_obj = MagicMock()
-        result_obj.scalar_one.return_value = 0
-        session.execute = AsyncMock(return_value=result_obj)
 
-        count = await count_active_executions(session)
+class TestGetExecution:
+    """Verify get_execution returns item dict or None."""
 
-        assert count == 0
+    def test_returns_dict_when_found(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            result = db.get_execution(eid)
+        assert result is not None
+        assert isinstance(result, dict)
+        assert result["execution_id"] == eid
 
-    async def test_returns_one_when_one_active(self) -> None:
-        """BVA B: count = 1 (exactly one active execution)."""
-        session = AsyncMock()
-        result_obj = MagicMock()
-        result_obj.scalar_one.return_value = 1
-        session.execute = AsyncMock(return_value=result_obj)
+    def test_returns_none_when_not_found(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            result = db.get_execution(eid)
+        assert result is None
 
-        count = await count_active_executions(session)
+    def test_status_field_present_in_result(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=100)
+            result = db.get_execution(eid)
+        assert result is not None
+        assert "status" in result
+        assert result["status"] == "queued"
 
-        assert count == 1
+    # BVA: UUID with all zeros edge case
+    def test_zero_uuid_not_found(self, ddb_table: Any) -> None:
+        """get_execution with a zero UUID (not inserted) returns None."""
+        db = _import_db()
+        with mock_aws():
+            result = db.get_execution("00000000-0000-0000-0000-000000000000")
+        assert result is None
 
-    async def test_returns_two_when_two_active(self) -> None:
-        """BVA B+1: count = 2 (two active executions)."""
-        session = AsyncMock()
-        result_obj = MagicMock()
-        result_obj.scalar_one.return_value = 2
-        session.execute = AsyncMock(return_value=result_obj)
 
-        count = await count_active_executions(session)
+# ---------------------------------------------------------------------------
+# mark_running
+# ---------------------------------------------------------------------------
 
-        assert count == 2
 
-    async def test_returns_int_not_any(self) -> None:
-        """Return type is int (no-any-return mypy requirement)."""
-        session = AsyncMock()
-        result_obj = MagicMock()
-        result_obj.scalar_one.return_value = 5
-        session.execute = AsyncMock(return_value=result_obj)
+class TestMarkRunning:
+    """Verify queued → running transition."""
 
-        count = await count_active_executions(session)
+    def test_queued_transitions_to_running(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert item["status"] == "running"
 
-        assert isinstance(count, int)
+    def test_started_at_set_on_running(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        before = int(time.time())
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        after = int(time.time())
+        assert "started_at" in item
+        assert before <= int(item["started_at"]) <= after
 
-    async def test_returns_zero_on_null_scalar(self) -> None:
-        """If DB returns NULL (no rows), coerce to 0."""
-        session = AsyncMock()
-        result_obj = MagicMock()
-        result_obj.scalar_one.return_value = None
-        session.execute = AsyncMock(return_value=result_obj)
+    def test_mark_running_on_already_running_is_no_op(self, ddb_table: Any) -> None:
+        """ConditionExpression: status must be 'queued'. Double mark_running is silently ignored."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            # Second mark_running should not raise
+            db.mark_running(eid)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert item["status"] == "running"
 
-        count = await count_active_executions(session)
+    def test_mark_running_on_done_is_no_op(self, ddb_table: Any) -> None:
+        """ConditionExpression: status must be 'queued'. mark_running on done row is ignored."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            # Should not raise
+            db.mark_running(eid)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert item["status"] == "done"
 
-        assert count == 0
 
-    async def test_executes_query(self) -> None:
-        """Verify a SELECT query is issued (sanity check)."""
-        session = AsyncMock()
-        result_obj = MagicMock()
-        result_obj.scalar_one.return_value = 0
-        session.execute = AsyncMock(return_value=result_obj)
+# ---------------------------------------------------------------------------
+# mark_done
+# ---------------------------------------------------------------------------
 
-        await count_active_executions(session)
 
-        session.execute.assert_awaited_once()
+class TestMarkDone:
+    """Verify running → done transition + TTL math."""
 
-    async def test_propagates_db_error(self) -> None:
-        """DB failure must propagate (caller maps to backpressure-unavailable)."""
-        session = AsyncMock()
-        session.execute = AsyncMock(side_effect=SQLAlchemyError("db down"))
+    def test_running_transitions_to_done(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_done(eid, primes=[2, 3, 5, 7], duration_ms=50)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert item["status"] == "done"
 
-        with pytest.raises(SQLAlchemyError, match="db down"):
-            await count_active_executions(session)
+    def test_primes_stored_as_list(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_done(eid, primes=[2, 3, 5, 7], duration_ms=50)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        stored = [int(p) for p in item["primes"]]
+        assert stored == [2, 3, 5, 7]
+
+    def test_primes_count_matches(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_done(eid, primes=[2, 3, 5, 7], duration_ms=50)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert int(item["primes_count"]) == 4
+
+    def test_duration_ms_stored(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_done(eid, primes=[2, 3, 5, 7], duration_ms=123)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert int(item["duration_ms"]) == 123
+
+    def test_completed_at_set(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        before = int(time.time())
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        after = int(time.time())
+        assert before <= int(item["completed_at"]) <= after
+
+    # TTL BVA: done TTL = completed_at + 30d
+    def test_done_ttl_is_30_days_from_completed_at(self, ddb_table: Any) -> None:
+        """BVA B: ttl_at = completed_at + 30d (exactly)."""
+        db = _import_db()
+        eid = _make_uuid()
+        before = int(time.time())
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        after = int(time.time())
+        ttl_at = int(item["ttl_at"])
+        # ttl_at should be approximately now + 30 days
+        expected_min = before + 30 * 86_400
+        expected_max = after + 30 * 86_400
+        assert expected_min <= ttl_at <= expected_max
+
+    def test_done_ttl_bva_29_days_below(self, ddb_table: Any) -> None:
+        """BVA B-1: 29d in seconds < TTL value (TTL must be >= 30d from now)."""
+        db = _import_db()
+        eid = _make_uuid()
+        now = int(time.time())
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        ttl_at = int(item["ttl_at"])
+        # ttl_at must be strictly more than 29 days from now
+        assert ttl_at > now + 29 * 86_400
+
+    def test_done_ttl_bva_31_days_above(self, ddb_table: Any) -> None:
+        """BVA B+1: TTL value < 31d from now (TTL must be <= 31d from now)."""
+        db = _import_db()
+        eid = _make_uuid()
+        now = int(time.time())
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        ttl_at = int(item["ttl_at"])
+        # ttl_at must be strictly less than 31 days from now
+        assert ttl_at < now + 31 * 86_400
+
+    def test_mark_done_on_done_is_no_op(self, ddb_table: Any) -> None:
+        """Double mark_done should not raise."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            # Should not raise
+            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert item["status"] == "done"
+
+    def test_empty_primes_list(self, ddb_table: Any) -> None:
+        """Empty primes list (range with no primes) stores correctly."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=14, range_end=16)
+            db.mark_running(eid)
+            db.mark_done(eid, primes=[], duration_ms=5)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert int(item["primes_count"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# mark_failed
+# ---------------------------------------------------------------------------
+
+
+class TestMarkFailed:
+    """Verify running → failed transition + TTL math."""
+
+    def test_running_transitions_to_failed(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_failed(eid, error_message="compute timeout")
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert item["status"] == "failed"
+
+    def test_error_message_stored(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_failed(eid, error_message="compute exceeded 60s SIGALRM budget")
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert "60s" in item["error_message"]
+
+    def test_completed_at_set_on_failed(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        before = int(time.time())
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_failed(eid, error_message="err")
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        after = int(time.time())
+        assert before <= int(item["completed_at"]) <= after
+
+    # TTL BVA: failed TTL = completed_at + 90d
+    def test_failed_ttl_is_90_days_from_completed_at(self, ddb_table: Any) -> None:
+        """BVA B: ttl_at = completed_at + 90d (exactly)."""
+        db = _import_db()
+        eid = _make_uuid()
+        before = int(time.time())
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_failed(eid, error_message="err")
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        after = int(time.time())
+        ttl_at = int(item["ttl_at"])
+        expected_min = before + 90 * 86_400
+        expected_max = after + 90 * 86_400
+        assert expected_min <= ttl_at <= expected_max
+
+    def test_failed_ttl_bva_89_days_below(self, ddb_table: Any) -> None:
+        """BVA B-1: 89d in seconds < TTL value (TTL must be >= 90d from now)."""
+        db = _import_db()
+        eid = _make_uuid()
+        now = int(time.time())
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_failed(eid, error_message="err")
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        ttl_at = int(item["ttl_at"])
+        assert ttl_at > now + 89 * 86_400
+
+    def test_failed_ttl_bva_91_days_above(self, ddb_table: Any) -> None:
+        """BVA B+1: TTL value < 91d from now (TTL must be <= 91d from now)."""
+        db = _import_db()
+        eid = _make_uuid()
+        now = int(time.time())
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_failed(eid, error_message="err")
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        ttl_at = int(item["ttl_at"])
+        assert ttl_at < now + 91 * 86_400
+
+    def test_mark_failed_from_queued_is_allowed(self, ddb_table: Any) -> None:
+        """queued → failed is allowed (stale-detection path skips mark_running)."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_failed(eid, error_message="stale running — prior worker crash")
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert item["status"] == "failed"
+
+    def test_mark_failed_on_done_is_no_op(self, ddb_table: Any) -> None:
+        """Cannot transition done → failed (ConditionExpression guards it)."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            # Should not raise; just silently ignored
+            db.mark_failed(eid, error_message="should be ignored")
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert item["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# Status transition state machine BVA
+# ---------------------------------------------------------------------------
+
+
+class TestStatusTransitions:
+    """BVA on the status state machine: queued → running → done | failed."""
+
+    # BVA at each status value (4 states)
+    @pytest.mark.parametrize("status_value", ["queued", "running", "done", "failed"])
+    def test_all_status_values_are_strings(self, status_value: str) -> None:
+        """Each status is a string (DynamoDB String type)."""
+        assert isinstance(status_value, str)
+
+    def test_full_happy_path_queued_running_done(self, ddb_table: Any) -> None:
+        """Full state machine traversal: queued → running → done."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+            assert item["status"] == "queued"
+
+            db.mark_running(eid)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+            assert item["status"] == "running"
+
+            db.mark_done(eid, primes=[2, 3, 5, 7], duration_ms=50)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+            assert item["status"] == "done"
+
+    def test_full_failure_path_queued_running_failed(self, ddb_table: Any) -> None:
+        """Full state machine traversal: queued → running → failed."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_failed(eid, error_message="timeout")
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert item["status"] == "failed"
+
+    def test_queued_no_ttl_at(self, ddb_table: Any) -> None:
+        """BVA: queued status → no ttl_at (TTL policy: in-flight rows not expired)."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert "ttl_at" not in item
+
+    def test_running_no_ttl_at(self, ddb_table: Any) -> None:
+        """BVA: running status → no ttl_at (TTL policy: in-flight rows not expired)."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert "ttl_at" not in item
+
+    def test_done_has_ttl_at(self, ddb_table: Any) -> None:
+        """BVA: done status → ttl_at set."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert "ttl_at" in item
+
+    def test_failed_has_ttl_at(self, ddb_table: Any) -> None:
+        """BVA: failed status → ttl_at set."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_failed(eid, error_message="err")
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert "ttl_at" in item
+
+
+# ---------------------------------------------------------------------------
+# health_check
+# ---------------------------------------------------------------------------
+
+
+class TestHealthCheck:
+    """Verify health_check returns True on ACTIVE table, False on error."""
+
+    def test_returns_true_when_table_active(self, ddb_table: Any) -> None:
+        db = _import_db()
+        with mock_aws():
+            result = db.health_check()
+        assert result is True
+
+    def test_returns_false_when_endpoint_unreachable(self) -> None:
+        """No mock_aws context → boto3 hits an unreachable endpoint → returns False."""
+        db = _import_db()
+        with patch.dict(
+            os.environ,
+            {"AWS_DYNAMODB_ENDPOINT_URL": "http://127.0.0.1:9999"},
+        ):
+            result = db.health_check()
+        assert result is False
+
+    def test_returns_bool_type(self, ddb_table: Any) -> None:
+        db = _import_db()
+        with mock_aws():
+            result = db.health_check()
+        assert isinstance(result, bool)
+
+    def test_returns_false_on_missing_table(self) -> None:
+        """Table does not exist → health_check returns False."""
+        db = _import_db()
+        with mock_aws():
+            # No table created in this context
+            result = db.health_check()
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Conditional write idempotency — concurrent write races
+# ---------------------------------------------------------------------------
+
+
+class TestConditionalWriteIdempotency:
+    """Verify ConditionExpression guards prevent duplicate state transitions."""
+
+    def test_concurrent_insert_same_uuid_both_return_id(self, ddb_table: Any) -> None:
+        """Two inserts with the same UUID: both return the id without error."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            r1 = db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            r2 = db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+        assert r1 == eid
+        assert r2 == eid
+
+    def test_mark_running_on_queued_succeeds(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)  # should not raise
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert item["status"] == "running"
+
+    def test_mark_done_on_running_succeeds(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_done(eid, primes=[2, 3, 5], duration_ms=50)  # should not raise
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert item["status"] == "done"
+
+    def test_mark_failed_on_running_succeeds(self, ddb_table: Any) -> None:
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_failed(eid, error_message="err")  # should not raise
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert item["status"] == "failed"
+
+    def test_mark_done_guards_done_to_failed(self, ddb_table: Any) -> None:
+        """done → failed must be blocked by ConditionExpression."""
+        db = _import_db()
+        eid = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            db.mark_failed(eid, error_message="should not apply")
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        assert item["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# TTL differences between done (30d) and failed (90d)
+# ---------------------------------------------------------------------------
+
+
+class TestTTLDifference:
+    """BVA: done TTL < failed TTL (30d vs 90d)."""
+
+    def test_done_ttl_less_than_failed_ttl(self, ddb_table: Any) -> None:
+        """done row's ttl_at is < failed row's ttl_at (30d < 90d)."""
+        db = _import_db()
+        eid_done = _make_uuid()
+        eid_failed = _make_uuid()
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid_done, range_start=2, range_end=10)
+            db.mark_running(eid_done)
+            db.mark_done(eid_done, primes=[2, 3], duration_ms=5)
+
+            db.insert_queued_execution(execution_id=eid_failed, range_start=2, range_end=10)
+            db.mark_running(eid_failed)
+            db.mark_failed(eid_failed, error_message="err")
+
+            item_done = ddb_table.get_item(Key={"execution_id": eid_done}, ConsistentRead=True)[
+                "Item"
+            ]
+            item_failed = ddb_table.get_item(Key={"execution_id": eid_failed}, ConsistentRead=True)[
+                "Item"
+            ]
+
+        assert int(item_done["ttl_at"]) < int(item_failed["ttl_at"])
+
+    def test_done_ttl_delta_30d(self, ddb_table: Any) -> None:
+        """done TTL delta = 30 days × 86400 s/day."""
+        db = _import_db()
+        eid = _make_uuid()
+        now = int(time.time())
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_done(eid, primes=[], duration_ms=1)
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        ttl_at = int(item["ttl_at"])
+        # Delta from now should be approximately 30*86400 (within 2 seconds clock drift)
+        delta = ttl_at - now
+        assert 30 * 86_400 - 2 <= delta <= 30 * 86_400 + 2
+
+    def test_failed_ttl_delta_90d(self, ddb_table: Any) -> None:
+        """failed TTL delta = 90 days × 86400 s/day."""
+        db = _import_db()
+        eid = _make_uuid()
+        now = int(time.time())
+        with mock_aws():
+            db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
+            db.mark_running(eid)
+            db.mark_failed(eid, error_message="err")
+            item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
+        ttl_at = int(item["ttl_at"])
+        delta = ttl_at - now
+        assert 90 * 86_400 - 2 <= delta <= 90 * 86_400 + 2

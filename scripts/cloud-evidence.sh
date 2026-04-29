@@ -5,7 +5,7 @@
 # irreversible — every dashboard / log line / handshake must be captured BEFORE
 # 'make cloud-down'. This script automates the API-fetchable subset:
 #
-#   - 6 CloudWatch metric widget PNGs (SQS / ECS / ElastiCache / ALB / RDS)
+#   - 6 CloudWatch metric widget PNGs (SQS / ECS / ElastiCache / ALB / DynamoDB)
 #   - Worker CloudWatch log excerpts (last hour)
 #   - Bootstrap task CloudWatch log excerpts (idempotency proof)
 #   - terraform output (state-as-evidence)
@@ -18,7 +18,7 @@
 #     metrics/03-elasticache-bytes.png
 #     metrics/04-elasticache-ecpu.png
 #     metrics/05-alb-target-response-time.png
-#     metrics/06-rds-cpu.png
+#     metrics/06-ddb-throttles.png
 #     logs/worker.log
 #     logs/bootstrap.log
 #     terraform-output.json
@@ -109,7 +109,7 @@ section "1/6 — CloudWatch metric widgets (AWS-native services)"
 # corresponding metric dimension. Reading from outputs (rather than
 # reverse-engineering from ARNs / DNS strings) avoids the parsing bugs that
 # previously made 5/6 widgets empty:
-#   - RDS used hardcoded "aegis-enclave" but actual identifier was "aegis-enclave-pg"
+#   - DynamoDB uses TableName from terraform output (not hardcoded)
 #   - ElastiCache Serverless uses CacheName, NOT CacheClusterId
 #   - ALB needs "app/<name>/<id>" suffix, not the DNS-stripped name
 SQS_NAME=$(cd "$TF_DIR" && terraform output -raw sqs_primes_name 2>/dev/null || echo "")
@@ -118,7 +118,7 @@ WORKER_CLUSTER=$(cd "$TF_DIR" && terraform output -raw ecs_cluster_name 2>/dev/n
 VALKEY_NAME=$(cd "$TF_DIR" && terraform output -raw valkey_cache_name 2>/dev/null || echo "")
 ALB_ARN_SUFFIX=$(cd "$TF_DIR" && terraform output -raw alb_arn_suffix 2>/dev/null || echo "")
 TG_ARN_SUFFIX=$(cd "$TF_DIR" && terraform output -raw alb_target_group_arn_suffix 2>/dev/null || echo "")
-RDS_ID=$(cd "$TF_DIR" && terraform output -raw rds_instance_identifier 2>/dev/null || echo "")
+DDB_TABLE_NAME=$(cd "$TF_DIR" && terraform output -raw dynamodb_table_name 2>/dev/null || echo "")
 
 info "Resolved dimensions:"
 info "  SQS QueueName:                 ${SQS_NAME:-MISSING}"
@@ -127,14 +127,14 @@ info "  ECS ServiceName (worker):      ${WORKER_SVC:-MISSING}"
 info "  ElastiCache CacheName:         ${VALKEY_NAME:-MISSING}"
 info "  ALB LoadBalancer arn_suffix:   ${ALB_ARN_SUFFIX:-MISSING}"
 info "  ALB TargetGroup arn_suffix:    ${TG_ARN_SUFFIX:-MISSING}"
-info "  RDS DBInstanceIdentifier:      ${RDS_ID:-MISSING}"
+info "  DynamoDB TableName:            ${DDB_TABLE_NAME:-MISSING}"
 
 # Pre-flight discovery: list metrics that ACTUALLY exist for each namespace.
 # Helps debug empty widgets — if list-metrics returns nothing for a namespace,
 # the resource hasn't emitted metrics yet (insufficient time / no traffic),
 # distinct from a wrong-dimension bug.
 section "2/6 — Discovery dry-run (list-metrics per namespace)"
-for ns in AWS/SQS AWS/ECS AWS/ElastiCache AWS/ApplicationELB AWS/RDS; do
+for ns in AWS/SQS AWS/ECS AWS/ElastiCache AWS/ApplicationELB AWS/DynamoDB; do
     count=$(aws cloudwatch list-metrics --region "$REGION" --namespace "$ns" \
               --query 'Metrics | length(@)' --output text 2>/dev/null || echo "?")
     if [[ "$count" == "0" ]] || [[ "$count" == "?" ]]; then
@@ -197,17 +197,22 @@ else
     warn "skip 05: alb_arn_suffix / alb_target_group_arn_suffix output missing"
 fi
 
-# 06: RDS CPU (uses DBInstanceIdentifier from terraform output, not hardcoded)
-if [[ -n "$RDS_ID" ]]; then
-    capture_metric "06-rds-cpu.png" '{
+# 06: DynamoDB consumed RCU/WCU + ThrottledRequests (uses TableName from output)
+# RCU/WCU are Sum-stat metrics — total capacity units consumed in the period.
+# ThrottledRequests on yAxis=right because it's a count (not capacity), and a
+# spike there is the headline signal for an under-provisioned PAY_PER_REQUEST
+# table or a partition-key hot-spot.
+if [[ -n "$DDB_TABLE_NAME" ]]; then
+    capture_metric "06-ddb-throttles.png" '{
       "metrics":[
-        ["AWS/RDS","CPUUtilization","DBInstanceIdentifier","'"$RDS_ID"'",{"label":"CPU%"}],
-        [".","DatabaseConnections",".","'"$RDS_ID"'",{"label":"connections","yAxis":"right"}]
+        ["AWS/DynamoDB","ConsumedReadCapacityUnits","TableName","'"$DDB_TABLE_NAME"'",{"label":"RCU","stat":"Sum"}],
+        [".","ConsumedWriteCapacityUnits",".","'"$DDB_TABLE_NAME"'",{"label":"WCU","stat":"Sum"}],
+        [".","ThrottledRequests",".","'"$DDB_TABLE_NAME"'",{"label":"throttles","yAxis":"right","stat":"Sum"}]
       ],
-      "period":60,"stat":"Average","width":1024,"height":400,
-      "title":"RDS '"$RDS_ID"' — CPU + Connections"}'
+      "period":60,"stat":"Sum","width":1024,"height":400,
+      "title":"DynamoDB '"$DDB_TABLE_NAME"' — RCU/WCU + Throttles"}'
 else
-    warn "skip 06: rds_instance_identifier output missing"
+    warn "skip 06: dynamodb_table_name output missing"
 fi
 
 # ─── 4. CloudWatch log excerpts + cache-hit ground-truth counters ─────────

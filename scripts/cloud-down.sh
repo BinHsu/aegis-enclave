@@ -246,9 +246,10 @@ cat <<EOF
   What is NOT touched (collateral-free guarantee):
     - Other AWS resources in account $ACCOUNT_ID (different tags / different VPCs)
     - State backend bucket (if you used 'make tf-bootstrap' separately)
-    - Secrets Manager: RDS master password is on a 7-day deletion window per
-      RDS default; check 'aws secretsmanager list-secrets' if you want to
-      force-delete the scheduled-deletion entry sooner.
+    - DynamoDB Global Tables: when secondary_region is set, both replicas
+      are torn down by terraform destroy — no separate orphan resource to
+      chase. Tables are immediately deleted (no recovery window like RDS
+      final snapshot).
 
   Final cost check:
     aws ce get-cost-and-usage --time-period Start=\$(date -u -v-1d +%Y-%m-%d),End=\$(date -u +%Y-%m-%d) --granularity DAILY --metrics UnblendedCost

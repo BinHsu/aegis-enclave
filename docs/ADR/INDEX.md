@@ -1,13 +1,13 @@
 # ADR Index — read by goal, not by number
 
-41 ADRs is overwhelming for first-time onboarding. This index groups them by reader goal so you can pick the load-bearing ones for *your* purpose and skip the rest.
+42 ADRs is overwhelming for first-time onboarding. This index groups them by reader goal so you can pick the load-bearing ones for *your* purpose and skip the rest.
 
 ## Pick your goal
 
 | Goal | Read | ~Time |
 |---|---|---|
-| **A. "I want to verify it works"** (run smoke + understand what passed) | Bands A + B-CORE below (4 ADRs) | 15 min |
-| **B. "I'm modifying / extending the architecture"** | A + B (full) (10 ADRs) | 45 min |
+| **A. "I want to verify it works"** (run smoke + understand what passed) | Bands A + B-CORE below (6 ADRs) | 20 min |
+| **B. "I'm modifying / extending the architecture"** | A + B (full) (11 ADRs) | 50 min |
 | **C. "Code review — I need to judge the engineering"** | A + B + C (~22 ADRs) | 90 min |
 | **D. "Forking for production deployment"** | All bands + skim superseded for context | 2-3 hrs |
 
@@ -23,12 +23,12 @@ If you are evaluating the repo against a senior-engineer rubric, here are the AD
 | **Timeout philosophy** | 0022, 0033, 0027 | 4-tier drain (app/ECS/ALB/SQS); SIGALRM 60s on CPU-bound; ALB idle 45s |
 | **Failure handling** | 0033, 0038, 0035 | Idempotent retry; DLQ alarm + manual triage (anti-auto-retry); bootstrap idempotency |
 | **Observability** | 0041, 0008, 0003 (+ design_doc § 3) | Tier 1 implemented: SLI via EMF + CloudWatch Dashboard + multi-window burn-rate alarms (Google SRE Workbook pattern) + optional SNS email. Tier 2 (AMG / AMP) + Tier 3 (X-Ray distributed tracing) deferred per ADR-0041 alternatives + deployment_guide § Production hardening |
-| **Scalability** | 0029, 0009, 0007, 0040 | SQS-depth-driven autoscale; Multi-AZ (3-AZ default per ADR-0007 reconsidered); production target = Frankfurt + Ireland multi-region (ADR-0040) |
-| **Decision documentation** | (this INDEX + every ADR's Status / Related field) | Nygard MADR; supersession chains (0002→0028→0034, 0020→0029/0031/0032, 0023→0029) |
-| **Calibration honesty** | 0003, 0013, 0015, 0034, 0037, 0038 | PoC scope + prod hygiene split; deliverable-not-demo; explicit anti-pattern analyses |
+| **Scalability** | 0029, 0009, 0007, 0040, 0042 | SQS-depth-driven autoscale; Multi-AZ (3-AZ default per ADR-0007 reconsidered); production target = Frankfurt + Ireland multi-region; ADR-0040 = Aurora migration path; ADR-0042 = DynamoDB Global Tables greenfield (active-active, DNS-only failover, RTO ~60-300s) |
+| **Decision documentation** | (this INDEX + every ADR's Status / Related field) | Nygard MADR; supersession chains (0002→0028→0034, 0020→0029/0031/0032, 0023→0029, 0009→0042 for greenfield) |
+| **Calibration honesty** | 0003, 0013, 0015, 0034, 0037, 0038, 0042 | PoC scope + prod hygiene split; deliverable-not-demo; explicit anti-pattern analyses; ADR-0042 documents why PG was mismatched for the workload and records the greenfield re-assessment honestly |
 | **Supply chain rigor** | 0039, 0036, 0016 | uv.lock + terraform exact-pin + `--provenance=false` ECR + signed-source defaults |
 | **Cost discipline** | 0006, 0015, 0024, 0027, 0031, 0032 (+ deployment_guide § Cost shape) | Per-component cost analysis; per-hour rates; FinOps scope honest |
-| **Security posture** | 0019, 0024, 0027, 0037 | Private-only VPC (no IGW/NAT); mTLS Client VPN; managed master password; rotation deferral path |
+| **Security posture** | 0019, 0024, 0027, 0037, 0042 | Private-only VPC (no IGW/NAT); mTLS Client VPN; managed master password; rotation deferral path; ADR-0042 adds DynamoDB endpoint via PrivateLink (same no-public-internet posture per ADR-0019) |
 | **Agent-executable runbooks** | 0012, 0014 (+ migration_runbook + scaling_runbook) | precondition / action / verify_cmd / on_failure / human_gate schema |
 | **Reproducibility from cold** | 0039, 0036, 0030 | Lock files; deterministic image tags; local↔cloud parity |
 | **Test rigor** | (CLAUDE.md § 8 + tests/) | BVA mandatory; branch coverage 95%; sympy differential; deterministic-seed fuzz |
@@ -61,14 +61,15 @@ These four set the scope, trade-off framework, and time budget that every other 
 | [0029](0029-async-post-sqs-worker-pool.md) | POST returns 202 + queue + worker pool (vs synchronous compute). Why the API, worker, and SQS resources exist |
 | [0031](0031-elasticache-serverless-valkey-zset-lua-coalescing.md) | ElastiCache Serverless Valkey + ZSET + Lua merge. The cache architecture |
 | [0033](0033-async-drain-semantics-sigalrm-sqs-redelivery.md) | Worker SIGALRM 60s + SQS visibility timeout 90s + how no-ack vs ack-after-fail decisions cascade |
+| [0042](0042-dynamodb-global-tables-greenfield-multi-region.md) | **Greenfield canonical target**: DynamoDB Global Tables active-active dual-region (Frankfurt + Ireland). Supersedes ADR-0009 for greenfield; ADR-0040 retained as Aurora migration path for existing-PG forkers |
 
 ### B (full architecture set)
 
 | ADR | What it decides |
 |---|---|
 | [0006](0006-vpn-three-tier-story.md) | Three VPN tiers: WireGuard local / Client VPN cloud / NetBird production-cross-cloud |
-| [0007](0007-single-region-multi-az.md) | Single region + Multi-AZ at PoC; multi-region triggers documented |
-| [0009](0009-db-topology-multi-az-standby.md) | RDS Multi-AZ synchronous standby (one-line free architectural credit) |
+| [0007](0007-single-region-multi-az.md) | Single region + Multi-AZ at PoC; multi-region triggers documented (superseded by ADR-0042 for greenfield multi-region target) |
+| [0009](0009-db-topology-multi-az-standby.md) | RDS Multi-AZ synchronous standby — case-study data layer (superseded by ADR-0042 for greenfield; retained for existing-PG migration path via ADR-0040) |
 | [0011](0011-topology-hub-and-spoke.md) | Network topology — single VPC with private subnets across two AZs |
 | [0017](0017-prime-computation-strategy.md) | The actual algorithm: 6k±1 small / sieve large / SIGALRM hard deadline |
 | [0018](0018-managed-default-tool-selection.md) | Why each AWS managed service: Client VPN (managed, IAM-integrated) over self-hosted, Secrets Manager over Vault, etc. |
@@ -85,7 +86,7 @@ These four set the scope, trade-off framework, and time budget that every other 
 |---|---|
 | [0008](0008-reliability-targets-slo-rto-rpo.md) | Stated SLOs / RTO / RPO targets and why they're set where they are |
 | [0022](0022-drain-semantics-four-tier.md) | Four-tier drain: app wait_for / ECS deregister 60s / ALB idle 45s / SQS visibility 90s |
-| [0035](0035-bootstrap-task-includes-schema-migration.md) | One-shot bootstrap ECS task carries both schema migration + cache seed (Phase 2.5 reconsidered: V2 must replace driver + split together, not one without the other) |
+| [0035](0035-bootstrap-task-includes-schema-migration.md) | One-shot bootstrap ECS task carries both schema migration + cache seed (Phase 2.5 reconsidered: V2 must replace driver + split together, not one without the other). Superseded by ADR-0042 for greenfield: DynamoDB tables are terraform-managed; bootstrap task role narrows to cache seed only |
 | [0036](0036-image-tag-git-sha-immutable-ecr.md) | Git-SHA image tagging + `--provenance=false --sbom=false` for IMMUTABLE-friendly deterministic ECR manifests |
 | [0038](0038-dlq-alarm-triage-not-auto-retry.md) | DLQ pattern: CloudWatch alarm + manual triage script, NOT auto-retry worker (anti-pattern analysis) |
 | [0041](0041-observability-amp-amg-not-grafana-cloud.md) | Observability backend: AWS-native CloudWatch SLI (EMF) + Dashboard + multi-window burn-rate alarms + opt-in SNS email. AMG / AMP / Grafana Cloud comparison records the V2 promotion paths |
@@ -114,7 +115,8 @@ These ADRs explicitly mark items deferred to V2 with the upgrade path documented
 |---|---|
 | [0037](0037-secrets-manager-rotation-deferred.md) | Secrets Manager rotation Lambda is V2 (Lambda + KMS coupling overhead). Manual rotation procedure documented; IAM database authentication is the preferred V2 upgrade |
 | [0038](0038-dlq-alarm-triage-not-auto-retry.md) | (Also in Band C-OPS.) `alarm_actions = []` is the case-study stance; SNS topic + email/Slack subscriber is the production add |
-| [0040](0040-multi-region-frankfurt-ireland-route53.md) | **Production target** — Frankfurt primary + Ireland standby with Route53 health-based failover. Case-study deliverable single-region per ADR-0007 budget; ADR-0040 documents the EU-only multi-region endpoint architecture (no CDN, no global database). Promotion path: `docs/scaling_runbook.md` |
+| [0040](0040-multi-region-frankfurt-ireland-route53.md) | **Aurora migration path** — Frankfurt primary + Ireland standby with Route53 health-based failover + Lambda-driven promotion. For forkers carrying an existing PostgreSQL/RDS investment. Read alongside ADR-0042: choose ADR-0040 if you have existing PG schema; choose ADR-0042 if greenfield. Superseded by ADR-0042 for greenfield. Promotion path: `docs/scaling_runbook.md` Phase A |
+| [0042](0042-dynamodb-global-tables-greenfield-multi-region.md) | **Greenfield production target** — DynamoDB Global Tables active-active (Frankfurt + Ireland), Route53 weighted 50/50. DNS-only failover (RTO ~60-300s), no Lambda automation, no promotion step. Supersedes ADR-0009 for greenfield; supersedes ADR-0040 for greenfield. Promotion path: `docs/scaling_runbook.md` Phase B |
 | [0041](0041-observability-amp-amg-not-grafana-cloud.md) | (Also in Band C-OPERATIONS.) Observability Tier 2 (AMG dashboards-as-code via `grafana/grafana` provider; AMP for Prometheus-native ingest) + Tier 3 (X-Ray distributed tracing with SQS message-attribute propagation) deferred. Tier 1 (CloudWatch SLI + Dashboard + alarms) ships in case-study. |
 
 ---
@@ -124,8 +126,10 @@ These ADRs explicitly mark items deferred to V2 with the upgrade path documented
 | ADR | Superseded by | Why preserved |
 |---|---|---|
 | [0002](0002-time-budget-15h.md) | [0028](0028-time-budget-revised-22h.md) → [0034](0034-build-budget-22-to-24h-l4-expansion.md) | Original time budget; supersession chain documents why the budget grew |
+| [0009](0009-db-topology-multi-az-standby.md) | [0042](0042-dynamodb-global-tables-greenfield-multi-region.md) for greenfield; [0040](0040-multi-region-frankfurt-ireland-route53.md) for existing-PG | Case-study data layer (RDS PG Multi-AZ). Preserved: case-study `main` branch still uses RDS; forkers must choose their migration path before supersession applies to them |
 | [0020](0020-unified-prime-cache-and-cost-estimator.md) | [0029](0029-async-post-sqs-worker-pool.md), [0031](0031-elasticache-serverless-valkey-zset-lua-coalescing.md), [0032](0032-cost-estimator-removed.md) | Original Phase-1 design; supersessions show how the architecture matured |
 | [0021](0021-cache-leveraging-compute-paths.md) | [0031](0031-elasticache-serverless-valkey-zset-lua-coalescing.md) | In-process unified monotonic cache; replaced by distributed Valkey cache |
+| [0035](0035-bootstrap-task-includes-schema-migration.md) | [0042](0042-dynamodb-global-tables-greenfield-multi-region.md) for greenfield schema migration role | Case-study bootstrap task carries schema migration + cache seed. For greenfield (DynamoDB tables terraform-managed), schema migration step disappears; bootstrap narrows to cache seed only |
 
 ## Cross-cycle / template ADRs (low forker load)
 

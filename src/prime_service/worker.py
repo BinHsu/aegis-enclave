@@ -15,6 +15,10 @@ Design:
     - SIGTERM grace (5s): set _shutdown flag; do not ack in-flight; SQS
       visibility timeout re-delivers after 90s.
 
+Data layer (ADR-0042):
+    DynamoDB replaces PostgreSQL. execution_id is a UUID4 string.
+    All DB helpers are synchronous boto3 calls; no asyncio.run() wrapping needed.
+
 SIGALRM rationale:
     Queue redelivery rescues the SQS message but NOT a stuck worker. A CPU-bound
     Python loop holds the GIL and has no OOM path. Only SIGALRM can interrupt
@@ -24,16 +28,17 @@ SIGALRM rationale:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import signal
 import time
 from datetime import UTC, datetime
+from decimal import Decimal
+from typing import Any
 
 import structlog
 
 from prime_service.cache import PrimeCache
-from prime_service.db import Execution, async_session_maker, get_execution
+from prime_service.db import get_execution, mark_done, mark_failed, mark_running
 from prime_service.metrics import emit_count, emit_latency_ms
 from prime_service.primes import sieve_with_timeout
 from prime_service.queue import PrimeQueue
@@ -74,80 +79,18 @@ def _handle_sigterm(signum: int, frame: object) -> None:
 signal.signal(signal.SIGTERM, _handle_sigterm)
 
 
-# ─── Sync DB helpers (run in asyncio) ─────────────────────────────────────────
-
-
-async def _get_exec(execution_id: int) -> Execution | None:
-    async with async_session_maker() as session:
-        return await get_execution(session, execution_id)
-
-
-async def _mark_running(execution_id: int) -> None:
-    from sqlalchemy import update
-
-    from prime_service.db import engine
-
-    async with engine.begin() as conn:
-        await conn.execute(
-            update(Execution)
-            .where(Execution.id == execution_id)
-            .values(status=Status.running.value, started_at=datetime.now(UTC))
-        )
-
-
-async def _mark_done(execution_id: int, primes: list[int], duration_ms: int) -> None:
-    from sqlalchemy import update
-
-    from prime_service.db import engine
-
-    async with engine.begin() as conn:
-        await conn.execute(
-            update(Execution)
-            .where(Execution.id == execution_id)
-            .values(
-                status=Status.done.value,
-                primes=primes,
-                primes_count=len(primes),
-                duration_ms=duration_ms,
-                completed_at=datetime.now(UTC),
-                error_message=None,
-            )
-        )
-
-
-async def _mark_failed(execution_id: int, error_message: str) -> None:
-    from sqlalchemy import update
-
-    from prime_service.db import engine
-
-    async with engine.begin() as conn:
-        await conn.execute(
-            update(Execution)
-            .where(Execution.id == execution_id)
-            .values(
-                status=Status.failed.value,
-                error_message=error_message,
-                completed_at=datetime.now(UTC),
-            )
-        )
-
-
-def _run_async(coro: object) -> object:
-    """Run a coroutine in a fresh event loop (worker is sync)."""
-    return asyncio.run(coro)  # type: ignore[arg-type]
-
-
 # ─── Message handler ──────────────────────────────────────────────────────────
 
 
 def handle_message(
-    message: dict,  # type: ignore[type-arg]
+    message: dict[str, Any],
     queue: PrimeQueue,
     cache: PrimeCache,
 ) -> None:
     """Process one SQS message through the idempotency + compute + cache pipeline."""
     body = PrimeQueue.parse_body(message)
-    execution_id: int = int(body["execution_id"])
+    # execution_id is a UUID4 string in the DynamoDB pivot (ADR-0042).
+    execution_id: str = str(body["execution_id"])
     start: int = int(body["start"])
     end: int = int(body["end"])
 
@@ -159,8 +102,8 @@ def handle_message(
     try:
         log.info("message_received", start=start, end=end)
 
-        # ── Idempotency check ──
-        row: Execution | None = _run_async(_get_exec(execution_id))  # type: ignore[assignment]
+        # ── Idempotency check (ConsistentRead=True in get_execution) ──
+        row: dict[str, Any] | None = get_execution(execution_id)
 
         if row is None:
             # Row missing — ack and skip (orphaned message)
@@ -168,26 +111,30 @@ def handle_message(
             queue.ack(message)
             return
 
-        if row.status == Status.done.value:
+        row_status: str = row["status"]
+
+        if row_status == Status.done.value:
             log.info("already_done")
             queue.ack(message)
             return
 
-        if row.status == Status.running.value:
+        if row_status == Status.running.value:
             # Check if stale (prior worker crashed)
-            if row.started_at is not None:
-                age_s = (datetime.now(UTC) - row.started_at).total_seconds()
+            started_at_raw = row.get("started_at")
+            if started_at_raw is not None:
+                started_at_epoch = int(started_at_raw)
+                now_epoch = int(datetime.now(UTC).timestamp())
+                age_s = now_epoch - started_at_epoch
                 if age_s <= _RUNNING_STALE_THRESHOLD_S:
                     # Another worker is actively computing — skip without ack.
-                    # SQS visibility timeout will re-deliver if that worker dies.
                     log.info("running_not_stale", age_s=age_s)
                     return
             # Stale running: mark failed, then fall through to fresh compute.
             log.warning("running_stale")
-            _run_async(_mark_failed(execution_id, "stale running — prior worker crash"))
+            mark_failed(execution_id, error_message="stale running — prior worker crash")
 
         # ── Mark running ──
-        _run_async(_mark_running(execution_id))
+        mark_running(execution_id)
         started = time.perf_counter()
 
         # ── Cache-first: try to serve from Valkey ──
@@ -195,12 +142,9 @@ def handle_message(
             cached = cache.get_covering_slice(start, end)
             if cached is not None:
                 duration_ms = int((time.perf_counter() - started) * 1000)
-                _run_async(_mark_done(execution_id, cached, duration_ms))
+                mark_done(execution_id, primes=cached, duration_ms=duration_ms)
                 queue.ack(message)
                 log.info("cache_hit", count=len(cached), duration_ms=duration_ms)
-                # SLI emission — cache_hit_count + poll_to_done duration on hit
-                # path. cache_hit_ratio = hit_count / (hit_count + miss_count)
-                # is computed in the SLO dashboard / alarm.
                 emit_count("cache_hit_count")
                 emit_latency_ms("poll_to_done_ms", float(duration_ms))
                 return
@@ -216,21 +160,21 @@ def handle_message(
             err = f"compute exceeded 60s SIGALRM budget: {exc}"
             log.error("compute_timeout", error=err)
             emit_count("compute_errors", error_class="timeout")
-            _run_async(_mark_failed(execution_id, err))
+            mark_failed(execution_id, error_message=err)
             queue.ack(message)
             return
         except ValueError as exc:
             err = f"validation error: {exc}"
             log.error("compute_validation_error", error=err)
             emit_count("compute_errors", error_class="validation")
-            _run_async(_mark_failed(execution_id, err))
+            mark_failed(execution_id, error_message=err)
             queue.ack(message)
             return
         except Exception as exc:  # noqa: BLE001
             err = f"unexpected error: {type(exc).__name__}: {exc}"
             log.error("compute_error", error=err)
             emit_count("compute_errors", error_class="generic")
-            _run_async(_mark_failed(execution_id, err))
+            mark_failed(execution_id, error_message=err)
             queue.ack(message)
             return
 
@@ -245,11 +189,9 @@ def handle_message(
             # Cache write errors are non-fatal; result is still persisted to DB.
 
         # ── Update audit record ──
-        _run_async(_mark_done(execution_id, primes, duration_ms))
+        mark_done(execution_id, primes=primes, duration_ms=duration_ms)
         queue.ack(message)
         log.info("compute_done", count=len(primes), duration_ms=duration_ms)
-        # SLI emission — cache_miss_count + compute_duration_ms (latency
-        # histogram on the compute path) + poll_to_done_ms (end-to-end SLO).
         emit_count("cache_miss_count")
         emit_latency_ms("compute_duration_ms", float(duration_ms))
         emit_latency_ms("poll_to_done_ms", float(duration_ms))
@@ -285,6 +227,10 @@ def run_worker() -> None:
                 # Do NOT ack — let SQS re-deliver after visibility timeout.
 
     log.info("worker_stopped")
+
+
+# Unused import kept for Decimal in module scope (used in type hints via db.py)
+_Decimal = Decimal  # noqa: F841
 
 
 if __name__ == "__main__":

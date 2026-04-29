@@ -2,11 +2,24 @@
 #
 # Defaults are case-study-shaped: single region, single environment tag,
 # placeholder cost-center / owner. Phase 1 build can override per workspace.
+#
+# Pivot branch: ADR-0042 greenfield DynamoDB Global Tables target. RDS-related
+# variables removed; secondary-region + DynamoDB variables added.
 
 variable "region" {
-  description = "AWS region — single-region eu-central-1 per ADR-0007"
+  description = "Primary AWS region; ADR-0042 greenfield primary, default Frankfurt"
   type        = string
   default     = "eu-central-1"
+}
+
+variable "secondary_region" {
+  description = "Secondary region for DDB Global Tables active-active replica + multi-region infra. Empty = single-region scope."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.secondary_region == "" || can(regex("^[a-z]{2}-[a-z]+-[0-9]+$", var.secondary_region))
+    error_message = "secondary_region must be empty or a valid AWS region pattern (e.g. eu-west-1)."
+  }
 }
 
 variable "environment" {
@@ -28,19 +41,49 @@ variable "owner" {
 }
 
 variable "vpc_cidr" {
-  description = "VPC CIDR for aegis-enclave"
+  description = "VPC CIDR for aegis-enclave (primary region)"
   type        = string
   default     = "10.0.0.0/16"
 }
 
+variable "secondary_vpc_cidr" {
+  description = "VPC CIDR for secondary region (avoid overlap with primary 10.0.0.0/16)"
+  type        = string
+  default     = "10.10.0.0/16"
+}
+
+variable "dynamodb_table_name" {
+  description = "DynamoDB table name for executions (ADR-0042). Used by app/worker via DYNAMODB_TABLE_NAME env var."
+  type        = string
+  default     = "aegis-enclave-executions"
+}
+
+variable "route53_zone_name" {
+  description = "Existing Route53 hosted zone name (e.g. enclave.example.com). Forker provides; multi-region scope uses it for weighted A records. Empty = no Route53 wiring."
+  type        = string
+  default     = ""
+}
+
 variable "server_cert_arn" {
-  description = "ACM certificate ARN for Client VPN endpoint server cert"
+  description = "ACM certificate ARN for Client VPN endpoint server cert (primary region)"
   type        = string
   default     = "" # Phase 1 fills in via separate ACM provisioning step
 }
 
 variable "client_cert_arn" {
-  description = "ACM certificate ARN for the Client VPN root CA (mutual-TLS authentication)"
+  description = "ACM certificate ARN for the Client VPN root CA - mutual-TLS authentication (primary region)"
+  type        = string
+  default     = ""
+}
+
+variable "secondary_server_cert_arn" {
+  description = "ACM certificate ARN for Client VPN endpoint server cert in secondary region. Required when secondary_region != ''."
+  type        = string
+  default     = ""
+}
+
+variable "secondary_client_cert_arn" {
+  description = "ACM certificate ARN for the Client VPN root CA in secondary region. Required when secondary_region != ''."
   type        = string
   default     = ""
 }

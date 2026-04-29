@@ -28,15 +28,16 @@
 #   AWS_PROFILE=corp make tfvars-init      # explicit profile
 #
 # Usage — CI / batch (env var override per prompt; convention TF_<UPPER>):
-#   TF_REGION=eu-west-1 \
+#   TF_REGION=eu-central-1 \
+#   TF_SECONDARY_REGION=eu-west-1 \
 #   TF_OWNER=ci-runner \
-#   TF_VPC_CIDR=10.10.0.0/16 \
+#   TF_VPC_CIDR=10.0.0.0/16 \
 #   TF_WORKER_MAX=5 \
 #   ./scripts/tfvars-init.sh --batch
 #
 # Env vars supported (uppercase prefix TF_, override prompt + default):
-#   TF_REGION, TF_ENVIRONMENT, TF_COST_CENTER, TF_OWNER, TF_VPC_CIDR,
-#   TF_ALB_HOSTNAME, TF_WORKER_MIN, TF_WORKER_MAX, TF_ALARM_EMAIL
+#   TF_REGION, TF_SECONDARY_REGION, TF_ENVIRONMENT, TF_COST_CENTER, TF_OWNER,
+#   TF_VPC_CIDR, TF_ALB_HOSTNAME, TF_WORKER_MIN, TF_WORKER_MAX, TF_ALARM_EMAIL
 #
 # Called automatically by cloud-up.sh when terraform.tfvars is missing.
 
@@ -258,10 +259,16 @@ validate_email_or_empty() {
     [[ -z "$1" ]] || [[ "$1" =~ ^[^@]+@[^@]+\.[^@]+$ ]]
 }
 
+validate_aws_region_or_empty() {
+    # Empty is valid (means: single-region scope; secondary infra disabled).
+    # Non-empty must match AWS region format (e.g., eu-west-1, us-east-2).
+    [[ -z "$1" ]] || [[ "$1" =~ ^[a-z]{2}-[a-z]+-[0-9]+$ ]]
+}
+
 # ─── Q&A: region (validated) ───────────────────────────────────────────────
 section "Region"
 while true; do
-    ask REGION "AWS region" "eu-central-1"
+    ask REGION "Primary region (Frankfurt default; primary cloud region for VPC + workers)" "eu-central-1"
     set +e
     validate_region "$REGION"
     rc=$?
@@ -273,6 +280,21 @@ while true; do
         2) fail "Cannot validate region — API call failed. See stderr above for missing IAM permission.
 For batch / CI: grant ec2:DescribeRegions to the runner role." ;;
     esac
+done
+
+# ─── Q&A: secondary region (optional; empty = single-region scope) ─────────
+while true; do
+    ask SECONDARY_REGION "Secondary region (Ireland; leave empty for single-region scope)" "eu-west-1"
+    if validate_aws_region_or_empty "$SECONDARY_REGION"; then
+        if [[ -z "$SECONDARY_REGION" ]]; then
+            ok "secondary_region empty — single-region scope (Global Tables replica + secondary infra disabled)"
+        else
+            ok "secondary_region = $SECONDARY_REGION"
+        fi
+        break
+    fi
+    batch_fail_or_retry SECONDARY_REGION "$SECONDARY_REGION" \
+        "not a valid AWS region format (expected e.g. eu-west-1, or empty for single-region)"
 done
 
 # ─── Q&A: tags (free text) ─────────────────────────────────────────────────
@@ -368,6 +390,7 @@ cat > "$TFVARS" <<EOF
 # cert-arns.auto.tfvars by scripts/cloud-up.sh.
 
 region                = "$REGION"
+secondary_region      = "$SECONDARY_REGION"
 environment           = "$ENVIRONMENT"
 cost_center           = "$COST_CENTER"
 owner                 = "$OWNER"

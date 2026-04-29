@@ -9,7 +9,7 @@ Design:
       re-delivers if the worker crashes mid-compute without explicit ack.
 
 Message schema (JSON body):
-    {"execution_id": <int>, "start": <int>, "end": <int>}
+    {"execution_id": <str UUID4>, "start": <int>, "end": <int>}
 
 Thread-safety:
     The SQS client returned by boto3 is NOT thread-safe. The PrimeQueue class
@@ -64,7 +64,7 @@ class PrimeQueue:
             self._url = resp["QueueUrl"]
         return self._url
 
-    def enqueue(self, *, execution_id: int, start: int, end: int) -> str:
+    def enqueue(self, *, execution_id: str, start: int, end: int) -> str:
         """Send a job message; returns the SQS MessageId."""
         body = json.dumps({"execution_id": execution_id, "start": start, "end": end})
         resp = self._client.send_message(

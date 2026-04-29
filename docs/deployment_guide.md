@@ -25,91 +25,164 @@ Local-stack acceptance (Phase 1.5) only requires the README Prerequisites — no
 
 ## Cloud architecture
 
+Greenfield production target: dual-region active-active (ADR-0042). Both regions mirror the same private-VPC topology. The diagram below shows the per-region detail (subnets, VPC endpoints) alongside the cross-region wiring.
+
 ```mermaid
 graph TB
     Op[Operator / Authorised Client]
+    CB[Build environment<br/>CodeBuild / GHA / dev laptop<br/>public internet access]
 
-    subgraph BUILD[Build environment — separate VPC / account / dev machine, has public internet]
-        CB[CodeBuild / CI runner / Bin's laptop<br/>docker build, pip install from PyPI]
+    subgraph R53[Route53 — hosted zone api.enclave.example]
+        DNS[Weighted A records 50/50<br/>health check on /health<br/>TTL 60s]
     end
 
-    subgraph AWS[AWS — eu-central-1]
-        CVPN[Client VPN Endpoint<br/>10.20.0.0/16 client CIDR]
-        SQS[SQS — aegis-enclave-primes<br/>visibility 90s]
+    subgraph FRA[AWS eu-central-1 Frankfurt — VPC 10.0.0.0/16 private only no IGW no NAT]
+        CVPN_FRA[Client VPN Endpoint<br/>10.20.0.0/16 client CIDR<br/>mTLS]
+        SQS_FRA[SQS aegis-enclave-primes<br/>region-local visibility 90s]
 
-        subgraph VPC[VPC 10.0.0.0/16 — private only · no IGW · no NAT]
-            subgraph AZ1[AZ eu-central-1a]
-                Pri1[Private subnet<br/>10.0.1.0/24]
-                Db1[Database subnet<br/>10.0.201.0/24]
+        subgraph VPC_FRA[VPC private subnets]
+            subgraph AZ1F[eu-central-1a]
+                PRI1F[Private 10.0.1.0/24]
             end
-            subgraph AZ2[AZ eu-central-1b]
-                Pri2[Private subnet<br/>10.0.2.0/24]
-                Db2[Database subnet<br/>10.0.202.0/24]
+            subgraph AZ2F[eu-central-1b]
+                PRI2F[Private 10.0.2.0/24]
             end
-            subgraph AZ3[AZ eu-central-1c]
-                Pri3[Private subnet<br/>10.0.3.0/24]
-                Db3[Database subnet<br/>10.0.203.0/24]
+            subgraph AZ3F[eu-central-1c]
+                PRI3F[Private 10.0.3.0/24]
             end
 
-            ALB[Internal ALB<br/>HTTPS :443<br/>spans 3 AZs]
-            ECS_API[ECS Fargate<br/>app service :8000<br/>desired=3, one per AZ]
-            ECS_WK[ECS Fargate<br/>worker service<br/>min=3 max=9, one per AZ baseline]
-            ECS_BS[ECS Fargate<br/>bootstrap task<br/>one-shot]
-            VALKEY[(ElastiCache Serverless<br/>Valkey — ZSET cache)]
-            RDS[(RDS PostgreSQL<br/>Multi-AZ standby)]
+            ALB_FRA[Internal ALB HTTPS :443<br/>spans 3 AZs]
+            ECS_API_FRA[ECS Fargate app :8000<br/>desired=3 one per AZ]
+            ECS_WK_FRA[ECS Fargate worker<br/>min=3 max=9 SQS-depth autoscale]
+            ECS_BS_FRA[ECS Fargate bootstrap<br/>one-shot cache seed]
+            VK_FRA[(ElastiCache Serverless<br/>Valkey ZSET)]
+            DDB_FRA[(DynamoDB Global Tables<br/>replica eu-central-1)]
 
-            subgraph VPCE[VPC Endpoints — PrivateLink]
-                VEP[Interface endpoints<br/>ecr.api · ecr.dkr · secretsmanager<br/>logs · ecs · ecs-agent · ecs-telemetry · sts · sqs]
-                S3GW[S3 Gateway Endpoint<br/>ECR layer storage]
+            subgraph VPCE_FRA[VPC Endpoints PrivateLink]
+                VEP_FRA[Interface endpoints<br/>ecr.api ecr.dkr secretsmanager<br/>logs ecs ecs-agent ecs-telemetry<br/>sts sqs dynamodb]
+                S3GW_FRA[S3 Gateway endpoint<br/>ECR layer storage]
             end
         end
 
-        subgraph BACKBONE[AWS Backbone — never on public internet]
-            ECR[ECR registry]
-            SM[Secrets Manager]
-            CWL[CloudWatch Logs]
+        subgraph BB_FRA[AWS backbone eu-central-1]
+            ECR_FRA[ECR registry]
+            SM_FRA[Secrets Manager]
+            CWL_FRA[CloudWatch Logs]
         end
     end
 
-    CB ==>|push image, IAM-authorised| ECR
+    subgraph IRE[AWS eu-west-1 Ireland — VPC 10.1.0.0/16 private only no IGW no NAT]
+        CVPN_IRE[Client VPN Endpoint<br/>10.21.0.0/16 client CIDR<br/>mTLS]
+        SQS_IRE[SQS aegis-enclave-primes<br/>region-local visibility 90s]
 
-    Op -. mTLS tunnel .-> CVPN
-    CVPN --> ALB
-    ALB --> ECS_API
-    ECS_API --> RDS
-    ECS_API --> SQS
-    SQS --> ECS_WK
-    ECS_WK --> VALKEY
-    ECS_WK --> RDS
-    ECS_BS -.seed on deploy.-> VALKEY
-    ECS_API -.via PrivateLink.-> VEP
-    ECS_WK -.via PrivateLink.-> VEP
-    VEP --> SM
-    VEP --> ECR
-    VEP --> CWL
-    ECS_API -.layer pull.-> S3GW
-    Pri1 -.failover.-> Pri2
-    Db1 -.sync replication.-> Db2
+        subgraph VPC_IRE[VPC private subnets]
+            subgraph AZ1I[eu-west-1a]
+                PRI1I[Private 10.1.1.0/24]
+            end
+            subgraph AZ2I[eu-west-1b]
+                PRI2I[Private 10.1.2.0/24]
+            end
+            subgraph AZ3I[eu-west-1c]
+                PRI3I[Private 10.1.3.0/24]
+            end
 
-    style CVPN fill:#e1f5fe,color:#000
-    style SQS fill:#fff9c4,color:#000
-    style ALB fill:#fff3e0,color:#000
-    style ECS_API fill:#e8f5e9,color:#000
-    style ECS_WK fill:#e8f5e9,color:#000
-    style ECS_BS fill:#f3e5f5,color:#000
-    style VALKEY fill:#e8f5e9,color:#000
-    style RDS fill:#fff3e0,color:#000
-    style VEP fill:#fce4ec,color:#000
-    style S3GW fill:#fce4ec,color:#000
-    style ECR fill:#f5f5f5,color:#000
-    style SM fill:#f5f5f5,color:#000
-    style CWL fill:#f5f5f5,color:#000
+            ALB_IRE[Internal ALB HTTPS :443<br/>spans 3 AZs]
+            ECS_API_IRE[ECS Fargate app :8000<br/>desired=3 one per AZ]
+            ECS_WK_IRE[ECS Fargate worker<br/>min=3 max=9 SQS-depth autoscale]
+            ECS_BS_IRE[ECS Fargate bootstrap<br/>one-shot cache seed]
+            VK_IRE[(ElastiCache Serverless<br/>Valkey ZSET)]
+            DDB_IRE[(DynamoDB Global Tables<br/>replica eu-west-1)]
+
+            subgraph VPCE_IRE[VPC Endpoints PrivateLink]
+                VEP_IRE[Interface endpoints<br/>ecr.api ecr.dkr secretsmanager<br/>logs ecs ecs-agent ecs-telemetry<br/>sts sqs dynamodb]
+                S3GW_IRE[S3 Gateway endpoint<br/>ECR layer storage]
+            end
+        end
+
+        subgraph BB_IRE[AWS backbone eu-west-1]
+            ECR_IRE[ECR registry mirror]
+            SM_IRE[Secrets Manager]
+            CWL_IRE[CloudWatch Logs]
+        end
+    end
+
+    CB ==>|push image IAM-authorised| ECR_FRA
+    ECR_FRA ==>|ECR replication| ECR_IRE
+
+    Op --> DNS
+    DNS -->|50% weighted| CVPN_FRA
+    DNS -->|50% weighted| CVPN_IRE
+
+    CVPN_FRA --> ALB_FRA
+    ALB_FRA --> ECS_API_FRA
+    ECS_API_FRA --> SQS_FRA
+    ECS_API_FRA --> DDB_FRA
+    SQS_FRA --> ECS_WK_FRA
+    ECS_WK_FRA --> VK_FRA
+    ECS_WK_FRA --> DDB_FRA
+    ECS_BS_FRA -.seed on deploy.-> VK_FRA
+    ECS_API_FRA -.via PrivateLink.-> VEP_FRA
+    ECS_WK_FRA -.via PrivateLink.-> VEP_FRA
+    VEP_FRA --> SM_FRA
+    VEP_FRA --> ECR_FRA
+    VEP_FRA --> CWL_FRA
+    ECS_API_FRA -.layer pull.-> S3GW_FRA
+
+    CVPN_IRE --> ALB_IRE
+    ALB_IRE --> ECS_API_IRE
+    ECS_API_IRE --> SQS_IRE
+    ECS_API_IRE --> DDB_IRE
+    SQS_IRE --> ECS_WK_IRE
+    ECS_WK_IRE --> VK_IRE
+    ECS_WK_IRE --> DDB_IRE
+    ECS_BS_IRE -.seed on deploy.-> VK_IRE
+    ECS_API_IRE -.via PrivateLink.-> VEP_IRE
+    ECS_WK_IRE -.via PrivateLink.-> VEP_IRE
+    VEP_IRE --> SM_IRE
+    VEP_IRE --> ECR_IRE
+    VEP_IRE --> CWL_IRE
+    ECS_API_IRE -.layer pull.-> S3GW_IRE
+
+    DDB_FRA <-->|active-active multi-master ~1s lag| DDB_IRE
+
+    style Op fill:#e1f5fe,color:#000
+    style DNS fill:#fff9c4,color:#000
+    style CVPN_FRA fill:#e1f5fe,color:#000
+    style CVPN_IRE fill:#e1f5fe,color:#000
+    style ALB_FRA fill:#fff3e0,color:#000
+    style ALB_IRE fill:#fff3e0,color:#000
+    style ECS_API_FRA fill:#e8f5e9,color:#000
+    style ECS_API_IRE fill:#e8f5e9,color:#000
+    style ECS_WK_FRA fill:#e8f5e9,color:#000
+    style ECS_WK_IRE fill:#e8f5e9,color:#000
+    style ECS_BS_FRA fill:#f3e5f5,color:#000
+    style ECS_BS_IRE fill:#f3e5f5,color:#000
+    style VK_FRA fill:#e8f5e9,color:#000
+    style VK_IRE fill:#e8f5e9,color:#000
+    style DDB_FRA fill:#fce4ec,color:#000
+    style DDB_IRE fill:#fce4ec,color:#000
+    style SQS_FRA fill:#fff9c4,color:#000
+    style SQS_IRE fill:#fff9c4,color:#000
+    style VEP_FRA fill:#fce4ec,color:#000
+    style VEP_IRE fill:#fce4ec,color:#000
+    style S3GW_FRA fill:#fce4ec,color:#000
+    style S3GW_IRE fill:#fce4ec,color:#000
+    style ECR_FRA fill:#f5f5f5,color:#000
+    style ECR_IRE fill:#f5f5f5,color:#000
+    style SM_FRA fill:#f5f5f5,color:#000
+    style SM_IRE fill:#f5f5f5,color:#000
+    style CWL_FRA fill:#f5f5f5,color:#000
+    style CWL_IRE fill:#f5f5f5,color:#000
     style CB fill:#fff9c4,color:#000
 ```
 
-**Network privacy posture (per ADR-0019)**: this VPC has **no Internet Gateway, no NAT, no public subnets**. Ingress is gated by AWS Client VPN endpoint (per ADR-0006); runtime egress to AWS APIs goes via VPC Endpoints (PrivateLink). The data plane never touches the public internet.
+**Network privacy posture (per ADR-0019)**: each VPC has **no Internet Gateway, no NAT, no public subnets**. Ingress is gated by AWS Client VPN endpoint (per ADR-0006); runtime egress to AWS APIs goes via VPC Endpoints (PrivateLink). The data plane never touches the public internet.
 
-**Build vs runtime separation**: image construction (`docker build`, `pip install` from PyPI) happens in a separate build environment with public-internet access — never inside this VPC. Cross-account ECR access is an IAM concern, not a networking one. The runtime VPC stays fully private regardless of how CI/CD evolves.
+**DynamoDB Global Tables active-active (per ADR-0042)**: both regions write to their local replica; multi-master replication propagates at ~1s lag. No promotion step on failover — Route53 health check + DNS TTL handle traffic shift; RTO ~60-300s DNS-dominated.
+
+**SQS is region-local**: messages are enqueued and consumed in the same region. No cross-region SQS bridging — processing locality is preserved per ADR-0042.
+
+**Build vs runtime separation**: image construction (`docker build`, `pip install` from PyPI) happens in a separate build environment with public-internet access — never inside either VPC. ECR replication carries the image from eu-central-1 to eu-west-1; the runtime VPCs stay fully private regardless of how CI/CD evolves.
 
 ## Components
 

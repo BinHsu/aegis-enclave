@@ -11,33 +11,21 @@ Strategy
 - Idempotency: already-present → skip without compute (put_if_absent not called).
 - Concurrent write guard: put_if_absent returns False → still exits 0.
 - Error propagation: cache.exists raises → exits 1.
+
+DynamoDB pivot (ADR-0042):
+    Schema migration (_ensure_schema / create_all) is REMOVED from bootstrap.
+    No fixture needed to mock it. Tests are simpler without that async overhead.
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 from prime_service.bootstrap import run_bootstrap
-from prime_service.cache import _BOOTSTRAP_END, _BOOTSTRAP_START
-
-
-@pytest.fixture(autouse=True)
-def _mock_ensure_schema() -> object:
-    """Patch out the async DB schema migration for all bootstrap tests.
-
-    `run_bootstrap` calls `asyncio.run(_ensure_schema())` before cache seeding.
-    Without this fixture, every test would try to connect to a real Postgres
-    (settings.database_url) and fail. Tests covering the schema migration
-    itself live in test_db.py / integration suite, not here.
-    """
-    with patch(
-        "prime_service.bootstrap._ensure_schema",
-        new=AsyncMock(return_value=None),
-    ):
-        yield
-
+from prime_service.cache import (
+    _BOOTSTRAP_END,
+    _BOOTSTRAP_START,
+)
 
 # ───────────────────────────────────────────────────────────────────────────
 # Constants BVA
@@ -333,3 +321,31 @@ class TestRunBootstrapReturnCodeBVA:
         cache = _mock_cache(exists_return=True)
         code = run_bootstrap(cache=cache)
         assert code >= 0
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Verify NO schema migration step (ADR-0042 supersedes ADR-0035)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestBootstrapNoDatabaseMigration:
+    """DynamoDB pivot: run_bootstrap must NOT call any DB schema migration."""
+
+    def test_no_schema_migration_called(self) -> None:
+        """run_bootstrap should complete without any DB create_all call."""
+        cache = _mock_cache(exists_return=True)
+        # If any DB migration function is accidentally imported/called,
+        # this would fail (via AttributeError or ImportError on the deleted
+        # SQLAlchemy symbols). The simplest proof: run_bootstrap completes without error.
+        result = run_bootstrap(cache=cache)
+        assert result == 0
+
+    def test_no_asyncio_run_in_bootstrap(self) -> None:
+        """No asyncio.run() needed in bootstrap now (no async DB migration)."""
+        import asyncio
+
+        cache = _mock_cache(exists_return=True)
+        with patch.object(asyncio, "run") as mock_asyncio_run:
+            run_bootstrap(cache=cache)
+        # asyncio.run should NOT be called in the new bootstrap
+        mock_asyncio_run.assert_not_called()

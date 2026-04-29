@@ -37,14 +37,14 @@ class PrimeRangeRequest(BaseModel):
 class PrimeRangeResponse(BaseModel):
     """202 Accepted response body for POST /primes (async path)."""
 
-    execution_id: int
+    execution_id: str
     status: Status = Status.queued
 
 
 class ExecutionResponse(BaseModel):
     """GET /primes/{exec_id} — current state of a job."""
 
-    id: int
+    id: str
     status: Status
     result: list[int] | None = None
     error_message: str | None = None
@@ -57,7 +57,7 @@ class HealthResponse(BaseModel):
 
 
 class ExecutionDetail(BaseModel):
-    id: int
+    id: str
     range_start: int
     range_end: int
     primes_count: int
