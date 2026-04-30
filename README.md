@@ -25,6 +25,7 @@ DEPLOYMENT SCOPE:
   Geographic pair:              eu-central-1 (Frankfurt) + eu-west-1 (Ireland), 50/50 active-active
   Data residency:               EU-jurisdictional (GDPR-clean; no SCC required for in-pair failover)
   Access pattern:               VPN-gated single-tenant (not public-facing SaaS)
+  Network isolation:            Private-only VPC + east-west SG matrix (ADR-0019)
   Region pair rationale:        ADR-0040 (selection criteria + rejected alternatives)
   Multi-region topology:        ADR-0042 (active-active 50/50 — multi-master rationale)
 
