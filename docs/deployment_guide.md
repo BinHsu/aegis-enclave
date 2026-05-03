@@ -303,7 +303,7 @@ Single-region → multi-region scaling lives in [`docs/scaling_runbook.md`](scal
 `make cloud-up` provisions the multi-region active-active stack against the operator's AWS account. After the stack is live, capture evidence before tearing down:
 
 - **`make cloud-smoke`** runs the 6-step smoke against the live VPN-connected endpoint (POST → poll → done → cache hit → schema rejection → backpressure). Pass criteria documented in [`README.md` § Initial Acceptance](../README.md#initial-acceptance-smoke-test).
-- **`make cloud-evidence`** captures CloudWatch metric widget PNGs via `aws cloudwatch get-metric-widget-image` (per ADR-0041 — the API path works even when org-level SCP blocks `cloudwatch:ListMetrics` Console access). Output lands in `evidence/<UTC-timestamp>/`.
+- **`make cloud-evidence`** captures CloudWatch metric widget PNGs via `aws cloudwatch get-metric-widget-image` (per ADR-0041 — the API path is canonical for evidence pipelines: scriptable, region-explicit, reproducible). Output lands in `evidence/<UTC-timestamp>/`.
 - **Worker + bootstrap CloudWatch logs** captured via `aws logs filter-log-events`. Evidence shows: `cache_miss → sieve_done → cache_write → db_update → sqs_ack` for first request; `cache_hit → db_update → sqs_ack` for subsequent overlapping requests.
 
 `make cloud-down` tears down collateral-free: VPC + Client VPN endpoints + ACM-imported certs + ECR repo + DynamoDB Global Tables replicas all removed. Verify post-destroy via the script's collateral-verify step.

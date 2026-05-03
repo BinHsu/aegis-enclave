@@ -605,12 +605,12 @@ Don't sed `dev tun` → `dev utun` — openvpn 2.6+ on macOS handles it internal
 **5. `make cloud-evidence` (~30 s)**
 
 Captures the API-fetchable evidence subset (per [memory feedback_phase25_screenshot_evidence](CLAUDE.md#10-adr-conventions)) into `evidence/<UTC-timestamp>/`:
-- 6 CloudWatch metric widget PNGs via `aws cloudwatch get-metric-widget-image` (which AWS-organisational SCPs typically allow, even when console-side `cloudwatch:ListMetrics` is denied — that latter denial is itself a positive production-shape signal)
+- 6 CloudWatch metric widget PNGs via `aws cloudwatch get-metric-widget-image` (canonical for evidence-pipeline reasons: scriptable, region-explicit, reproducible)
 - worker + bootstrap CloudWatch log excerpts (last hour)
 - `terraform output -json`
 - `summary.md` stub for browser-side screenshots + manual notes
 
-Reviewer-grade dashboard screenshots (browser, full chrome) remain optional manual supplements — when the operator's account SCP allows console access.
+Reviewer-grade dashboard screenshots (browser, full chrome) are optional manual supplements; the metric-widget PNG path above is canonical for evidence capture.
 
 **6. `make cloud-down` (~5-8 min)**
 
