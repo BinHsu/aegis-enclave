@@ -103,7 +103,7 @@ Each row traces back to a specific Terraform decision rather than standing as a 
 
 The following operations layers are deliberately deferred under ADR-0003 and ADR-0015. Naming them is itself a senior signal — the candidate knows what production-grade looks like end-to-end and is choosing what fits the brief's scope, not stopping where their knowledge ends.
 
-- **CI/CD pipeline** — no GitHub Actions / Jenkins / GitLab CI for build + deploy
+- **CI/CD apply pipeline** — GitHub Actions runs lint + tests (`ci.yml`) and PR-time `terraform plan` via OIDC ([ADR-0026](ADR/0026-pr-time-terraform-plan-via-oidc.md)); `terraform apply` is operator-initiated via `make cloud-up`, not CI-driven. Apply-on-merge with branch protection is the forker upgrade path in [`production_adoption.md` § OIDC apply at production scale](production_adoption.md#oidc-apply-at-production-scale).
 - **Observability stack** — no Prometheus, no Grafana, no Loki, no centralised log aggregation
 - **Distributed tracing** — no OpenTelemetry collector, no APM
 - **Load testing** — no k6 / Locust / synthetic-traffic baseline
