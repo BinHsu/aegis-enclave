@@ -272,7 +272,7 @@ resource "aws_dynamodb_table" "executions" {
 # ─── Container registry (ECR with scan-on-push + immutable tags) ───────────
 module "ecr" {
   source  = "terraform-aws-modules/ecr/aws"
-  version = "2.4.0" # exact pin (case-study reproducibility); was ~> 2.3
+  version = "3.2.0" # exact pin (case-study reproducibility); was ~> 2.3
 
   repository_name                 = "aegis-enclave"
   repository_image_tag_mutability = "IMMUTABLE"
