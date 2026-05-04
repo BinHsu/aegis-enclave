@@ -415,7 +415,7 @@ module "ecs" {
   # 5.11.x predates that change and accepts our standard module-output references.
   # Exact-pinned to 5.11.4 (case-study reproducibility) — registry could otherwise
   # tag 5.11.5 with a regression and silently break the next forker apply.
-  version = "5.11.4"
+  version = "7.5.0"
 
   cluster_name = "aegis-enclave"
 
