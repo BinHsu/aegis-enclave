@@ -8,14 +8,31 @@
 #     each var sourced from env var TF_<UPPER_NAME> if set, else default.
 #     Validation failures are FATAL (no retry).
 #
+# Region interface (ADR-0042): `platform_region` (the home region) + a
+# `regions` map keyed by AWS region name. Single-region scope = a one-entry
+# map; multi-region active-active = two entries (platform + one peer). Each
+# region carries its own vpc_cidr / vpn_client_cidr / cert ARNs.
+#
+# Cert ARNs are written as REGION-KEYED SENTINEL placeholders:
+#   server_cert_arn = "PENDING:server:<region>"
+#   client_cert_arn = "PENDING:client:<region>"
+# `terraform plan` type-checks these strings fine; scripts/cloud-up.sh does an
+# in-place sed substitution to the real ACM ARNs after it bootstraps the VPN
+# PKI per region. This replaces the old cert-arns.auto.tfvars file —
+# terraform.tfvars is now the single authoritative definition of `regions`.
+#
 # AWS-aware checks (require valid AWS_PROFILE + creds):
-#   - region:  must be in `aws ec2 describe-regions` (enabled in account)
+#   - region:  must be in `aws ec2 describe-regions` (enabled in account) —
+#              applied to platform_region AND the optional peer region
 #   - vpc_cidr: must NOT overlap any existing VPC CIDR in account+region
-#               (describe-vpcs CidrBlockAssociationSet). API failure → accept
-#               with warning in batch mode; yes/no prompt in interactive.
+#               (describe-vpcs CidrBlockAssociationSet), applied per region.
+#               API failure → accept with warning in batch mode; yes/no prompt
+#               in interactive.
 #
 # Sanity-only checks (no AWS call):
-#   - vpc_cidr format: valid IPv4 network notation (python3 ipaddress)
+#   - vpc_cidr / vpn_client_cidr format: valid IPv4 network notation
+#   - cross-region non-overlap: the two regions' VPC CIDRs and VPN pools must
+#     not collide with each other
 #   - alb_internal_hostname: valid RFC 1123 hostname
 #   - worker_min/max_count: positive integer; max ≥ min
 #
@@ -28,16 +45,21 @@
 #   AWS_PROFILE=corp make tfvars-init      # explicit profile
 #
 # Usage — CI / batch (env var override per prompt; convention TF_<UPPER>):
-#   TF_REGION=eu-central-1 \
-#   TF_SECONDARY_REGION=eu-west-1 \
+#   TF_PLATFORM_REGION=eu-central-1 \
+#   TF_PEER_REGION=eu-west-1 \
 #   TF_OWNER=ci-runner \
 #   TF_VPC_CIDR=10.0.0.0/16 \
+#   TF_VPN_CLIENT_CIDR=10.20.0.0/16 \
+#   TF_PEER_VPC_CIDR=10.10.0.0/16 \
+#   TF_PEER_VPN_CLIENT_CIDR=10.21.0.0/16 \
 #   TF_WORKER_MAX=5 \
 #   ./scripts/tfvars-init.sh --batch
 #
 # Env vars supported (uppercase prefix TF_, override prompt + default):
-#   TF_REGION, TF_SECONDARY_REGION, TF_ENVIRONMENT, TF_COST_CENTER, TF_OWNER,
-#   TF_VPC_CIDR, TF_ALB_HOSTNAME, TF_WORKER_MIN, TF_WORKER_MAX, TF_ALARM_EMAIL
+#   TF_PLATFORM_REGION, TF_PEER_REGION, TF_ENVIRONMENT, TF_COST_CENTER,
+#   TF_OWNER, TF_VPC_CIDR, TF_VPN_CLIENT_CIDR, TF_PEER_VPC_CIDR,
+#   TF_PEER_VPN_CLIENT_CIDR, TF_ALB_HOSTNAME, TF_WORKER_MIN, TF_WORKER_MAX,
+#   TF_ALARM_EMAIL
 #
 # Called automatically by cloud-up.sh when terraform.tfvars is missing.
 
@@ -244,6 +266,25 @@ if overlaps:
 PYEOF
 }
 
+cidrs_overlap() {
+    # Pure-local CIDR overlap check between two (or a list of) CIDRs.
+    # Usage: cidrs_overlap "10.0.0.0/16" "10.0.0.0/16 10.21.0.0/16 ..."
+    # Exit 0 = NO overlap; exit 1 = the first arg overlaps something in the rest.
+    local proposed="$1"
+    shift
+    local others="$*"
+    [[ -z "$others" ]] && return 0
+    python3 - "$proposed" "$others" <<'PYEOF'
+import sys, ipaddress
+proposed = ipaddress.ip_network(sys.argv[1], strict=False)
+others = sys.argv[2].split()
+hit = [c for c in others if proposed.overlaps(ipaddress.ip_network(c, strict=False))]
+if hit:
+    print(f"{sys.argv[1]} overlaps {', '.join(hit)}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+}
+
 validate_hostname() {
     # RFC 1123: labels are [a-z0-9]([-a-z0-9]*[a-z0-9])?, max 63 chars per label
     [[ "$1" =~ ^[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?)*$ ]]
@@ -265,35 +306,54 @@ validate_aws_region_or_empty() {
     [[ -z "$1" ]] || [[ "$1" =~ ^[a-z]{2}-[a-z]+-[0-9]+$ ]]
 }
 
-# ─── Q&A: region (validated) ───────────────────────────────────────────────
-section "Region"
+# ─── Q&A: platform region (validated) ──────────────────────────────────────
+# The new interface (ADR-0042): platform_region is the home region; regions is
+# a map. We collect the platform region first, then optionally a peer region;
+# each region's vpc_cidr + vpn_client_cidr are collected per region below.
+section "Region topology"
 while true; do
-    ask REGION "Primary region (Frankfurt default; primary cloud region for VPC + workers)" "eu-central-1"
+    ask PLATFORM_REGION "Platform (home) region — DynamoDB table + Route53 + Budget live here" "eu-central-1"
     set +e
-    validate_region "$REGION"
+    validate_region "$PLATFORM_REGION"
     rc=$?
     set -e
     case $rc in
-        0) ok "region '$REGION' enabled in account $ACCOUNT_ID"; break ;;
-        1) batch_fail_or_retry REGION "$REGION" \
-               "region '$REGION' not in 'aws ec2 describe-regions' (not enabled / typo)" ;;
+        0) ok "platform_region '$PLATFORM_REGION' enabled in account $ACCOUNT_ID"; break ;;
+        1) batch_fail_or_retry PLATFORM_REGION "$PLATFORM_REGION" \
+               "region '$PLATFORM_REGION' not in 'aws ec2 describe-regions' (not enabled / typo)" ;;
         2) fail "Cannot validate region — API call failed. See stderr above for missing IAM permission.
 For batch / CI: grant ec2:DescribeRegions to the runner role." ;;
     esac
 done
 
-# ─── Q&A: secondary region (optional; empty = single-region scope) ─────────
+# ─── Q&A: peer region (optional; empty = single-region scope) ──────────────
 while true; do
-    ask SECONDARY_REGION "Secondary region (Ireland; leave empty for single-region scope)" "eu-west-1"
-    if validate_aws_region_or_empty "$SECONDARY_REGION"; then
-        if [[ -z "$SECONDARY_REGION" ]]; then
-            ok "secondary_region empty — single-region scope (Global Tables replica + secondary infra disabled)"
-        else
-            ok "secondary_region = $SECONDARY_REGION"
+    ask PEER_REGION "Peer region for DDB Global Tables active-active (leave empty for single-region scope)" "eu-west-1"
+    if validate_aws_region_or_empty "$PEER_REGION"; then
+        if [[ -z "$PEER_REGION" ]]; then
+            ok "peer region empty — single-region scope (one-entry regions map)"
+            break
         fi
-        break
+        if [[ "$PEER_REGION" == "$PLATFORM_REGION" ]]; then
+            batch_fail_or_retry PEER_REGION "$PEER_REGION" \
+                "peer region must differ from platform_region ('$PLATFORM_REGION')"
+            continue
+        fi
+        # Validate it is an enabled region too.
+        set +e
+        validate_region "$PEER_REGION"
+        rc=$?
+        set -e
+        case $rc in
+            0) ok "peer region '$PEER_REGION' enabled — multi-region active-active scope"; break ;;
+            1) batch_fail_or_retry PEER_REGION "$PEER_REGION" \
+                   "region '$PEER_REGION' not in 'aws ec2 describe-regions' (not enabled / typo)" ;;
+            2) fail "Cannot validate peer region — API call failed. See stderr above.
+For batch / CI: grant ec2:DescribeRegions to the runner role." ;;
+        esac
+        continue
     fi
-    batch_fail_or_retry SECONDARY_REGION "$SECONDARY_REGION" \
+    batch_fail_or_retry PEER_REGION "$PEER_REGION" \
         "not a valid AWS region format (expected e.g. eu-west-1, or empty for single-region)"
 done
 
@@ -303,39 +363,86 @@ ask ENVIRONMENT "Environment tag" "case-study"
 ask COST_CENTER "Cost center tag" "engineering"
 ask OWNER "Owner tag (your name / handle / DL)" "$(whoami)"
 
-# ─── Q&A: VPC CIDR (validated for format + no overlap) ─────────────────────
-section "Network"
-while true; do
-    ask VPC_CIDR "VPC CIDR" "10.0.0.0/16"
-    if ! validate_cidr_format "$VPC_CIDR"; then
-        batch_fail_or_retry VPC_CIDR "$VPC_CIDR" "not a valid IPv4 network notation"
-        continue
-    fi
-    info "checking overlap against existing VPCs in $REGION..."
-    set +e
-    check_cidr_overlap "$VPC_CIDR" "$REGION"
-    rc=$?
-    set -e
-    case $rc in
-        0) ok "no CIDR overlap in $REGION"; break ;;
-        1) batch_fail_or_retry VPC_CIDR "$VPC_CIDR" \
-               "overlaps existing VPC CIDR in $REGION (try 10.10.0.0/16 / 172.20.0.0/16 / 192.168.100.0/24)" ;;
-        2) # AWS API failure. CI without AWS access should NOT run cloud-up — fail in batch.
-           if (( IS_BATCH )); then
-               fail "Cannot validate CIDR — describe-vpcs API failed. See stderr above for missing IAM permission.
+# ─── Per-region network CIDRs (format + AWS-overlap + cross-region) ─────────
+# ask_cidr <out_var> <env_var_name> <prompt> <default> <region> <other_cidrs>
+#   - validates IPv4 network format
+#   - if <region> non-empty: checks overlap against existing VPCs in that region
+#   - <other_cidrs> = space-separated CIDRs already chosen this run (cross-region
+#     + cross-pool collision guard); always enforced (pure-local, no AWS call)
+ask_cidr() {
+    local out_var="$1" env_name="$2" prompt="$3" default="$4" region="$5" others="$6"
+    local upper
+    upper=$(echo "$out_var" | tr '[:lower:]' '[:upper:]')
+    while true; do
+        ask "$out_var" "$prompt" "$default"
+        local val="${!out_var}"
+        if ! validate_cidr_format "$val"; then
+            batch_fail_or_retry "$out_var" "$val" "not a valid IPv4 network notation"
+            continue
+        fi
+        # Cross-region / cross-pool non-overlap (pure-local; always enforced).
+        set +e
+        cidrs_overlap "$val" $others
+        local lrc=$?
+        set -e
+        if [[ $lrc -ne 0 ]]; then
+            batch_fail_or_retry "$out_var" "$val" \
+                "$val collides with another CIDR chosen this run (regions / VPN pools must not overlap)"
+            continue
+        fi
+        # AWS describe-vpcs overlap (skipped if no region given, e.g. VPN pools
+        # are account-local-only — but VPC CIDRs do get the AWS check).
+        if [[ -z "$region" ]]; then
+            ok "$out_var = $val"
+            break
+        fi
+        info "checking overlap against existing VPCs in $region..."
+        set +e
+        check_cidr_overlap "$val" "$region"
+        local arc=$?
+        set -e
+        case $arc in
+            0) ok "$out_var = $val (no overlap in $region)"; break ;;
+            1) batch_fail_or_retry "$out_var" "$val" \
+                   "overlaps existing VPC CIDR in $region (try 10.10.0.0/16 / 172.20.0.0/16 / 192.168.100.0/24)" ;;
+            2) if (( IS_BATCH )); then
+                   fail "Cannot validate CIDR — describe-vpcs API failed. See stderr above for missing IAM permission.
 For batch / CI: grant ec2:DescribeVpcs to the runner role.
 (CI without AWS access must not run tfvars-init / cloud-up — see Bin 04/26 rule.)"
-           fi
-           warn "AWS API failed — cannot auto-validate CIDR. Accept anyway? [yes/no]"
-           read -r ack
-           if [[ "$ack" == "yes" ]]; then
-               ok "accepted '$VPC_CIDR' without API validation"
-               break
-           else
-               warn "re-prompting CIDR"
-           fi ;;
-    esac
-done
+               fi
+               warn "AWS API failed — cannot auto-validate CIDR. Accept anyway? [yes/no]"
+               read -r ack
+               if [[ "$ack" == "yes" ]]; then
+                   ok "accepted '$val' without API validation"
+                   break
+               else
+                   warn "re-prompting CIDR"
+               fi ;;
+        esac
+    done
+}
+
+# CHOSEN_CIDRS accumulates every CIDR picked this run so each new prompt is
+# checked for collision against all earlier ones (cross-region + cross-pool).
+CHOSEN_CIDRS=""
+
+section "Network — platform region ($PLATFORM_REGION)"
+ask_cidr VPC_CIDR TF_VPC_CIDR \
+    "VPC CIDR for $PLATFORM_REGION" "10.0.0.0/16" "$PLATFORM_REGION" "$CHOSEN_CIDRS"
+CHOSEN_CIDRS="$CHOSEN_CIDRS $VPC_CIDR"
+ask_cidr VPN_CLIENT_CIDR TF_VPN_CLIENT_CIDR \
+    "Client VPN client pool for $PLATFORM_REGION" "10.20.0.0/16" "" "$CHOSEN_CIDRS"
+CHOSEN_CIDRS="$CHOSEN_CIDRS $VPN_CLIENT_CIDR"
+
+if [[ -n "$PEER_REGION" ]]; then
+    section "Network — peer region ($PEER_REGION)"
+    ask_cidr PEER_VPC_CIDR TF_PEER_VPC_CIDR \
+        "VPC CIDR for $PEER_REGION" "10.10.0.0/16" "$PEER_REGION" "$CHOSEN_CIDRS"
+    CHOSEN_CIDRS="$CHOSEN_CIDRS $PEER_VPC_CIDR"
+    ask_cidr PEER_VPN_CLIENT_CIDR TF_PEER_VPN_CLIENT_CIDR \
+        "Client VPN client pool for $PEER_REGION" "10.21.0.0/16" "" "$CHOSEN_CIDRS"
+    CHOSEN_CIDRS="$CHOSEN_CIDRS $PEER_VPN_CLIENT_CIDR"
+fi
 
 # ─── Q&A: ALB internal hostname (format validated) ─────────────────────────
 section "ALB"
@@ -383,31 +490,71 @@ while true; do
 done
 
 # ─── Write tfvars ──────────────────────────────────────────────────────────
+# Cert ARNs are emitted as REGION-KEYED SENTINELS ("PENDING:server:<region>" /
+# "PENDING:client:<region>"). They satisfy the string type for `terraform
+# plan`; scripts/cloud-up.sh sed-substitutes the real ACM ARNs in place after
+# bootstrapping the VPN PKI per region. There is no cert-arns.auto.tfvars
+# anymore — this file is the single authoritative definition of `regions`.
 section "Writing $TFVARS"
-cat > "$TFVARS" <<EOF
+
+# Build the `regions` map block. One entry for the platform region, plus an
+# optional peer entry. Heredoc per region keeps formatting close to
+# terraform.tfvars.example.
+emit_region_block() {
+    # $1 region, $2 vpc_cidr, $3 vpn_client_cidr
+    cat <<EOF
+  "$1" = {
+    vpc_cidr        = "$2"
+    vpn_client_cidr = "$3"
+    # Cert ARNs: PENDING sentinels — scripts/cloud-up.sh substitutes real ACM
+    # ARNs in place after the per-region VPN PKI bootstrap. Plan-safe strings.
+    server_cert_arn = "PENDING:server:$1"
+    client_cert_arn = "PENDING:client:$1"
+  }
+EOF
+}
+
+{
+    cat <<EOF
 # Auto-generated by scripts/tfvars-init.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ).
-# Edit freely; this file is gitignored. Cert ARNs are written separately to
-# cert-arns.auto.tfvars by scripts/cloud-up.sh.
+# Edit freely; this file is gitignored.
+#
+# Cert ARNs below are PENDING sentinels — scripts/cloud-up.sh runs the VPN PKI
+# bootstrap per region and sed-substitutes the real ACM ARNs in place. This
+# file is the single authoritative definition of the `regions` map.
 
 aws_profile           = "$AWS_PROFILE"
-region                = "$REGION"
-secondary_region      = "$SECONDARY_REGION"
 environment           = "$ENVIRONMENT"
 cost_center           = "$COST_CENTER"
 owner                 = "$OWNER"
-vpc_cidr              = "$VPC_CIDR"
 alb_internal_hostname = "$ALB_HOSTNAME"
 worker_min_count      = $WORKER_MIN
 worker_max_count      = $WORKER_MAX
 alarm_email           = "$ALARM_EMAIL"
 
+# ─── Region topology (ADR-0042) ─────────────────────────────────────────
+# platform_region is the home region (DynamoDB table + Route53 + Budget) and
+# MUST also be a key in the regions map. Single-region scope = one entry.
+platform_region = "$PLATFORM_REGION"
+
+regions = {
+EOF
+    emit_region_block "$PLATFORM_REGION" "$VPC_CIDR" "$VPN_CLIENT_CIDR"
+    if [[ -n "$PEER_REGION" ]]; then
+        emit_region_block "$PEER_REGION" "$PEER_VPC_CIDR" "$PEER_VPN_CLIENT_CIDR"
+    fi
+    cat <<EOF
+}
+
 # ─── Less-commonly-tuned knobs (uncomment + edit if needed) ─────────────
+# route53_zone_name              = "enclave.example.com"  # multi-region weighted records
 # compute_budget_seconds         = 60        # SIGALRM worker timeout (ADR-0033)
 # backpressure_threshold_factor  = 5         # 503 trigger: queue_depth > N × workers
 # sqs_visibility_timeout         = 90        # = 1.5 × compute_budget (ADR-0033)
 # valkey_max_storage_gb          = 1         # Valkey serverless storage cap (ADR-0031)
 # valkey_max_ecpu_per_sec        = 5000      # Valkey serverless eCPU cap (ADR-0031)
 EOF
+} > "$TFVARS"
 
 ok "wrote $TFVARS"
 echo

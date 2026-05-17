@@ -499,10 +499,10 @@ This gate exercises the **deployment-architecture VPN** (AWS Client VPN endpoint
 #    Docker Desktop running, terraform + aws CLI + easy-rsa installed.
 
 # 1. Cloud deploy — one-shot orchestrator:
-#    Reads region + secondary_region from terraform.tfvars (interactive Q&A
-#    on first run); provisions PKI + ACM imports for both regions; ECR build
+#    Reads platform_region + the regions map from terraform.tfvars (interactive
+#    Q&A on first run); provisions PKI + ACM imports for every region; ECR build
 #    + image push; full terraform apply.
-make cloud-up   # ~15-20 min; idempotent if cert-arns.auto.tfvars already exists
+make cloud-up   # ~15-20 min; idempotent — skips cert bootstrap once the regions map PENDING placeholders are filled
 
 # 2. Connect to VPN — cloud-up auto-generates ready-to-use .ovpn files (one per
 #    region; cert + key inlined for mutual-TLS). Connect ONE region at a time
@@ -648,7 +648,7 @@ Pre-fixed for next forker:
 | App lacks `sqs:SendMessage` IAM perm | `tasks_iam_role_statements` extends the auto-created task role |
 | ALB `enable_deletion_protection = true` blocks destroy | overridden to `false` for case-study apply-then-destroy |
 | Partial-state destroy crashes on for_each over dead module outputs | `terraform plan -destroy -refresh=false` |
-| DynamoDB Global Tables replica setup needs both regions ready first | `make cloud-up` provisions both regions in one terraform composition; `tfvars-init.sh` prompts for `secondary_region` |
+| DynamoDB Global Tables replica setup needs both regions ready first | `make cloud-up` provisions all regions in one terraform composition; `tfvars-init.sh` prompts for the platform region + an optional peer region |
 | ACM-imported VPN certs leak after `terraform destroy` | `cloud-down.sh` step 4/6 deletes them |
 | `cwagent:ListMetrics` SCP-denied (console blocked) | `make cloud-evidence` uses `cloudwatch:GetMetricWidgetImage` API path — typically SCP-allowed |
 

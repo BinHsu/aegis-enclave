@@ -5,9 +5,9 @@
 #
 # Recommended path for the cloud-acceptance window:
 #   make cloud-up    — runs scripts/cloud-up.sh which auto-generates real
-#                      VPN cert ARNs via easy-rsa + ACM imports, then writes
-#                      them to terraform/cert-arns.auto.tfvars (gitignored)
-#                      and triggers the staged apply.
+#                      VPN cert ARNs via easy-rsa + ACM imports, substitutes
+#                      them into terraform.tfvars's regions map (replacing the
+#                      PENDING: cert placeholders), and triggers the staged apply.
 #
 # Manual path (production adoption workflow):
 #   1. Copy this file to `terraform.tfvars` (gitignored)
@@ -20,15 +20,64 @@
 # this composition into their own AWS environment. See
 # `docs/production_adoption.md` for the full adoption workflow.
 
-# ─── Region ─────────────────────────────────────────────────────────────────
-# AWS region the workload deploys into. Must be a region where:
+# ─── Region topology ────────────────────────────────────────────────────────
+# The deployment has two layers in ONE Terraform config / ONE apply / ONE
+# state:
+#   - Platform layer  — the DynamoDB Global Table, Route53, and the AWS Budget.
+#                       Created in `platform_region`.
+#   - Regional layer  — one full `region-stack` per entry in `regions`.
+#
+# `platform_region` is the home region and MUST also be a key in `regions`.
+#
+# `regions` is a map keyed by AWS region name. Each region where:
 #   - The ACM certificates referenced below exist
-#   - All eight VPC interface endpoints (ecr.api / ecr.dkr / secretsmanager /
-#     logs / ecs / ecs-agent / ecs-telemetry / sts) are available — they are
-#     in every commercial region as of 2026, but verify for newer regions.
-region = "eu-central-1"
+#   - All nine VPC interface endpoints (ecr.api / ecr.dkr / secretsmanager /
+#     logs / ecs / ecs-agent / ecs-telemetry / sts / sqs) are available — they
+#     are in every commercial region as of 2026, but verify for newer regions.
+#
+# Single-region scope = a one-entry `regions` map (see the commented
+# single-region example at the bottom of this file). Multi-region
+# active-active = two entries: the DynamoDB replica + Route53 weighted records
+# switch on automatically once a second region is present.
+platform_region = "eu-central-1"
 
-# ─── Environment + cost / ownership tags(default_tags on the provider)──────
+regions = {
+  # ─── Platform region ──────────────────────────────────────────────────────
+  "eu-central-1" = {
+    # VPC CIDR — must NOT overlap any other region's VPC CIDR, nor any VPC the
+    # operator might peer via Transit Gateway. Three /24 private subnets are
+    # derived automatically (x.x.1.0/24, x.x.2.0/24, x.x.3.0/24).
+    vpc_cidr = "10.0.0.0/16"
+
+    # Client VPN client address pool — must not overlap any region's VPC CIDR
+    # or any other region's VPN client pool.
+    vpn_client_cidr = "10.20.0.0/16"
+
+    # ─── ACM certificates for AWS Client VPN endpoint ──────────────────────
+    # Mutual-TLS authentication. Pre-provision two ACM-imported (or ACM-issued
+    # via Private CA) certificates per region:
+    #   server_cert_arn — server-side cert the Client VPN endpoint presents
+    #   client_cert_arn — root CA certificate that signs client-side certs
+    # These ARNs are PLAN-ONLY placeholders. See docs/production_adoption.md § 3
+    # for the certificate-provisioning paths. If the operator's organisation
+    # already runs a corporate VPN, see ADR-0010 for removing the Client VPN.
+    server_cert_arn = "arn:aws:acm:eu-central-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
+    client_cert_arn = "arn:aws:acm:eu-central-1:000000000000:certificate/11111111-1111-1111-1111-111111111111"
+  }
+
+  # ─── Peer region (DDB Global Tables active-active mirror) ──────────────────
+  # Remove this entry for a single-region deployment. When present, the
+  # DynamoDB table gains a replica here and Route53 weighted A records are
+  # created (if route53_zone_name is also set).
+  "eu-west-1" = {
+    vpc_cidr        = "10.10.0.0/16"
+    vpn_client_cidr = "10.21.0.0/16"
+    server_cert_arn = "arn:aws:acm:eu-west-1:000000000000:certificate/22222222-2222-2222-2222-222222222222"
+    client_cert_arn = "arn:aws:acm:eu-west-1:000000000000:certificate/33333333-3333-3333-3333-333333333333"
+  }
+}
+
+# ─── Environment + cost / ownership tags (default_tags on the provider) ─────
 # `environment` flows into resource tags and (in some shops) IAM scoping
 # conditions. Use the operator's environment taxonomy: dev / staging / prod.
 environment = "case-study"
@@ -38,39 +87,32 @@ environment = "case-study"
 cost_center = "engineering"
 
 # Resource owner — typically a team or distribution list, not an individual.
-# Used for ops contact + on-call routing in some org conventions.
 owner = "bin.hsu"
 
-# ─── VPC CIDR ────────────────────────────────────────────────────────────────
-# Must NOT overlap with any existing VPC the operator might peer or attach
-# via Transit Gateway. Subnet ranges are derived automatically from this
-# CIDR (private 10.0.1.0/24 + 10.0.2.0/24, database 10.0.201.0/24 + 10.0.202.0/24).
-# See `docs/production_adoption.md § 5` for IPAM coordination guidance.
-vpc_cidr = "10.0.0.0/16"
-
-# ─── ACM certificates for AWS Client VPN endpoint ───────────────────────────
-# Mutual-TLS authentication. The operator must pre-provision two ACM-imported
-# (or ACM-issued via Private CA) certificates:
-#
-#   `server_cert_arn` — server-side certificate the Client VPN endpoint
-#                       presents to connecting clients
-#   `client_cert_arn` — root CA certificate that signs client-side certs
-#
-# These ARNs are PLAN-ONLY placeholders that satisfy the Terraform type
-# system but would fail at `terraform apply` without real ACM resources.
-# See `docs/production_adoption.md § 3` for the certificate-provisioning paths
-# (AWS Private CA / self-signed via OpenSSL / third-party CA / corporate VPN).
-#
-# If the operator's organisation already runs a corporate VPN (Cisco AnyConnect,
-# Palo Alto GlobalProtect, etc.), the recommended path is to remove the
-# Client VPN endpoint resources from `main.tf` entirely and let the application
-# consume the existing corp VPN — see ADR-0010.
-server_cert_arn = "arn:aws:acm:eu-central-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
-client_cert_arn = "arn:aws:acm:eu-central-1:000000000000:certificate/11111111-1111-1111-1111-111111111111"
+# ─── Route53 (optional; multi-region weighted records) ──────────────────────
+# Existing Route53 hosted zone name. When set AND a peer region is present,
+# the composition creates 50/50 weighted A records with per-region health
+# checks. Leave empty for no Route53 wiring.
+# route53_zone_name = "enclave.example.com"
 
 # ─── (Future) Cross-account ECR ─────────────────────────────────────────────
 # If the operator follows a shared-services-account pattern (build artifacts
-# in a central account, runtime in a per-environment account), uncomment the
-# following and remove `module "ecr"` from `main.tf`. See `docs/production_adoption.md § 4`.
+# in a central account, runtime in a per-environment account), remove the
+# `module "ecr"` call from `modules/region-stack/ecr.tf` and wire the shared
+# repository URL instead. See `docs/production_adoption.md § 4`.
+
+# ════════════════════════════════════════════════════════════════════════════
+# SINGLE-REGION EXAMPLE — replace the `regions` map above with the one entry
+# below (and leave route53_zone_name unset). No DDB replica, no Route53 peer
+# record, exactly one region-stack instance is planned.
 #
-# ecr_repository_url = "<shared-account-id>.dkr.ecr.eu-central-1.amazonaws.com/aegis-enclave"
+# platform_region = "eu-central-1"
+# regions = {
+#   "eu-central-1" = {
+#     vpc_cidr        = "10.0.0.0/16"
+#     vpn_client_cidr = "10.20.0.0/16"
+#     server_cert_arn = "arn:aws:acm:eu-central-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
+#     client_cert_arn = "arn:aws:acm:eu-central-1:000000000000:certificate/11111111-1111-1111-1111-111111111111"
+#   }
+# }
+# ════════════════════════════════════════════════════════════════════════════

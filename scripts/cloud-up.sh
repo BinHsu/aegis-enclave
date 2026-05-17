@@ -3,10 +3,17 @@
 #
 # Sequences the operator's deploy workflow into a single command:
 #   1. Pre-flight: AWS auth + docker daemon + terraform + tfvars present
-#   2. VPN PKI provisioning (idempotent — skip if cert-arns.auto.tfvars valid)
+#   2. VPN PKI provisioning (idempotent — skip if no PENDING: cert sentinels
+#      remain in terraform.tfvars)
 #   3. ECR-target apply + image build + push (chicken-and-egg break)
 #   4. Full terraform apply (cloud-acceptance window starts here per ADR-0034)
 #   5. Print operator next-steps (VPN config, ALB DNS, smoke command)
+#
+# Region interface (ADR-0042): terraform.tfvars carries `platform_region` plus
+# a `regions` map. Cert ARNs live INSIDE each region's map entry. tfvars-init
+# writes them as REGION-KEYED SENTINELS ("PENDING:server:<region>" /
+# "PENDING:client:<region>"); this script bootstraps the VPN PKI per region and
+# sed-substitutes the real ACM ARNs in place. No cert-arns.auto.tfvars file.
 #
 # Designed for a bounded apply-then-destroy window (per ADR-0034 + ADR-0031
 # cost framing). Pair with `make cloud-down` for collateral-free teardown.
@@ -42,7 +49,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TF_DIR="$REPO_ROOT/terraform"
 PKI_DIR="$REPO_ROOT/pki"
 TFVARS="$TF_DIR/terraform.tfvars"
-CERT_TFVARS="$TF_DIR/cert-arns.auto.tfvars"
 
 OPERATOR="${OPERATOR:-$(whoami)}"
 START_TIME=$(date -u +%s)
@@ -161,15 +167,27 @@ if [[ ! -f "$TFVARS" ]]; then
 fi
 ok "$TFVARS present"
 
-REGION=$( (grep -E '^region[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
+# Region interface (ADR-0042): platform_region is a flat scalar; the peer
+# region is whichever quoted `regions` map key is NOT the platform region.
+# `terraform output` names (secondary_ecr_repository_url etc.) deliberately
+# keep the "primary/secondary" wording — the SECONDARY_REGION var below maps
+# the peer region onto those output names unchanged.
+REGION=$( (grep -E '^platform_region[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
 REGION="${REGION:-eu-central-1}"
-ok "Region (primary): $REGION"
+ok "Region (platform): $REGION"
 
-SECONDARY_REGION=$( (grep -E '^secondary_region[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
+# Peer region = the regions-map key that is not the platform region. Map keys
+# are lines like `  "eu-west-1" = {`. Grep all quoted keys, drop the platform
+# region, take the first remainder. Subshell + || true: a single-region map
+# (only the platform key) legitimately yields no remainder.
+SECONDARY_REGION=$( (grep -oE '^[[:space:]]*"[a-z]{2}-[a-z]+-[0-9]+"[[:space:]]*=[[:space:]]*\{' "$TFVARS" 2>/dev/null || true) \
+    | sed -E 's/.*"([^"]+)".*/\1/' \
+    | grep -vx "$REGION" \
+    | head -1 || true )
 if [[ -n "$SECONDARY_REGION" ]]; then
-    ok "Region (secondary): $SECONDARY_REGION (multi-region active-active mode)"
+    ok "Region (peer): $SECONDARY_REGION (multi-region active-active mode)"
 else
-    info "secondary_region empty/absent — single-region mode"
+    info "no peer region in regions map — single-region mode"
 fi
 
 # ─── Step 1: VPN PKI provisioning (idempotent, multi-region) ───────────────
@@ -178,79 +196,81 @@ section "4/6 — VPN PKI + ACM import"
 # bootstrap-vpn-certs.sh handles PKI generation idempotently and ACM import
 # per --region. For multi-region we run it twice (same PKI, second region's
 # ACM import-only path triggered by the bootstrap script's PKI_REUSED=1 branch).
+#
+# Cert ARNs live INSIDE each region's object in the single `regions` map. A
+# .auto.tfvars file cannot partially override one map key, so the old
+# cert-arns.auto.tfvars pattern is gone. Instead tfvars-init.sh wrote
+# REGION-KEYED SENTINELS ("PENDING:server:<region>" / "PENDING:client:<region>")
+# and this script sed-substitutes the real ACM ARNs in place.
 
-# Helper: parse ARNs from bootstrap output log
+# Helper: parse ARNs from bootstrap output log.
 parse_arns_from_log() {
     local log="$1"
     SERVER_ARN=$(grep -oE 'server_cert_arn[[:space:]]*=[[:space:]]*"arn:[^"]+"' "$log" | tail -1 | sed -E 's/.*"(arn:[^"]+)"/\1/')
     CLIENT_ARN=$(grep -oE 'client_cert_arn[[:space:]]*=[[:space:]]*"arn:[^"]+"' "$log" | tail -1 | sed -E 's/.*"(arn:[^"]+)"/\1/')
 }
 
-# Check what's already cached in cert-arns.auto.tfvars
-HAS_PRIMARY=0
-HAS_SECONDARY=0
-if [[ -f "$CERT_TFVARS" ]]; then
-    grep -q '^server_cert_arn = "arn:' "$CERT_TFVARS" \
-        && grep -q '^client_cert_arn = "arn:' "$CERT_TFVARS" \
-        && HAS_PRIMARY=1
-    grep -q '^secondary_server_cert_arn = "arn:' "$CERT_TFVARS" \
-        && grep -q '^secondary_client_cert_arn = "arn:' "$CERT_TFVARS" \
-        && HAS_SECONDARY=1
-fi
+# Helper: in-place substitute a region's PENDING sentinels with real ARNs.
+# macOS sed needs the `-i ''` form (empty backup suffix). ARNs are plain
+# alphanumerics + ':' + '/' + '-' so they are sed-replacement-safe; the
+# sentinel pattern (PENDING:server:<region>) contains no regex metachars.
+substitute_cert_arns() {
+    local region="$1" server_arn="$2" client_arn="$3"
+    sed -i '' \
+        -e "s|PENDING:server:${region}|${server_arn}|g" \
+        -e "s|PENDING:client:${region}|${client_arn}|g" \
+        "$TFVARS"
+}
 
-# Decide what to provision
-NEED_PRIMARY=$(( 1 - HAS_PRIMARY ))
-NEED_SECONDARY=0
-if [[ -n "$SECONDARY_REGION" ]] && [[ $HAS_SECONDARY -eq 0 ]]; then
-    NEED_SECONDARY=1
-fi
+# Helper: does $TFVARS still contain a given sentinel pattern?
+# Returns 0 = present, 1 = absent. set -e safe: grep's exit code is consumed
+# by `if`, so a no-match (exit 1) does not abort the script. The 2>/dev/null
+# covers a (would-be unexpected) missing file without killing the run.
+has_sentinel() {
+    grep -q "$1" "$TFVARS" 2>/dev/null
+}
 
-if [[ $NEED_PRIMARY -eq 0 ]] && [[ $NEED_SECONDARY -eq 0 ]]; then
-    ok "$CERT_TFVARS already has all required ARNs — skipping cert bootstrap"
+# Idempotency: if no PENDING: sentinel remains anywhere, certs are filled in.
+if ! has_sentinel 'PENDING:'; then
+    ok "no PENDING: cert sentinels in $TFVARS — VPN certs already provisioned, skipping bootstrap"
 else
     PKI_LOG="$REPO_ROOT/.cloud-up-pki-output.log"
 
-    if [[ $NEED_PRIMARY -eq 1 ]]; then
-        info "Running bootstrap-vpn-certs.sh --operator $OPERATOR --region $REGION (primary)"
+    # Platform region — only bootstrap if its sentinels are still present.
+    if has_sentinel "PENDING:server:${REGION}"; then
+        info "Running bootstrap-vpn-certs.sh --operator $OPERATOR --region $REGION (platform)"
         "$SCRIPT_DIR/bootstrap-vpn-certs.sh" --operator "$OPERATOR" --region "$REGION" 2>&1 | tee "$PKI_LOG"
         parse_arns_from_log "$PKI_LOG"
         [[ -n "$SERVER_ARN" && -n "$CLIENT_ARN" ]] \
-            || fail "Failed to parse primary cert ARNs from bootstrap output"
-        PRIMARY_SERVER_ARN="$SERVER_ARN"
-        PRIMARY_CLIENT_ARN="$CLIENT_ARN"
+            || fail "Failed to parse platform-region cert ARNs from bootstrap output"
+        substitute_cert_arns "$REGION" "$SERVER_ARN" "$CLIENT_ARN"
+        ok "Substituted real ACM ARNs for $REGION in $TFVARS"
     else
-        # Reuse cached primary ARNs
-        PRIMARY_SERVER_ARN=$(grep '^server_cert_arn = ' "$CERT_TFVARS" | sed -E 's/.*"(arn:[^"]+)".*/\1/')
-        PRIMARY_CLIENT_ARN=$(grep '^client_cert_arn = ' "$CERT_TFVARS" | sed -E 's/.*"(arn:[^"]+)".*/\1/')
+        ok "$REGION cert sentinels already substituted — skipping platform bootstrap"
     fi
 
-    if [[ $NEED_SECONDARY -eq 1 ]]; then
-        info "Running bootstrap-vpn-certs.sh --operator $OPERATOR --region $SECONDARY_REGION (secondary)"
-        "$SCRIPT_DIR/bootstrap-vpn-certs.sh" --operator "$OPERATOR" --region "$SECONDARY_REGION" 2>&1 | tee "$PKI_LOG"
-        parse_arns_from_log "$PKI_LOG"
-        [[ -n "$SERVER_ARN" && -n "$CLIENT_ARN" ]] \
-            || fail "Failed to parse secondary cert ARNs from bootstrap output"
-        SECONDARY_SERVER_ARN="$SERVER_ARN"
-        SECONDARY_CLIENT_ARN="$CLIENT_ARN"
-    elif [[ -n "$SECONDARY_REGION" ]]; then
-        # Reuse cached secondary ARNs
-        SECONDARY_SERVER_ARN=$(grep '^secondary_server_cert_arn = ' "$CERT_TFVARS" | sed -E 's/.*"(arn:[^"]+)".*/\1/')
-        SECONDARY_CLIENT_ARN=$(grep '^secondary_client_cert_arn = ' "$CERT_TFVARS" | sed -E 's/.*"(arn:[^"]+)".*/\1/')
-    fi
-
-    {
-        echo "# Auto-generated by scripts/cloud-up.sh — do not edit manually."
-        echo "# Regenerated on each fresh PKI bootstrap; deleted by cloud-down.sh after ACM cleanup."
-        echo "server_cert_arn = \"$PRIMARY_SERVER_ARN\""
-        echo "client_cert_arn = \"$PRIMARY_CLIENT_ARN\""
-        if [[ -n "$SECONDARY_REGION" ]]; then
-            echo "secondary_server_cert_arn = \"$SECONDARY_SERVER_ARN\""
-            echo "secondary_client_cert_arn = \"$SECONDARY_CLIENT_ARN\""
+    # Peer region — same per-region sentinel check.
+    if [[ -n "$SECONDARY_REGION" ]]; then
+        if has_sentinel "PENDING:server:${SECONDARY_REGION}"; then
+            info "Running bootstrap-vpn-certs.sh --operator $OPERATOR --region $SECONDARY_REGION (peer)"
+            "$SCRIPT_DIR/bootstrap-vpn-certs.sh" --operator "$OPERATOR" --region "$SECONDARY_REGION" 2>&1 | tee "$PKI_LOG"
+            parse_arns_from_log "$PKI_LOG"
+            [[ -n "$SERVER_ARN" && -n "$CLIENT_ARN" ]] \
+                || fail "Failed to parse peer-region cert ARNs from bootstrap output"
+            substitute_cert_arns "$SECONDARY_REGION" "$SERVER_ARN" "$CLIENT_ARN"
+            ok "Substituted real ACM ARNs for $SECONDARY_REGION in $TFVARS"
+        else
+            ok "$SECONDARY_REGION cert sentinels already substituted — skipping peer bootstrap"
         fi
-    } > "$CERT_TFVARS"
+    fi
 
     rm -f "$PKI_LOG"
-    ok "Wrote $CERT_TFVARS"
+
+    # Guard: every sentinel must be gone before the apply (apply needs real ARNs).
+    if has_sentinel 'PENDING:'; then
+        fail "PENDING: cert sentinels still in $TFVARS after bootstrap — substitution incomplete; check bootstrap output"
+    fi
+    ok "All cert sentinels substituted in $TFVARS"
 fi
 
 # ─── Step 2: Pre-deps apply + ECR + image push ────────────────────────────

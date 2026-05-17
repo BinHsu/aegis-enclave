@@ -1,6 +1,6 @@
 # ADR Index — read by goal, not by number
 
-36 ADRs is overwhelming for first-time onboarding. This index groups them by reader goal so you can pick the load-bearing ones for *your* purpose and skip the rest.
+37 ADRs is overwhelming for first-time onboarding. This index groups them by reader goal so you can pick the load-bearing ones for *your* purpose and skip the rest.
 
 Numbering has gaps (ADR-0002 / 0009 / 0021 / 0022 / 0028 / 0032 / 0035 are deleted; numbers are not reused per the monotonic numbering convention).
 
@@ -103,6 +103,7 @@ These four set the scope, calibration framework, methodology, and target-shape t
 | [0030](0030-elasticmq-local-sqs-parity.md) | ElasticMQ in docker-compose for local SQS-shape parity |
 | [0039](0039-supply-chain-rigor.md) | Exact-pin / lock / signed-source defaults — uv.lock, terraform exact-patch, `--provenance=false` ECR, brew-preferred tooling |
 | [0043](0043-finops-opt-in-budget-guardrail.md) | Opt-in, forker-tunable `aws_budgets_budget` cost guardrail |
+| [0044](0044-region-stack-module-platform-regional-split.md) | `region-stack` module — platform/regional layer split, `platform_region` + `regions` map |
 
 ---
 
