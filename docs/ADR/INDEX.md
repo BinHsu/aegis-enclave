@@ -102,6 +102,7 @@ These four set the scope, calibration framework, methodology, and target-shape t
 | [0026](0026-pr-time-terraform-plan-via-oidc.md) | OIDC tier-1 read-only role for PR-time `terraform plan` workflow |
 | [0030](0030-elasticmq-local-sqs-parity.md) | ElasticMQ in docker-compose for local SQS-shape parity |
 | [0039](0039-supply-chain-rigor.md) | Exact-pin / lock / signed-source defaults — uv.lock, terraform exact-patch, `--provenance=false` ECR, brew-preferred tooling |
+| [0043](0043-finops-opt-in-budget-guardrail.md) | Opt-in, forker-tunable `aws_budgets_budget` cost guardrail |
 
 ---
 

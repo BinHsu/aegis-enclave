@@ -143,6 +143,13 @@ tf-fmt: ## Recursively format Terraform code
 tf-validate: tf-init ## Validate Terraform configuration
 	cd terraform && terraform validate
 
+.PHONY: tf-scan
+tf-scan: ## Lint + security-scan Terraform (tflint + tfsec) — supply-chain rubric P1
+	@command -v tflint >/dev/null 2>&1 || { echo "tflint not installed. Run 'brew install tflint'"; exit 1; }
+	@command -v tfsec  >/dev/null 2>&1 || { echo "tfsec not installed. Run 'brew install tfsec'"; exit 1; }
+	cd terraform && tflint --recursive
+	tfsec terraform/ --exclude-downloaded-modules
+
 .PHONY: tf-apply
 tf-apply: ## OPERATOR USE — apply Terraform via scripts/ts_apply.sh (low-level; prefer 'make cloud-up')
 	@./scripts/ts_apply.sh

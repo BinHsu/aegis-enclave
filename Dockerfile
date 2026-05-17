@@ -1,8 +1,17 @@
 # syntax=docker/dockerfile:1.7
 ARG PYTHON_VERSION=3.12
 
+# Base image pinned to its multi-arch index digest, not just the floating
+# `-slim` tag — a tag can be repointed upstream, a digest cannot, so the
+# build is reproducible and supply-chain auditable. The tag is kept for
+# human readability; Docker resolves on the digest.
+# Refresh when bumping PYTHON_VERSION:
+#   docker buildx imagetools inspect python:<ver>-slim --format '{{.Manifest.Digest}}'
+# Pinned 2026-05-17 — python:3.12-slim.
+ARG PYTHON_BASE_DIGEST=sha256:401f6e1a67dad31a1bd78e9ad22d0ee0a3b52154e6bd30e90be696bb6a3d7461
+
 # ─── Builder stage ──────────────────────────────────────────────────────────
-FROM python:${PYTHON_VERSION}-slim AS builder
+FROM python:${PYTHON_VERSION}-slim@${PYTHON_BASE_DIGEST} AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -23,7 +32,7 @@ RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install .
 
 # ─── Runtime stage ──────────────────────────────────────────────────────────
-FROM python:${PYTHON_VERSION}-slim AS runtime
+FROM python:${PYTHON_VERSION}-slim@${PYTHON_BASE_DIGEST} AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

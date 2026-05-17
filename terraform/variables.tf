@@ -115,12 +115,18 @@ variable "worker_max_count" {
   default     = 9
 }
 
+# Intent anchor: consumed as documentation by sqs_visibility_timeout's 1.5x
+# derivation, deliberately not referenced by HCL.
+# tflint-ignore: terraform_unused_declarations
 variable "compute_budget_seconds" {
   description = "Worker SIGALRM compute budget in seconds. Must match prime_service.primes._SIGALRM_SECONDS."
   type        = number
   default     = 60
 }
 
+# Operator-script metadata: lives in the tfvars file for cloud-*.sh,
+# deliberately not consumed by HCL.
+# tflint-ignore: terraform_unused_declarations
 variable "aws_profile" {
   description = "AWS CLI profile name for operator-side scripts (cloud-up / cloud-down / cloud-evidence / cloud-smoke). NOT used by Terraform itself — provider auth comes from the env at apply time. Operator-only metadata; safe to leave empty for forkers in env-based auth."
   type        = string
@@ -159,4 +165,22 @@ variable "valkey_max_ecpu_per_sec" {
   description = "ElastiCache Serverless Valkey maximum eCPU per second. Caps cost within the 3h acceptance window."
   type        = number
   default     = 5000
+}
+
+# ─── Cost guardrail (AWS Budgets — see budget.tf) ───────────────────────────
+
+variable "monthly_budget_usd" {
+  description = "Monthly AWS cost budget ceiling in USD (see budget.tf, ADR-0043). Forker-tunable starting point, not a prescriptive cap - set this to your own steady-state estimate. Default 25 suits the case-study's ~3h apply-then-destroy window; raise it for a long-running fork. AWS Budgets itself is free."
+  type        = number
+  default     = 25
+}
+
+variable "budget_notification_email" {
+  description = "Email for AWS Budgets alert notifications (80%-actual + 100%-forecasted). Empty (default) leaves the budget a silent cost tracker - set it to arm alerts. Mirrors the alarm_email opt-in pattern so forkers get no unsolicited mail. Operator/forker-supplied; never commit a real address (CLAUDE.md section 5)."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.budget_notification_email == "" || can(regex("^[^@]+@[^@]+\\.[^@]+$", var.budget_notification_email))
+    error_message = "budget_notification_email must be empty or a valid email address."
+  }
 }

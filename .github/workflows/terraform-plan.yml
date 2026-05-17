@@ -16,9 +16,14 @@
 #
 # See ADR-0026 for the design rationale and trust-scope analysis.
 
-name: Terraform Plan (PR)
+name: Terraform Lint + Plan
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform-plan.yml'
   pull_request:
     paths:
       - 'terraform/**'
@@ -36,12 +41,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Lint + format gate — ungated (no AWS creds, no role ARN needed), so it
+  # runs on every terraform/** change (PR + push to main), including Phase 1
+  # / pre-bootstrap. tfsec runs locally via the pre-commit hook + `make
+  # tf-scan`; CI carries the actively-maintained linter (tflint) as the
+  # remote backstop. Solo main-based workflow (no PR) is still gated here.
+  lint:
+    name: Terraform lint + fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.0"
+          terraform_wrapper: false
+
+      - name: Terraform fmt check
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: tflint
+        working-directory: terraform
+        run: |
+          tflint --init
+          tflint --recursive
+
   plan:
     name: Terraform plan (read-only)
     runs-on: ubuntu-latest
     # Skip if the role hasn't been provisioned yet (Phase 1 default).
     # Once `AWS_TF_PLAN_ROLE_ARN` is set as a repo variable, this gate opens.
-    if: ${{ vars.AWS_TF_PLAN_ROLE_ARN != '' }}
+    # pull_request only — the plan posts a PR comment, which has no target on
+    # a push to main (the lint job above is what covers push-to-main).
+    if: ${{ vars.AWS_TF_PLAN_ROLE_ARN != '' && github.event_name == 'pull_request' }}
 
     steps:
       - uses: actions/checkout@v4

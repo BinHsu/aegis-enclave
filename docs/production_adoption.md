@@ -246,9 +246,9 @@ Forker production extension of ADR-0041 (CloudWatch SLI emission).
 
 **Dependabot / Renovate for dependency updates** — `uv.lock` (committed) pins exact Python dependency versions. Terraform modules + providers are exact-pinned per ADR-0039. Without an automated bump tool, pinned versions go stale. Configure either Dependabot (GitHub-native) or Renovate (more flexible, supports Terraform modules natively) with weekly bump PRs.
 
-**FinOps cap + anomaly detection** — case-study has cost attribution (provider `default_tags`) + per-hour cost table but does not wire `aws_budgets_budget` or `aws_ce_anomaly_monitor`. For a forker:
+**FinOps cap + anomaly detection** — the case-study wires an opt-in budget cap (`terraform/budget.tf`, see ADR-0043) but not `aws_ce_anomaly_monitor`. For a forker:
 
-- **Budget cap** (~10 lines TF): `aws_budgets_budget` with `budget_type = "COST"`, monthly limit set to your steady-state estimate × 1.5, plus a `notification` block at 80%/100%/forecasted-100% to an SNS topic or email.
+- **Budget cap** — already wired as `aws_budgets_budget` in `terraform/budget.tf`. Tune `monthly_budget_usd` to your steady-state estimate × 1.5 and set `budget_notification_email` to arm the 80%-actual / 100%-forecasted notifications. Delete the file if you run cost governance elsewhere.
 - **Anomaly detection** (~15 lines TF): `aws_ce_anomaly_monitor` scoped to `monitor_dimension = "SERVICE"`, plus an `aws_ce_anomaly_subscription` with daily summary or above-threshold alert.
 
 Both are free at the AWS billing layer; cost is only the SNS messages or email delivery.

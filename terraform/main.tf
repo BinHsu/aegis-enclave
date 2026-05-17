@@ -254,6 +254,9 @@ resource "aws_dynamodb_table" "executions" {
     enabled = true
   }
 
+  # PoC scope: SSE with the AWS-owned key. Customer-managed KMS is a
+  # production-hardening upgrade (ADR-0003 PoC-scope / prod-hygiene calibration).
+  #tfsec:ignore:aws-dynamodb-table-customer-key
   server_side_encryption {
     enabled = true
   }
@@ -597,6 +600,7 @@ resource "aws_sqs_queue" "primes_dlq" {
   name                      = "aegis-enclave-primes-dlq"
   message_retention_seconds = 1209600 # 14 days — max; keeps failed messages for analysis
   receive_wait_time_seconds = 0
+  sqs_managed_sse_enabled   = true # SSE-SQS (SQS-owned key) — explicit at-rest encryption, free
 }
 
 # ─── Alerting backbone — conditional SNS topic for email delivery ─────────
@@ -973,6 +977,7 @@ resource "aws_sqs_queue" "primes" {
   visibility_timeout_seconds = var.sqs_visibility_timeout
   message_retention_seconds  = 86400 # 1 day
   receive_wait_time_seconds  = 20    # long-polling — reduces empty receive costs
+  sqs_managed_sse_enabled    = true  # SSE-SQS (SQS-owned key) — explicit at-rest encryption, free
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.primes_dlq.arn
@@ -989,9 +994,11 @@ resource "aws_security_group" "valkey" {
 
   # Egress: unrestricted (required for cluster-mode inter-node traffic internal to ElastiCache)
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
+    from_port = 0
+    to_port   = 0
+    protocol  = "-1"
+    # Accepted: documented ElastiCache Serverless internal-cluster requirement.
+    #tfsec:ignore:aws-ec2-no-public-egress-sgr
     cidr_blocks = ["0.0.0.0/0"]
     description = "Unrestricted egress - ElastiCache Serverless requirement"
   }
@@ -1101,6 +1108,9 @@ data "aws_iam_policy_document" "worker_policy" {
       "dynamodb:Query",
       "dynamodb:DescribeTable",
     ]
+    # tfsec false positive: not a broad wildcard — scoped to this one table's
+    # own GSI sub-resources (<table-arn>/index/*), the recommended idiom.
+    #tfsec:ignore:aws-iam-no-policy-wildcards
     resources = [
       aws_dynamodb_table.executions.arn,
       "${aws_dynamodb_table.executions.arn}/index/*",
@@ -1134,9 +1144,14 @@ resource "aws_security_group" "worker" {
 
   # No ingress - worker only pulls from SQS, never receives inbound traffic.
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
+    from_port = 0
+    to_port   = 0
+    protocol  = "-1"
+    # Accepted: worker is in private subnets with no ingress and no public
+    # route. Scoping egress to VPC CIDR would break S3/DDB gateway-endpoint
+    # traffic (managed prefix lists, not VPC CIDR) — ECR layer pulls included.
+    # Prefix-list-scoped egress is the production-hardening path.
+    #tfsec:ignore:aws-ec2-no-public-egress-sgr
     cidr_blocks = ["0.0.0.0/0"]
     description = "Unrestricted egress - worker reaches SQS endpoint, Valkey, DDB, ECR via VPC endpoints"
   }
@@ -1194,12 +1209,18 @@ resource "aws_ecs_task_definition" "worker" {
 }
 
 # CloudWatch log group for the worker.
+# PoC scope: AWS-managed log encryption; customer-managed KMS is a
+# production-hardening upgrade (ADR-0003 PoC-scope / prod-hygiene calibration).
+#tfsec:ignore:aws-cloudwatch-log-group-customer-key
 resource "aws_cloudwatch_log_group" "worker" {
   name              = "/ecs/aegis-enclave-worker"
   retention_in_days = 7
 }
 
 # CloudWatch log group for the FastAPI app container.
+# PoC scope: AWS-managed log encryption; customer-managed KMS is a
+# production-hardening upgrade (ADR-0003 PoC-scope / prod-hygiene calibration).
+#tfsec:ignore:aws-cloudwatch-log-group-customer-key
 resource "aws_cloudwatch_log_group" "app" {
   name              = "/ecs/aegis-enclave-app"
   retention_in_days = 7
@@ -1248,6 +1269,9 @@ resource "aws_ecs_task_definition" "cache_bootstrap" {
 }
 
 # CloudWatch log group for the bootstrap task.
+# PoC scope: AWS-managed log encryption; customer-managed KMS is a
+# production-hardening upgrade (ADR-0003 PoC-scope / prod-hygiene calibration).
+#tfsec:ignore:aws-cloudwatch-log-group-customer-key
 resource "aws_cloudwatch_log_group" "bootstrap" {
   name              = "/ecs/aegis-enclave-bootstrap"
   retention_in_days = 7
@@ -1423,9 +1447,13 @@ resource "aws_security_group" "secondary_vpc_endpoints" {
   }
 
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
+    from_port = 0
+    to_port   = 0
+    protocol  = "-1"
+    # Accepted: private-subnet secondary-region SG, no public ingress path;
+    # mirrors the primary-region egress posture. Prefix-list-scoped egress is
+    # the production-hardening path.
+    #tfsec:ignore:aws-ec2-no-public-egress-sgr
     cidr_blocks = ["0.0.0.0/0"]
     description = "All egress"
   }
@@ -1491,9 +1519,13 @@ resource "aws_security_group" "secondary_alb" {
   }
 
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
+    from_port = 0
+    to_port   = 0
+    protocol  = "-1"
+    # Accepted: private-subnet secondary-region SG, no public ingress path;
+    # mirrors the primary-region egress posture. Prefix-list-scoped egress is
+    # the production-hardening path.
+    #tfsec:ignore:aws-ec2-no-public-egress-sgr
     cidr_blocks = ["0.0.0.0/0"]
     description = "All egress"
   }
@@ -1518,9 +1550,13 @@ resource "aws_security_group" "secondary_app" {
   }
 
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
+    from_port = 0
+    to_port   = 0
+    protocol  = "-1"
+    # Accepted: private-subnet secondary-region SG, no public ingress path;
+    # mirrors the primary-region egress posture. Prefix-list-scoped egress is
+    # the production-hardening path.
+    #tfsec:ignore:aws-ec2-no-public-egress-sgr
     cidr_blocks = ["0.0.0.0/0"]
     description = "All egress"
   }
@@ -1537,9 +1573,14 @@ resource "aws_security_group" "secondary_worker" {
   vpc_id      = aws_vpc.secondary[0].id
 
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
+    from_port = 0
+    to_port   = 0
+    protocol  = "-1"
+    # Accepted: secondary worker SG, private subnets, no ingress; mirrors the
+    # primary worker SG. Scoping egress to VPC CIDR would break S3/DDB
+    # gateway-endpoint traffic (managed prefix lists). Prefix-list-scoped
+    # egress is the production-hardening path.
+    #tfsec:ignore:aws-ec2-no-public-egress-sgr
     cidr_blocks = ["0.0.0.0/0"]
     description = "Unrestricted egress"
   }
@@ -1564,9 +1605,11 @@ resource "aws_security_group" "secondary_valkey" {
   }
 
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
+    from_port = 0
+    to_port   = 0
+    protocol  = "-1"
+    # Accepted: documented ElastiCache Serverless internal-cluster requirement.
+    #tfsec:ignore:aws-ec2-no-public-egress-sgr
     cidr_blocks = ["0.0.0.0/0"]
     description = "Unrestricted egress - ElastiCache Serverless requirement"
   }
@@ -1718,6 +1761,9 @@ resource "aws_ecs_cluster" "secondary" {
   }
 }
 
+# PoC scope: AWS-managed log encryption; customer-managed KMS is a
+# production-hardening upgrade (ADR-0003 PoC-scope / prod-hygiene calibration).
+#tfsec:ignore:aws-cloudwatch-log-group-customer-key
 resource "aws_cloudwatch_log_group" "secondary_app" {
   count    = local.is_multi_region
   provider = aws.secondary
@@ -1726,6 +1772,9 @@ resource "aws_cloudwatch_log_group" "secondary_app" {
   retention_in_days = 7
 }
 
+# PoC scope: AWS-managed log encryption; customer-managed KMS is a
+# production-hardening upgrade (ADR-0003 PoC-scope / prod-hygiene calibration).
+#tfsec:ignore:aws-cloudwatch-log-group-customer-key
 resource "aws_cloudwatch_log_group" "secondary_worker" {
   count    = local.is_multi_region
   provider = aws.secondary
@@ -1734,6 +1783,9 @@ resource "aws_cloudwatch_log_group" "secondary_worker" {
   retention_in_days = 7
 }
 
+# PoC scope: AWS-managed log encryption; customer-managed KMS is a
+# production-hardening upgrade (ADR-0003 PoC-scope / prod-hygiene calibration).
+#tfsec:ignore:aws-cloudwatch-log-group-customer-key
 resource "aws_cloudwatch_log_group" "secondary_bootstrap" {
   count    = local.is_multi_region
   provider = aws.secondary
@@ -1843,6 +1895,7 @@ resource "aws_sqs_queue" "secondary_primes_dlq" {
   name                      = "aegis-enclave-secondary-primes-dlq"
   message_retention_seconds = 1209600
   receive_wait_time_seconds = 0
+  sqs_managed_sse_enabled   = true # SSE-SQS (SQS-owned key) — explicit at-rest encryption, free
 }
 
 resource "aws_sqs_queue" "secondary_primes" {
@@ -1853,6 +1906,7 @@ resource "aws_sqs_queue" "secondary_primes" {
   visibility_timeout_seconds = var.sqs_visibility_timeout
   message_retention_seconds  = 86400
   receive_wait_time_seconds  = 20
+  sqs_managed_sse_enabled    = true # SSE-SQS (SQS-owned key) — explicit at-rest encryption, free
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.secondary_primes_dlq[0].arn

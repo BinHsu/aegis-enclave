@@ -203,3 +203,14 @@ output "route53_health_check_ids" {
     secondary = aws_route53_health_check.secondary[0].id
   } : {}
 }
+
+# ─── Cost guardrail (see budget.tf) ─────────────────────────────────────────
+
+output "monthly_budget" {
+  description = "AWS Budgets cost guardrail: ceiling in USD and whether email notifications are armed (false = silent cost tracker)."
+  value = {
+    limit_usd     = var.monthly_budget_usd
+    notifications = var.budget_notification_email != ""
+    budget_name   = aws_budgets_budget.monthly.name
+  }
+}
