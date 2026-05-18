@@ -174,6 +174,10 @@ cloud-down: ## Cloud-acceptance one-shot teardown — drain ECR + destroy + ACM 
 cloud-smoke: ## Cloud-side 6-step smoke (POST + poll + cache hit + 422 + backpressure)
 	@./scripts/cloud-smoke.sh
 
+.PHONY: dr-drill
+dr-drill: ## Disaster-recovery drill — destroy + rebuild peer region, measure RTO, prove survivor serves
+	@./scripts/dr-drill.sh
+
 .PHONY: cloud-evidence
 cloud-evidence: ## Cloud-acceptance evidence capture — CloudWatch metric widgets + worker/bootstrap logs + tf output
 	@./scripts/cloud-evidence.sh
