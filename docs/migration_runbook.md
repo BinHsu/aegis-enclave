@@ -1,5 +1,7 @@
 # Migration Runbook — AWS → Alternative Cloud
 
+> Last reconciled 2026-05-20 for the DynamoDB pivot (ADR-0042). IONOS-side data-layer target is ScyllaDB Alternator self-hosted on IONOS compute, per ADR-0045.
+
 > **Phase 2 deliverable.** Spec-grade, not code-grade. This document describes an agent-executable migration plan — designed for execution by an AI coding agent (with human oversight at marked gates) or a human engineer following the spec. The mapping table at the top is the only destination-specific artifact; the rest of the runbook is invariant.
 
 The worked example destination here is **IONOS Cloud** (Frankfurt). To target a different destination — GCP, Azure, on-premise — only the **service-mapping** table changes; every step block below is destination-invariant.
@@ -28,12 +30,12 @@ The AWS source-of-truth is `terraform/main.tf` in this repo. Each row below maps
 | AWS | IONOS Cloud | Notes |
 |---|---|---|
 | `terraform-aws-modules/vpc/aws` (VPC + private/public subnets, NAT) | `ionoscloud_datacenter` + `ionoscloud_lan` (+ `ionoscloud_private_crossconnect` for inter-DC) | Datacenter is the IONOS containment unit; LANs are the L2 segments. Private cross-connects link datacenters when multi-DC topology is needed. |
-| `terraform-aws-modules/rds/aws` (PostgreSQL 16, Multi-AZ) | `ionoscloud_dbaas_pgsql_cluster` | IONOS DBaaS PostgreSQL with HA replica. Engine version parity at PostgreSQL 16. Master credential management is operator-owned (no AWS Secrets Manager equivalent on the DB side). |
+| `aws_dynamodb_table` (Global Tables, eu-central-1 + eu-west-1, active-active) | 3-node **ScyllaDB Alternator** cluster on `ionoscloud_server` VMs (one per AZ in `de/fra`) | IONOS has no DynamoDB-compatible managed service. ScyllaDB Alternator (Apache-2.0, OSS) exposes the DynamoDB wire protocol — `boto3` works unchanged with `endpoint_url=` override; `src/prime_service/db.py` is invariant across the AWS and IONOS legs. Multi-region active-active does **not** survive: the IONOS leg is single-DC 3-AZ. See ADR-0045 for the decision and accepted trade-offs. |
 | `terraform-aws-modules/ecs/aws` (Fargate) | `ionoscloud_k8s_cluster` + `ionoscloud_k8s_node_pool` | IONOS has no managed serverless container runtime equivalent to Fargate. Managed Kubernetes is the closest peer; the application is repackaged as a Deployment + Service. |
 | `terraform-aws-modules/alb/aws` (internal) | `ionoscloud_application_loadbalancer` | Application-layer (L7) load balancer. Health-check semantics map cleanly. |
 | `terraform-aws-modules/ecr/aws` | self-hosted Harbor on IONOS, or external registry (`ghcr.io`, `quay.io`) | No native IONOS container registry. Harbor on a small VM is the typical self-hosted answer; an external public/private registry works if the buyer's policy allows. |
 | `aws_ec2_client_vpn_endpoint` | **No equivalent** → see Track 2 (self-hosted NetBird) | This is the architectural pivot point — see paragraph below the table. |
-| AWS Secrets Manager (RDS-managed master password) | self-hosted HashiCorp Vault, or SOPS+age committed to a private repo | No managed secrets service on IONOS at the DBaaS layer. Vault on a small VM is the typical self-hosted answer. |
+| AWS Secrets Manager (general secret store) | self-hosted HashiCorp Vault, or SOPS+age committed to a private repo | No managed secrets service on IONOS. Vault on a small VM is the typical self-hosted answer. (The AWS-side data layer is DDB with IAM-authn per ADR-0037 — no DB-password secret to migrate; the Scylla Alternator listener on the IONOS leg is network-bound, also no password.) |
 | `terraform-aws-modules/security-group/aws` (stateful SGs at the ENI) | `ionoscloud_firewall` (rules at the NIC layer) | Stateful firewall rules attached per NIC. Semantically equivalent to AWS Security Groups for the patterns used in this repo. |
 | AWS CloudWatch Logs | IONOS Logging Service (or self-hosted Loki / Elastic) | Out of scope for this runbook — observability migration is a separate axis. |
 
@@ -44,7 +46,7 @@ The cell that drives the rest of this runbook is the third-from-last row: **AWS 
 ## Track 1 — Application migration
 
 **Owner:** Application / Cloud team (per [ADR-0010](ADR/0010-vpn-ownership-app-vs-platform.md)).
-**Scope:** VPC-equivalent → managed PostgreSQL → container orchestration → load balancer → image registry → secrets → traffic cutover.
+**Scope:** VPC-equivalent → self-hosted DynamoDB-compatible NoSQL (ScyllaDB Alternator) → container orchestration → load balancer → image registry → secrets → traffic cutover.
 **Total estimated steps:** 7
 
 ### Step 1.1 — Provision IONOS datacenter and private network
@@ -58,16 +60,18 @@ The cell that drives the rest of this runbook is the third-from-last row: **AWS 
 | `on_failure` | If the datacenter creation fails: check API token scope (must include `datacenter:create`), then re-run. If location quota exhausted: file a quota-increase request with IONOS support — this is a manual escalation, agent should halt and surface the ticket reference. |
 | `human_gate` | `false` — creation is reversible; an empty datacenter can be deleted with no data impact. |
 
-### Step 1.2 — Provision Managed PostgreSQL with HA replica
+### Step 1.2 — Provision ScyllaDB Alternator cluster on IONOS compute (3-node, multi-AZ within one DC)
+
+Per [ADR-0045](ADR/0045-ionos-data-layer-scylladb-alternator.md). The AWS-side data layer is DynamoDB Global Tables active-active across `eu-central-1` + `eu-west-1` (ADR-0042); IONOS Cloud has no DynamoDB-compatible managed service. ScyllaDB Alternator (Apache-2.0, OSS) exposes the DynamoDB wire protocol so the application's `boto3` client is unchanged — only the endpoint URL differs. Multi-region active-active does **not** survive intact on the IONOS leg: v1 is a single 3-node cluster across IONOS AZs in one datacenter (RPO ~0 within-DC quorum, no cross-DC replication).
 
 | Field | Value |
 |---|---|
-| `precondition` | Step 1.1 complete; LAN ID known; master-credential value generated and staged in the chosen secret store (Vault or SOPS). |
-| `action` | Provision `ionoscloud_dbaas_pgsql_cluster` with PostgreSQL 16, instance class equivalent to `db.t4g.micro` (1 vCPU / 2 GiB RAM / 20 GiB storage), HA enabled (replica in a second availability zone), backup retention 7 days, attached to the LAN from Step 1.1. |
-| `verify_cmd` | `ionosctl dbaas postgres cluster list --cols Id,DisplayName,State,Location` |
-| `expected_output` | Cluster row in `AVAILABLE` state, located in `de/fra`. |
-| `on_failure` | If cluster fails to reach `AVAILABLE` within 20 minutes: check IONOS service health page; if region-wide degradation, halt and notify operator. If quota error: file IONOS quota-increase request. |
-| `human_gate` | `false` — provisioning is reversible, no data has been written yet. |
+| `precondition` | Step 1.1 complete; LAN ID known; ScyllaDB version target pinned (latest 6.x LTS at execution time, named explicitly in the runbook execution log, not inferred); SSH key staged for the three nodes; firewall policy decided (Alternator on `8000/TCP` reachable only from the K8s LAN; native CQL on `9042/TCP` reachable only from operator bastion; intra-cluster ports `7000/TCP`, `7001/TCP`, `9180/TCP` open between the three node NICs). |
+| `action` | Provision 3× `ionoscloud_server` instances, one per IONOS availability zone in the `de/fra` datacenter — each `cpu-dedicated`-class, 4 vCPU / 16 GiB RAM / 100 GiB NVMe-equivalent storage. Install ScyllaDB from the official Scylla package repository on each node. Bootstrap the cluster with one seed node first, then join the remaining two peers (`scylla.yaml`: `seeds: <seed-node-ip>`; `endpoint_snitch: GossipingPropertyFileSnitch`; `cassandra-rackdc.properties`: `dc=de-fra`, `rack=az-1\|az-2\|az-3` per node). Enable the Alternator listener in `scylla.yaml`: `alternator_port: 8000`, `alternator_write_isolation: always`. Start the seed node, wait for it to reach `UN` (Up Normal), then start the peers one at a time. Create the `executions` table via the AWS CLI against the Alternator endpoint, matching the schema in ADR-0042 (PK `execution_id` String; on-demand billing-mode equivalent — Alternator treats `PAY_PER_REQUEST` as unconstrained). |
+| `verify_cmd` | Cluster health: `ssh scylla-seed nodetool status` AND Alternator listener: `curl -sf -o /dev/null -w "%{http_code}\n" http://<scylla-node>:8000/` (expect HTTP 400 — listener parses DynamoDB wire protocol and rejects a bare GET, which is the success signal). Table existence: `aws dynamodb describe-table --table-name executions --endpoint-url http://<scylla-node>:8000 --region eu-central-1` (any non-empty credential pair — Alternator does not validate at the application boundary). |
+| `expected_output` | `nodetool status` shows three rows, all `UN` (Up Normal), one per rack `az-1` / `az-2` / `az-3`, owning ~33% of the ring each. `curl` against `:8000` returns HTTP 400 (proves the listener is parsing DDB-wire). `describe-table` returns the `executions` table with `TableStatus: ACTIVE` and the expected key schema. |
+| `on_failure` | If a node fails to reach `UN`: check `/var/log/scylla/scylla.log` for gossip failures (most common cause: intra-cluster firewall rule blocks `7000/TCP` between AZs — re-check `ionoscloud_firewall` rules on the three NICs). If Alternator listener does not bind: verify `alternator_port: 8000` in `scylla.yaml` is uncommented and the daemon was restarted after edit. If `describe-table` returns table-not-found: the table was not created — re-run the `aws dynamodb create-table` command. **Do not** attempt to re-bootstrap the seed node once peers have joined; that risks data loss. If the seed node is unrecoverable: provision a replacement node, follow the ScyllaDB node-replacement procedure (`replace_node_first_boot` parameter), and run `nodetool repair` after rejoin. |
+| `human_gate` | **`true`** — cluster bootstrap is not idempotent the way managed-DBaaS provisioning is: seed-node ordering matters, version pinning matters, config drift between the three nodes matters. Operator must confirm the seed-first / peers-second sequence before the agent proceeds, and must verify `nodetool status` shows all three nodes `UN` before the runbook advances to Step 1.3. |
 
 ### Step 1.3 — Provision Managed Kubernetes cluster and node pool
 
@@ -95,11 +99,11 @@ The cell that drives the rest of this runbook is the third-from-last row: **AWS 
 
 | Field | Value |
 |---|---|
-| `precondition` | Steps 1.2 (DBaaS), 1.3 (K8s cluster), 1.4 (registry) complete; secret store (Vault or SOPS) reachable from the cluster; manifests authored: Deployment, Service (ClusterIP), ExternalSecret (or sealed Secret) referencing the Vault path for the DB password. |
-| `action` | Apply the Deployment + Service + Secret manifests to the cluster. The Deployment pulls the image from the registry chosen in Step 1.4. The Secret provides the DB password from the external secret store. The Service exposes port 8000 inside the cluster as a ClusterIP — the load balancer in Step 1.6 will be the external entrypoint. |
+| `precondition` | Steps 1.2 (Scylla cluster), 1.3 (K8s cluster), 1.4 (registry) complete; manifests authored: Deployment, Service (ClusterIP), ConfigMap providing `AEGIS_DDB_ENDPOINT_URL=http://<scylla-node-ip>:8000` and `AWS_REGION=eu-central-1` (region value is a placeholder for the boto3 client — Alternator does not enforce it). |
+| `action` | Apply the Deployment + Service + ConfigMap manifests to the cluster. The Deployment pulls the image from the registry chosen in Step 1.4. The ConfigMap supplies the Alternator endpoint URL; no DB password is needed (Alternator authn is network-bound). The Service exposes port 8000 inside the cluster as a ClusterIP — the load balancer in Step 1.6 will be the external entrypoint. |
 | `verify_cmd` | `kubectl get pods -l app=aegis-enclave -o jsonpath='{.items[*].status.phase}'` |
 | `expected_output` | Both pods in `Running` phase; application healthcheck endpoint `/health` returns `200 OK` from inside the cluster (verified via `kubectl exec` from a debug pod). |
-| `on_failure` | If pod stuck in `CrashLoopBackOff`: check logs (`kubectl logs`), most common cause is DB connectivity (verify firewall rule from cluster nodes to DBaaS). If `ImagePullBackOff`: verify registry credentials are present as `imagePullSecrets`. |
+| `on_failure` | If pod stuck in `CrashLoopBackOff`: check logs (`kubectl logs`); most common cause is Alternator connectivity (verify firewall rule from K8s node NICs to the Scylla nodes on `8000/TCP`, and that the ConfigMap endpoint URL resolves to a Scylla node). If `ImagePullBackOff`: verify registry credentials are present as `imagePullSecrets`. |
 | `human_gate` | `false` — Deployment can be rolled back with `kubectl rollout undo`; no production traffic yet. |
 
 ### Step 1.6 — Provision Application Load Balancer
@@ -117,10 +121,10 @@ The cell that drives the rest of this runbook is the third-from-last row: **AWS 
 
 | Field | Value |
 |---|---|
-| `precondition` | Track 1 steps 1.1-1.6 complete and individually verified; Track 2 (VPN modernisation) steps 2.1-2.4 complete; operators tested via NetBird against the IONOS endpoint; DB schema and data parity verified between AWS RDS and IONOS DBaaS (final dump-and-restore window agreed with operators). |
+| `precondition` | Track 1 steps 1.1-1.6 complete and individually verified; Track 2 (VPN modernisation) steps 2.1-2.4 complete; operators tested via NetBird against the IONOS endpoint; data parity verified between AWS DynamoDB Global Tables and the IONOS ScyllaDB Alternator cluster. Parity verification is a `dynamodb scan` against both endpoints with the same command pair: `aws dynamodb scan --table-name executions --endpoint-url https://dynamodb.eu-central-1.amazonaws.com --output json > aws.json` and `aws dynamodb scan --table-name executions --endpoint-url http://<scylla-node>:8000 --region eu-central-1 --output json > ionos.json`, then `diff <(jq -S . aws.json) <(jq -S . ionos.json)`. The wire protocol is identical between endpoints; the verification script is invariant. Final replication window (one-shot scan-and-put from AWS to Scylla for any rows written between rehearsal and cutover) agreed with operators. |
 | `action` | Update the DNS record for the API hostname (CNAME or A record at the operator's chosen DNS provider — typically Route 53, Cloudflare, or the buyer's internal DNS) to point operator/client traffic at the IONOS ALB DNS name. Optionally use weighted DNS for gradual cutover (10% / 50% / 100% over 24-72h) to limit blast radius if a regression is observed. |
 | `verify_cmd` | `curl --resolve <api-host>:443:<ionos-alb-ip> https://<api-host>/health` from a VPN-connected operator host |
-| `expected_output` | `200 OK` with healthy response from IONOS-side service; subsequent `GET /executions/<id>` returns rows from the IONOS DBaaS, not the AWS RDS. |
+| `expected_output` | `200 OK` with healthy response from IONOS-side service; subsequent `GET /executions/<id>` returns rows from the IONOS ScyllaDB Alternator cluster, not from AWS DynamoDB. |
 | `on_failure` | Rollback: revert DNS record to the AWS ALB. With a 60-second TTL on the DNS record, blast radius is minutes, not hours. Investigate the regression on IONOS-side without time pressure before re-attempting cutover. |
 | `human_gate` | **`true`** — production traffic cutover is irreversible at the user-perception layer (operators see whichever cloud answers their requests). Humans must sign off on the cutover window and confirm the rollback path is staged. |
 
@@ -310,6 +314,7 @@ The runbook places `human_gate: true` only at irreversible or identity-binding m
 
 | Step | Reason for gate |
 |---|---|
+| 1.2 — ScyllaDB Alternator cluster bootstrap | Self-hosted NoSQL bootstrap is order-sensitive (seed first, peers second), version-pin sensitive, and config-drift sensitive across the three nodes. Operator confirms `nodetool status` shows all three nodes `UN` before the runbook advances. |
 | 1.7 — DNS cutover | Production traffic cutover; user-perceived effect is irreversible at the moment of switching. |
 | 2.4 — Peer credential distribution | Identity-bound, auditable; recipient list must be verified by a human against the operator roster, not inferred by the agent. |
 | 2.5 — `terraform destroy` of AWS Client VPN endpoint | `terraform destroy` against a production resource; re-provisioning cost is hours; explicit human approval ties to observed clean-traffic window. |
@@ -337,3 +342,5 @@ The Phase 2 scaling runbook (`docs/scaling_runbook.md`, single-region → multi-
 - [ADR-0012](ADR/0012-migration-runbook-agent-executable.md) — The agent-executable spec format that this runbook implements.
 - [ADR-0015](ADR/0015-no-k8s-no-real-apply.md) — ECS Fargate as the case-study orchestration default; framing for Track 3's "starting point."
 - [ADR-0018](ADR/0018-managed-default-tool-selection.md) — Managed-default tool selection principle; supplies Track 3's trigger conditions for the upgrade.
+- [ADR-0042](ADR/0042-dynamodb-global-tables-greenfield-multi-region.md) — AWS-side data layer; the source primitive that Step 1.2 migrates from.
+- [ADR-0045](ADR/0045-ionos-data-layer-scylladb-alternator.md) — IONOS-side data-layer target choice (ScyllaDB Alternator self-hosted); the destination primitive that Step 1.2 migrates to, and the honest record of where multi-region active-active does not survive the migration.

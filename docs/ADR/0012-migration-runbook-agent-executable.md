@@ -64,3 +64,5 @@ The migration runbook (`docs/migration_runbook.md`) is an **agent-executable spe
 - ADR-0006 (VPN three-tier story — VPN modernisation track target is NetBird)
 - ADR-0007 (single-region; Phase 2 scaling runbook follows same format)
 - ADR-0010 (VPN ownership boundary — drives the two-track structure)
+- ADR-0042 (DynamoDB Global Tables — the AWS-side data layer that Track 1 step 1.2 migrates from)
+- ADR-0045 (ScyllaDB Alternator self-hosted — the IONOS-side target for Track 1 step 1.2; materialises the destination primitive)

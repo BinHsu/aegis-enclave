@@ -99,6 +99,8 @@ The brief makes no quantitative reliability requirement, but a senior deliverabl
 
 Each row traces back to a specific Terraform decision rather than standing as a free-floating number. RTO 15 min is supported by per-region 3-AZ posture (ADR-0007) + cross-region active-active routing (ADR-0042) — DNS failover ~60–300 s well within budget. RPO < 1 s on in-flight transactions comes from local-region synchronous commit; RPO ≤ 5 min on durable writes is met natively by DynamoDB Global Tables ~1 s replication lag. The trace is the value of the table; the digits without the trace would be filler.
 
+> **Scope note.** The numbers above are the **AWS-leg** posture. The IONOS migration target documented in `docs/migration_runbook.md` runs the data layer as a single 3-node ScyllaDB cluster across IONOS AZs in one datacenter (no cross-DC replication), per [ADR-0045](ADR/0045-ionos-data-layer-scylladb-alternator.md). RTO/RPO budgets at the IONOS leg differ; the migration is honest about losing multi-region active-active at the destination cloud.
+
 ### 1.3 Out of scope (named, not forgotten)
 
 The following operations layers are deliberately deferred under ADR-0003 and ADR-0015. Naming them is itself a senior signal — the candidate knows what production-grade looks like end-to-end and is choosing what fits the brief's scope, not stopping where their knowledge ends.
@@ -171,13 +173,13 @@ Every primitive in the Terraform composition publishes a baseline of CloudWatch 
 |---|---|---|
 | Internal ALB | `RequestCount`, `HTTPCode_Target_{2,3,4,5}XX_Count`, `TargetResponseTime` (p50 / p90 / p99 built-in), `HealthyHostCount`, `UnHealthyHostCount` | Access logs to S3 (per request: client IP, path, response code, latency, target group) |
 | ECS Fargate task | `CPUUtilization`, `MemoryUtilization`, container exit codes | stdout / stderr → CloudWatch Logs via `awslogs` driver (FastAPI's structured logging lands here intact) |
-| RDS PostgreSQL Multi-AZ | `CPUUtilization`, `DatabaseConnections`, `FreeableMemory`, `ReadIOPS` / `WriteIOPS`, `ReplicaLag` | PostgreSQL log + slow-query log → CloudWatch Logs |
+| DynamoDB Global Table | `ConsumedRead/WriteCapacityUnits`, `ThrottledRequests`, `SuccessfulRequestLatency`, `SystemErrors` / `UserErrors`, `ReplicationLatency` (cross-region) | No DB-side log; item-level access auditable via CloudTrail data events |
 | AWS Client VPN endpoint | `ActiveConnectionsCount`, `AuthenticationFailures`, `IngressBytes`, `EgressBytes` | Connection log: client cert CN, source IP, connect / disconnect timestamps |
 | VPC Flow Logs | (per-flow records) | All NIC-to-NIC traffic, including PrivateLink endpoint hits |
 
 The cloud-acceptance gate consumes this baseline by combining four evidence sources, captured before the stack is destroyed:
 
-1. **Aggregate metric dashboards** — ALB `RequestCount` / `TargetResponseTime` / 5xx, ECS task CPU / memory, RDS CPU / connections, Client VPN active connections. One screenshot per dashboard captures system-level health.
+1. **Aggregate metric dashboards** — ALB `RequestCount` / `TargetResponseTime` / 5xx, ECS task CPU / memory, DynamoDB consumed capacity / throttling, Client VPN active connections. One screenshot per dashboard captures system-level health.
 2. **Per-endpoint round-trip** — manual `curl` invocations against `/health`, `POST /primes`, and `GET /executions/{id}` with request and response bodies recorded. This is the per-endpoint correctness signal.
 3. **ALB access log lines** — pulled from S3 (or queried via Athena) for the `curl` timestamps. Each line carries the endpoint path, response code, latency, and target instance, providing the audit trail per request.
 4. **ECS CloudWatch Log entries** — corresponding FastAPI structured log lines for the same requests, providing the application-side view (DB query attempts, internal state, error context if any).
@@ -191,7 +193,7 @@ The ALB metrics aggregate across endpoints. For aegis-enclave specifically — t
 - **Per-endpoint latency.** A p99 spike on the ALB cannot tell whether `POST /primes` is degrading (expected under load) or `GET /health` is degrading (unexpected, likely a DB-connection or service-health canary). Mixed into one statistic, the smaller endpoint's signal is dominated and effectively invisible.
 - **Per-endpoint error rate.** A 5xx burst on `POST /primes` (e.g., a bad input range escaping validation) reads identically to a 5xx burst on `GET /executions/{id}` (e.g., DB unavailability). The remediation paths differ.
 - **Business-level dimensions.** Latency as a function of the requested range size (the dominant performance variable for `POST /primes`), cache hit vs miss for the prime-cache code path (ADR-0031), or per-tenant call patterns if multi-tenancy enters scope — none of these are visible from the ALB.
-- **Internal subsystem timing.** DB query duration, cache lookup duration, and computation time are a single black box from the ALB's perspective. Slow queries surface in the RDS slow-query log, but the linkage back to the API request that issued them is not.
+- **Internal subsystem timing.** DB query duration, cache lookup duration, and computation time are a single black box from the ALB's perspective. DynamoDB publishes table-level `SuccessfulRequestLatency`, but the linkage back to the API request that issued each call is not.
 
 The gap is between **infrastructure observability** (already free) and **application observability** (requires a decision).
 

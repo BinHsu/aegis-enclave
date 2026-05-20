@@ -120,4 +120,5 @@ Industry-pattern alternatives, sparse:
 - ADR-0030 (ElasticMQ local SQS parity — the pattern this ADR's `amazon/dynamodb-local` choice mirrors)
 - ADR-0037 (secret minimization — DDB IAM-based authn eliminates DB password rotation surface)
 - ADR-0041 (observability — SLI emission unchanged across data-layer choice)
+- ADR-0045 (IONOS-side data-layer migration target — ScyllaDB Alternator self-hosted; closes the destination-cloud parity gap for the migration runbook)
 - `docs/scaling_runbook.md` — the agent-executable runbook for this architecture
