@@ -1,6 +1,6 @@
 [project]
 name = "aegis-enclave"
-version = "0.1.0"
+version = "1.0.0"
 description = "VPN-gated cloud microservice template — prime number generator with audit trail"
 readme = "README.md"
 requires-python = ">=3.12"

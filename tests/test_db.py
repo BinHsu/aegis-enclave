@@ -49,7 +49,7 @@ def _aws_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
     monkeypatch.setenv("AWS_DEFAULT_REGION", _REGION)
     monkeypatch.setenv("DYNAMODB_TABLE_NAME", _TABLE_NAME)
-    monkeypatch.delenv("AWS_DYNAMODB_ENDPOINT_URL", raising=False)
+    monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
 
 
 @pytest.fixture()
@@ -662,7 +662,7 @@ class TestHealthCheck:
         db = _import_db()
         with patch.dict(
             os.environ,
-            {"AWS_DYNAMODB_ENDPOINT_URL": "http://127.0.0.1:9999"},
+            {"AWS_ENDPOINT_URL": "http://127.0.0.1:9999"},
         ):
             result = db.health_check()
         assert result is False
