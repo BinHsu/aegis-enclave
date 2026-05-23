@@ -3,6 +3,13 @@
 ## Status
 Accepted (2026-05-17)
 
+> A Proposed refinement of this ADR's regional-layer instantiation exists:
+> **ADR-0046** (N-region envs/ split + enable-catalog). It does **not** supersede
+> this ADR until accepted; this ADR remains the active design until then.
+> ADR-0046 keeps this ADR's platform/regional *layering* and changes only how
+> the regional layer is instantiated (per-region state + external orchestration
+> instead of explicit single-state module calls).
+
 ## Context
 
 The multi-region composition in `terraform/main.tf` was built by hand-mirroring:
