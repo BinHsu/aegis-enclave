@@ -144,6 +144,37 @@ is the orchestrator's job (Makefile/CI matrix over `enabled`). Adding the Nth
 region is **one catalog entry** (`enabled = true`) — no `.tf` change. This is
 the property ADR-0044 could not offer ("one new module call per region").
 
+Concretely, the apply flow changes from today's **single** `terraform apply
+terraform/` (one config, one state, providers + provider aliases inside it) to
+**1 + 1 + N applies**, each with its own state — exactly the aegis-platform
+shape:
+
+```bash
+# 1x, one-time (local state) — creates the S3 remote-state backend bucket.
+#     This is the terraform/envs/bootstrap env (NOT the cache prewarm task).
+cd envs/bootstrap && terraform init && terraform apply
+
+# 1x — global / singleton layer: DynamoDB Global Table + replica list,
+#      Route53, budget. Owns the one cross-region resource (DDB), so it must
+#      stay a single state.
+cd envs/platform  && terraform init -backend-config=... && terraform apply
+
+# Nx — once per ENABLED region; the loop is in the Makefile/CI, NOT in HCL.
+#      Each apply: one static `aws` provider bound to var.region, its own
+#      state key regional/<region>/terraform.tfstate, its own lock.
+for r in $(jq -r '.regions|to_entries[]|select(.value.enabled)|.key' regions.auto.tfvars.json); do
+  cd envs/regional && terraform init -backend-config="key=regional/$r/terraform.tfstate" \
+    && terraform apply -var="region=$r" ...
+done
+```
+
+The provider wall disappears because **no single apply ever faces more than one
+region** — the "iterate regions" loop moved out of Terraform (where providers
+can't be iterated) and into the Makefile (where it's just a shell `for`). The
+cost is the loss of the one-command apply: an ordered, multi-phase sequence
+(bootstrap → platform → regional×N) that `cloud-up.sh` / `cloud-down.sh` /
+`dr-drill.sh` must encode.
+
 ### 5. Validation (collapsed)
 
 ```hcl
