@@ -1,14 +1,15 @@
 # ADR-0044: Region-stack module — platform / regional layer separation
 
 ## Status
-Accepted (2026-05-17)
+Accepted (2026-05-17); regional-layer instantiation **Superseded by ADR-0046** (2026-05-27)
 
-> A Proposed refinement of this ADR's regional-layer instantiation exists:
-> **ADR-0046** (N-region envs/ split + enable-catalog). It does **not** supersede
-> this ADR until accepted; this ADR remains the active design until then.
-> ADR-0046 keeps this ADR's platform/regional *layering* and changes only how
-> the regional layer is instantiated (per-region state + external orchestration
-> instead of explicit single-state module calls).
+> **ADR-0046** (N-region envs/ split + enable-catalog) was accepted 2026-05-27 and
+> supersedes the *regional-layer instantiation* decision of this ADR. What survives:
+> this ADR's platform/regional **layering** insight. What changes: the regional layer
+> moves from "explicit single-state module calls per region" to "a single module
+> behind per-region state, iterated by external orchestration". The refactor is
+> deferred to implementation (tracked in issue #12); the code follows this ADR's
+> single-state model until ADR-0046 is implemented.
 
 ## Context
 
