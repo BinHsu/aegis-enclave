@@ -1,13 +1,16 @@
 # ADR-0046: N-region scaling — envs/ split + enable-catalog (refines ADR-0044)
 
 ## Status
-Proposed (2026-05-23)
+Accepted (2026-05-27)
 
-> Supersedes the regional-layer instantiation decision of **ADR-0044** *on
-> acceptance*. Until accepted, ADR-0044 remains the active design and its
-> Status is left unchanged (a Proposed ADR does not retroactively supersede an
-> Accepted one). This ADR is drafted during the pre-interview freeze
-> (≤ 2026-05-27) as a plan only — **no code changes accompany it.**
+> **Supersedes the regional-layer instantiation decision of ADR-0044** — its
+> platform/regional *layering* insight is retained; only "explicit single-state
+> module calls per region" is replaced by "a single module behind per-region
+> state, iterated by external orchestration". Accepted 2026-05-27 (after the
+> case-study interview). The decision is adopted, but the structural refactor is
+> **deferred to implementation** — tracked in GitHub issue #12 and the
+> Implementation plan below. Until that lands, the code still follows ADR-0044's
+> single-state, explicit-module-call model (N=2 cap).
 
 ## Context
 

@@ -105,6 +105,7 @@ These four set the scope, calibration framework, methodology, and target-shape t
 | [0043](0043-finops-opt-in-budget-guardrail.md) | Opt-in, forker-tunable `aws_budgets_budget` cost guardrail |
 | [0044](0044-region-stack-module-platform-regional-split.md) | `region-stack` module — platform/regional layer split, `platform_region` + `regions` map |
 | [0045](0045-ionos-data-layer-scylladb-alternator.md) | IONOS-side migration target: self-hosted ScyllaDB Alternator (DynamoDB-wire-compatible); closes the destination-cloud parity gap left by ADR-0042 |
+| [0046](0046-n-region-envs-split-enable-catalog.md) | N-region scaling — `envs/` split + enable-catalog (Pattern X); accepted refinement of ADR-0044's regional-layer instantiation, lifts the N=2 cap (implementation deferred, issue #12) |
 
 ---
 
