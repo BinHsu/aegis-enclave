@@ -11,12 +11,20 @@
 #   app            — FastAPI prime service (no host port published)
 #   worker         — SQS consumer loop (reuses app image, different CMD)
 #   bootstrap      — One-shot cache pre-warm task (profiles: bootstrap — manual trigger only)
-#   wg-gateway     — WireGuard server (UDP/51820 published to host)
+#   wg-gateway     — WireGuard server (UDP/51820 published to host, dual-homed)
 #   test-client    — Verification harness with curl + wireguard-tools + Python (sympy oracle)
 #
-# Verification (per ADR-0013): smoke test runs from test-client container.
-# Negative test (per ADR-0014): host-side curl to localhost:8000 must FAIL
-# because port 8000 is NOT published.
+# Networks (segmented per #13):
+#   edge     — host-visible surface; wg-gateway:51820/udp is the ONLY port
+#              published to the host; test-client sits here.
+#   internal — `internal: true` (no outbound NAT, no cross-network routing
+#              except via wg-gateway); app / worker / data tier live here.
+#
+# Verification (per ADR-0013): smoke.sh runs from test-client (edge-only),
+# brings up the WireGuard tunnel, and reaches app:8000 ONLY through the gateway
+# — same shape as the cloud Client VPN -> internal ALB path.
+# Negative test (per ADR-0014): host-side `curl localhost:8000` must FAIL
+# because the only published port on the host is 51820/udp on the gateway.
 
 services:
   # ─── Data tier ───────────────────────────────────────────────────────────────
@@ -41,7 +49,7 @@ services:
       timeout: 3s
       retries: 10
     networks:
-      - enclave-net
+      - internal
     # Intentionally NOT publishing port 8000 — DynamoDB Local is reachable only
     # inside the Docker network, satisfying the "no direct access" property of
     # the brief.
@@ -76,7 +84,7 @@ services:
     profiles:
       - bootstrap
     networks:
-      - enclave-net
+      - internal
 
   valkey:
     image: valkey/valkey:7-alpine
@@ -90,7 +98,7 @@ services:
       timeout: 3s
       retries: 10
     networks:
-      - enclave-net
+      - internal
 
   elasticmq:
     # SQS-compatible local queue. Pinned to 1.6.x per strategy.md § D.
@@ -109,7 +117,7 @@ services:
       retries: 10
       start_period: 10s
     networks:
-      - enclave-net
+      - internal
 
   # ─── Application tier ─────────────────────────────────────────────────────
 
@@ -143,7 +151,7 @@ services:
       BACKPRESSURE_FACTOR: "5"
       WORKER_COUNT: "1"
     networks:
-      - enclave-net
+      - internal
     # Intentionally NOT publishing port 8000 — the API is reachable only
     # through the VPN gateway (or, for verification, from the test-client
     # container which is on the internal network).
@@ -186,7 +194,7 @@ services:
     # before acking — so we can be aggressive here without losing messages.
     stop_grace_period: 60s
     networks:
-      - enclave-net
+      - internal
 
   bootstrap:
     # One-shot cache pre-warm task. NOT started by default — run manually:
@@ -214,7 +222,7 @@ services:
     profiles:
       - bootstrap
     networks:
-      - enclave-net
+      - internal
 
   # ─── VPN + verification tier ──────────────────────────────────────────────
 
@@ -236,7 +244,15 @@ services:
       PEERS: "1"
       PEERDNS: "auto"
       INTERNAL_SUBNET: "10.13.13.0"
-      ALLOWEDIPS: "0.0.0.0/0"
+      # Routed-VPN model: peers route the internal Docker subnet plus the WG
+      # link subnet through the tunnel (mirrors AWS Client VPN giving routes
+      # INTO the VPC — not a full-tunnel default route). The 10.13.13.0/24
+      # entry is required so peers can reach the gateway's tunnel IP
+      # (10.13.13.1) — which they need to query CoreDNS for `app` / `valkey`
+      # / etc. resolution. 172.30.0.0/16 matches the `internal` Docker
+      # network's fixed CIDR, so peer-side curl to app:8000 routes through
+      # the tunnel into internal via gateway's PostUp MASQUERADE.
+      ALLOWEDIPS: "10.13.13.0/24, 172.30.0.0/16"
     volumes:
       - ./wireguard/config:/config
       - /lib/modules:/lib/modules:ro
@@ -249,7 +265,10 @@ services:
       retries: 3
       start_period: 15s
     networks:
-      - enclave-net
+      # Dual-homed: one foot on edge (publishes 51820/udp; the only host-visible
+      # surface) + one foot on internal (forwards tunnel traffic to app/data).
+      - edge
+      - internal
 
   test-client:
     image: alpine:3.20
@@ -257,23 +276,43 @@ services:
     depends_on:
       app:
         condition: service_healthy
+      wg-gateway:
+        condition: service_healthy
+    # NET_ADMIN is required for `wg-quick up` to create the wg0 interface and
+    # add routes. The wg-gateway peer config (peer1.conf) is mounted read-only
+    # so smoke.sh can copy + rewrite the Endpoint, then `wg-quick up wg0`.
+    cap_add:
+      - NET_ADMIN
     volumes:
       - ./test-client:/work:ro
+      - ./wireguard/config:/wg-config:ro
     working_dir: /work
+    # Edge-only on purpose: test-client has NO direct path to app/worker/data
+    # on `internal`. The only way it can reach app:8000 is to bring up the
+    # WireGuard tunnel and let the gateway forward into internal — which is
+    # exactly the VPN-gated property we want to verify (per ADR-0006 + #13).
     networks:
-      - enclave-net
-    # Stays running so `docker compose run --rm test-client ./smoke.sh` can
-    # exec inside; on first start it installs verification tools.
-    # Python3 + sympy needed for prime oracle in smoke step 3.
-    # py3-sympy is in the Alpine package repository and avoids PEP 668 issues.
+      - edge
     entrypoint: ["sh", "-c"]
     command:
       - |
-        apk add --no-cache curl jq wireguard-tools python3 py3-sympy >/dev/null 2>&1 || true
+        apk add --no-cache curl jq wireguard-tools openresolv iptables iproute2 python3 py3-sympy >/dev/null 2>&1 || true
         exec sleep infinity
 
 networks:
-  enclave-net:
+  # Edge: plain bridge. Carries the only host-published port (wg-gateway
+  # 51820/udp) and is the only network the test-client sees. From `edge` there
+  # is no route to `internal` except through the dual-homed wg-gateway.
+  edge:
     driver: bridge
-    # Internal only — no NAT to internet from this network is required for
-    # the demo. The only externally-reachable surface is wg-gateway:51820/udp.
+  # Internal: `internal: true` blocks outbound NAT and cross-network bridging.
+  # app / worker / data tier sit here and are unreachable from anywhere except
+  # the wg-gateway (which is also on this network). Fixed CIDR so the gateway's
+  # WireGuard `ALLOWEDIPS = 172.30.0.0/16` matches this subnet — peers route
+  # this CIDR through the tunnel (routed-VPN model, mirrors AWS Client VPN).
+  internal:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
