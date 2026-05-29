@@ -175,7 +175,12 @@ Every primitive in the Terraform composition publishes a baseline of CloudWatch 
 | ECS Fargate task | `CPUUtilization`, `MemoryUtilization`, container exit codes | stdout / stderr → CloudWatch Logs via `awslogs` driver (FastAPI's structured logging lands here intact) |
 | DynamoDB Global Table | `ConsumedRead/WriteCapacityUnits`, `ThrottledRequests`, `SuccessfulRequestLatency`, `SystemErrors` / `UserErrors`, `ReplicationLatency` (cross-region) | No DB-side log; item-level access auditable via CloudTrail data events |
 | AWS Client VPN endpoint | `ActiveConnectionsCount`, `AuthenticationFailures`, `IngressBytes`, `EgressBytes` | Connection log: client cert CN, source IP, connect / disconnect timestamps |
-| VPC Flow Logs | (per-flow records) | All NIC-to-NIC traffic, including PrivateLink endpoint hits |
+<!-- VPC Flow Logs row removed (#9 item 6): the design doc previously listed
+     VPC Flow Logs as a shipped emission, but `network.tf` instantiates the
+     `terraform-aws-modules/vpc/aws` module without `enable_flow_log = true`,
+     so no flow log destination is provisioned. For PoC scope this drift is
+     closed by removing the claim; for a BSI-C5 / production-direction forker,
+     flip the module flag and add the destination + retention. -->
 
 The cloud-acceptance gate consumes this baseline by combining four evidence sources, captured before the stack is destroyed:
 
@@ -245,7 +250,7 @@ The migration runbook (`docs/migration_runbook.md`) is the right place to record
 
 ### 3.5 Calibration recap
 
-The architecture above mirrors the calibration shape in § 1.3: name the architecture, scope the implementation. The shipped observability tier (per [ADR-0041](ADR/0041-observability-amp-amg-not-grafana-cloud.md)) is CloudWatch SLI emission via EMF + 6-panel dashboard + multi-window burn-rate alarms + opt-in SNS email delivery. The distributed-tracing layer (§ 3.4) remains a forker-promotion path documented in `production_adoption.md` § Observability at production scale. We have neither Prometheus the system nor Grafana the UI; we have CloudWatch the AWS-native equivalent, scoped to what an apply-then-destroy evidence model can deliver as screenshots.
+The architecture above mirrors the calibration shape in § 1.3: name the architecture, scope the implementation. The shipped observability tier (per [ADR-0041](ADR/0041-observability-cloudwatch-emf-not-grafana-cloud.md)) is CloudWatch SLI emission via EMF + 6-panel dashboard + multi-window burn-rate alarms + opt-in SNS email delivery. The distributed-tracing layer (§ 3.4) remains a forker-promotion path documented in `production_adoption.md` § Observability at production scale. We have neither Prometheus the system nor Grafana the UI; we have CloudWatch the AWS-native equivalent, scoped to what an apply-then-destroy evidence model can deliver as screenshots.
 
 ## 4. Async architecture + cost guards
 
@@ -266,10 +271,12 @@ INPUT BOUNDS
   start, end ∈ ℤ, start ≥ 2, end ≥ start, end - start ≤ 10⁷
   out-of-bounds → 422
 
-THROUGHPUT
-  sustained:   ~20 req/sec/worker (cache-miss-bound; cache-hit ~30 req/sec)
-  peak burst:  up to (5 × worker_count) queued before back-pressure kicks
-  overload:    503 + Retry-After: 60s
+THROUGHPUT (single-threaded worker; per-worker rate ≈ 1 / job_duration — see LATENCY)
+  cache hit:        up to ~10 req/sec/worker (bounded by < 100 ms lookup + DDB write)
+  cache miss ≤ 10⁵: ~2 req/sec/worker        (< 500 ms compute)
+  cache miss → 10⁷: ~1 job / 60 s/worker     (up to the SIGALRM budget; the §4.1 burst-drain floor)
+  peak burst:       up to (5 × worker_count) queued before back-pressure kicks
+  overload:         503 + Retry-After: 60s
 
 LATENCY (P50)
   cache hit:                     < 100 ms

@@ -89,7 +89,7 @@ These four set the scope, calibration framework, methodology, and target-shape t
 | [0036](0036-image-tag-git-sha-immutable-ecr.md) | Git-SHA image tagging + `--provenance=false --sbom=false` for IMMUTABLE-friendly deterministic ECR manifests |
 | [0037](0037-secrets-manager-rotation-deferred.md) | Secret minimization posture — IAM-first, mTLS over token, passwordless data plane |
 | [0038](0038-dlq-alarm-triage-not-auto-retry.md) | DLQ pattern: CloudWatch alarm + manual triage script, NOT auto-retry worker (anti-pattern analysis) |
-| [0041](0041-observability-amp-amg-not-grafana-cloud.md) | Observability backend: CloudWatch SLI emission + multi-window burn-rate alarms + opt-in SNS email |
+| [0041](0041-observability-cloudwatch-emf-not-grafana-cloud.md) | Observability backend: CloudWatch SLI emission + multi-window burn-rate alarms + opt-in SNS email |
 
 ### C-SUPPORTING (tool choices, build hygiene, dev parity)
 

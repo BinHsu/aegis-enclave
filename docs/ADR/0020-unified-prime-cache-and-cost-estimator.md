@@ -20,7 +20,7 @@ A single guard cannot cover all three. Schema-level rejection blocks unbounded i
 | Policy choice | Value | Source |
 |---|---|---|
 | Worker count baseline | 3 | per-AZ posture (ADR-0007 — one task per AZ) |
-| Per-task time budget | 60 s SIGALRM | derived from worst-case range 10⁷ sieve cost on Fargate compute profile |
+| Per-task time budget | 60 s SIGALRM | SLO-derived round minute (300 s SLO / 5 polls); not benchmark-anchored — see § Per-task budget honesty below |
 | Acceptable p99 queue wait | 5 min | SLO calibration per Tier 2 ops support (ADR-0008) |
 
 Once these three policy values are set, the layer constants below are **derived, not chosen**.
