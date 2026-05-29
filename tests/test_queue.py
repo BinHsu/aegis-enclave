@@ -366,16 +366,27 @@ class TestParseBody:
 
 
 class TestQueueEnvironmentConfig:
-    """Verify AWS_SQS_ENDPOINT_URL override is passed to boto3 client."""
+    """Verify AWS_SQS_ENDPOINT_URL override is passed to boto3 client.
+
+    Per issue #10, the boto3 SQS client is now a module-level singleton
+    constructed lazily inside ``_get_client()`` — not in ``PrimeQueue.__init__``.
+    These tests reset the singleton, then trigger the lazy construction by
+    calling ``_get_client()`` directly, and assert the env-var was passed
+    through correctly.
+    """
 
     def test_endpoint_url_passed_to_boto3(self) -> None:
+        from prime_service.queue import _get_client, reset_for_testing
+
+        reset_for_testing()
         with patch("prime_service.queue.boto3.client") as mock_client_factory:
             mock_client_factory.return_value = MagicMock()
             os.environ["AWS_SQS_ENDPOINT_URL"] = "http://localhost:9324"
             try:
-                PrimeQueue()
+                _get_client()  # triggers the lazy construction
             finally:
                 del os.environ["AWS_SQS_ENDPOINT_URL"]
+                reset_for_testing()
             mock_client_factory.assert_called_once()
             call_kwargs = mock_client_factory.call_args
             assert call_kwargs.kwargs.get("endpoint_url") == "http://localhost:9324" or (
@@ -383,9 +394,15 @@ class TestQueueEnvironmentConfig:
             )
 
     def test_no_endpoint_url_when_unset(self) -> None:
+        from prime_service.queue import _get_client, reset_for_testing
+
+        reset_for_testing()
         os.environ.pop("AWS_SQS_ENDPOINT_URL", None)
         with patch("prime_service.queue.boto3.client") as mock_client_factory:
             mock_client_factory.return_value = MagicMock()
-            PrimeQueue()
+            try:
+                _get_client()  # triggers the lazy construction
+            finally:
+                reset_for_testing()
             call_kwargs = mock_client_factory.call_args
             assert call_kwargs.kwargs.get("endpoint_url") is None
