@@ -8,6 +8,10 @@
 #                    runs `aws dynamodb create-table` once and exits)
 #   valkey         — Valkey 7 (Redis-compatible cache; local parity for ElastiCache Serverless)
 #   elasticmq      — ElasticMQ (SQS-compatible local queue; parity for AWS SQS)
+#   minio          — MinIO (S3-compatible local object store; parity for S3 — ADR-0048)
+#   minio-bootstrap — One-shot bucket-create task (profiles: bootstrap — MinIO
+#                    has no auto-create on start, so this profile runs
+#                    `mc mb` once and exits)
 #   app            — FastAPI prime service (no host port published)
 #   worker         — SQS consumer loop (reuses app image, different CMD)
 #   bootstrap      — One-shot cache pre-warm task (profiles: bootstrap — manual trigger only)
@@ -69,7 +73,10 @@ services:
       AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb-local:8000
       AWS_DEFAULT_REGION: eu-central-1
       AWS_ACCESS_KEY_ID: local
-      AWS_SECRET_ACCESS_KEY: local
+      # Aligned with MINIO_ROOT_PASSWORD (>= 8 chars per MinIO requirement);
+      # dynamodb-local + elasticmq accept any non-empty credential so this
+      # single value works across all three local emulators.
+      AWS_SECRET_ACCESS_KEY: local12345
     # create-table is idempotent-ish: subsequent runs return ResourceInUseException.
     # We tolerate that (|| true) so re-running the bootstrap profile is safe.
     entrypoint: ["/bin/sh", "-c"]
@@ -97,6 +104,54 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    networks:
+      - internal
+
+  minio:
+    # S3-compatible local object store. Cloud parity: real S3 buckets per
+    # region with bidirectional CRR (ADR-0048). Holds the gzipped primes-
+    # list payloads; the DDB row carries only the s3_key pointer.
+    # No host port published — reachable only inside the internal Docker
+    # network (alongside app / worker / data tier).
+    image: minio/minio:latest
+    container_name: enclave-minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: local
+      # MinIO requires the root password to be >= 8 chars; matches the
+      # AWS_SECRET_ACCESS_KEY=local12345 we hand to boto3 below.
+      MINIO_ROOT_PASSWORD: local12345
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - internal
+
+  minio-bootstrap:
+    # One-shot bucket-create task. MinIO has no auto-create on start —
+    # buckets must be made via the API or `mc mb`. Profiles guard
+    # prevents accidental start on `docker compose up`; invoke manually:
+    #   docker compose --profile bootstrap run --rm minio-bootstrap
+    # (Pattern mirrors `ddb-bootstrap`.)
+    image: minio/mc:latest
+    container_name: enclave-minio-bootstrap
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    # `mc alias set` configures `mc` with the local MinIO credentials;
+    # `mc mb --ignore-existing` is idempotent so re-running the profile
+    # is safe (no error if the bucket already exists).
+    command:
+      - |
+        mc alias set localminio http://minio:9000 local local12345
+        mc mb --ignore-existing localminio/aegis-enclave-results-eu-central-1
+    profiles:
+      - bootstrap
     networks:
       - internal
 
@@ -134,17 +189,29 @@ services:
         condition: service_healthy
       elasticmq:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     environment:
       DYNAMODB_TABLE_NAME: aegis-enclave-executions
       AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb-local:8000
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # SQS / Valkey endpoints — overridden to local containers in dev.
       AWS_SQS_ENDPOINT_URL: http://elasticmq:9324
+      # boto3 per-service S3 endpoint (#9.8 family); points at the local
+      # MinIO emulator. ADR-0048: s3_store reads this to talk to MinIO.
+      AWS_ENDPOINT_URL_S3: http://minio:9000
       AWS_DEFAULT_REGION: eu-central-1
+      # AWS_REGION drives the bucket name in s3_store._bucket_for() so
+      # the local container reads/writes the same bucket the bootstrap
+      # task created.
+      AWS_REGION: eu-central-1
       # Dummy credentials required by boto3 even when talking to ElasticMQ /
       # DynamoDB Local.
       AWS_ACCESS_KEY_ID: local
-      AWS_SECRET_ACCESS_KEY: local
+      # Aligned with MINIO_ROOT_PASSWORD (>= 8 chars per MinIO requirement);
+      # dynamodb-local + elasticmq accept any non-empty credential so this
+      # single value works across all three local emulators.
+      AWS_SECRET_ACCESS_KEY: local12345
       VALKEY_ENDPOINT: valkey:6379
       VALKEY_TLS: "false"
       # Backpressure: 5 × worker_count = 5 × 1 = 5 (strategy.md § D)
@@ -171,13 +238,25 @@ services:
         condition: service_healthy
       elasticmq:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     environment:
       DYNAMODB_TABLE_NAME: aegis-enclave-executions
       AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb-local:8000
       AWS_SQS_ENDPOINT_URL: http://elasticmq:9324
+      # boto3 per-service S3 endpoint (#9.8 family); points at the local
+      # MinIO emulator. ADR-0048: s3_store reads this to talk to MinIO.
+      AWS_ENDPOINT_URL_S3: http://minio:9000
       AWS_DEFAULT_REGION: eu-central-1
+      # AWS_REGION drives the bucket name in s3_store._bucket_for() so
+      # the local container reads/writes the same bucket the bootstrap
+      # task created.
+      AWS_REGION: eu-central-1
       AWS_ACCESS_KEY_ID: local
-      AWS_SECRET_ACCESS_KEY: local
+      # Aligned with MINIO_ROOT_PASSWORD (>= 8 chars per MinIO requirement);
+      # dynamodb-local + elasticmq accept any non-empty credential so this
+      # single value works across all three local emulators.
+      AWS_SECRET_ACCESS_KEY: local12345
       VALKEY_ENDPOINT: valkey:6379
       VALKEY_TLS: "false"
     # Override the Dockerfile CMD to start the worker consumer loop.
@@ -213,9 +292,19 @@ services:
       DYNAMODB_TABLE_NAME: aegis-enclave-executions
       AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb-local:8000
       AWS_SQS_ENDPOINT_URL: http://elasticmq:9324
+      # boto3 per-service S3 endpoint (#9.8 family); points at the local
+      # MinIO emulator. ADR-0048: s3_store reads this to talk to MinIO.
+      AWS_ENDPOINT_URL_S3: http://minio:9000
       AWS_DEFAULT_REGION: eu-central-1
+      # AWS_REGION drives the bucket name in s3_store._bucket_for() so
+      # the local container reads/writes the same bucket the bootstrap
+      # task created.
+      AWS_REGION: eu-central-1
       AWS_ACCESS_KEY_ID: local
-      AWS_SECRET_ACCESS_KEY: local
+      # Aligned with MINIO_ROOT_PASSWORD (>= 8 chars per MinIO requirement);
+      # dynamodb-local + elasticmq accept any non-empty credential so this
+      # single value works across all three local emulators.
+      AWS_SECRET_ACCESS_KEY: local12345
       VALKEY_ENDPOINT: valkey:6379
       VALKEY_TLS: "false"
     command: ["python", "-m", "prime_service.bootstrap"]

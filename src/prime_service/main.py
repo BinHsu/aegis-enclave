@@ -37,7 +37,7 @@ from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.gzip import GZipMiddleware
 
-from prime_service import __version__
+from prime_service import __version__, s3_store
 from prime_service.db import (
     get_execution,
     health_check,
@@ -261,7 +261,15 @@ async def compute_primes(
 async def get_primes_result(
     execution_id: str,
 ) -> ExecutionResponse:
-    """Return the current state of a queued prime-computation job."""
+    """Return the current state of a queued prime-computation job.
+
+    For status=done, the primes list is fetched from the local-region S3
+    bucket via the row's `s3_key` (ADR-0048). The server is **stateless**
+    on retries: on S3 NoSuchKey it distinguishes replication lag (transient
+    → 503 + Retry-After: 20) from lifecycle expiry (genuine loss → 410)
+    by comparing the row's `completed_at` against `s3_store._LIFECYCLE_TTL_S`.
+    The client owns its retry budget (reference: 3 × 20 s = 60 s).
+    """
     structlog.contextvars.bind_contextvars(execution_id=execution_id)
     row = get_execution(execution_id)
     if row is None:
@@ -273,11 +281,59 @@ async def get_primes_result(
     row_status = row["status"]
     log.info("job_query", status=row_status)
 
-    # Convert Decimal list back to int for the response
     primes: list[int] | None = None
     if row_status == Status.done.value:
-        raw_primes = row.get("primes", [])
-        primes = [int(p) for p in raw_primes]
+        s3_key = row.get("s3_key")
+        if not s3_key:
+            # Defensive: a `done` row without s3_key shouldn't exist after
+            # ADR-0048, but old rows from before the migration might.
+            log.warning("done_row_missing_s3_key")
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail="result pointer missing (pre-ADR-0048 audit row?)",
+            )
+        try:
+            primes = s3_store.get_primes(str(s3_key))
+        except ClientError as exc:
+            err_code = exc.response.get("Error", {}).get("Code", "")
+            if err_code not in ("NoSuchKey", "404"):
+                # Genuine S3 failure (auth, network, etc.). Surface it.
+                log.error("s3_get_failed", error=str(exc), code=err_code)
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="result store unreachable",
+                    headers={"Retry-After": "20"},
+                ) from exc
+            # NoSuchKey — either replication has not yet arrived or the
+            # lifecycle policy has removed the object. Distinguish by the
+            # audit row's `completed_at` age (per ADR-0048 § 5).
+            completed_at_raw = row.get("completed_at")
+            now_epoch = int(time.time())
+            if completed_at_raw is None:
+                # `done` row without completed_at is anomalous; treat as 503.
+                log.warning("done_row_missing_completed_at")
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="result not yet replicated to this region; retry",
+                    headers={"Retry-After": "20"},
+                ) from exc
+            age_s = now_epoch - int(completed_at_raw)
+            if age_s > s3_store._LIFECYCLE_TTL_S:
+                # The S3 lifecycle policy has deleted the payload; the row
+                # outlived it. Genuine, permanent loss — client re-POSTs.
+                log.info("s3_lifecycle_expired", age_s=age_s)
+                raise HTTPException(
+                    status_code=status.HTTP_410_GONE,
+                    detail="result expired per retention policy",
+                ) from exc
+            # Replication has not yet caught up. Retry-After is advisory;
+            # the client owns its retry budget (ADR-0048 § 5).
+            log.info("s3_replication_lag", age_s=age_s)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="result not yet replicated to this region; retry",
+                headers={"Retry-After": "20"},
+            ) from exc
 
     return ExecutionResponse(
         id=execution_id,
@@ -291,7 +347,13 @@ async def get_primes_result(
 async def fetch_execution(
     execution_id: str,
 ) -> dict[str, Any]:
-    """Legacy: return raw execution audit detail by id."""
+    """Legacy: return raw execution audit detail by id.
+
+    Per ADR-0048 the primes list lives in S3, not DDB; this audit endpoint
+    returns the metadata + s3_key pointer only. Use GET /primes/{id} to
+    fetch the actual primes list (it handles cache + S3 + replication-lag
+    response codes properly).
+    """
     structlog.contextvars.bind_contextvars(execution_id=execution_id)
     row = get_execution(execution_id)
     if row is None:
@@ -306,7 +368,7 @@ async def fetch_execution(
         "range_start": int(row.get("range_start", 0)),
         "range_end": int(row.get("range_end", 0)),
         "primes_count": int(row.get("primes_count", 0)),
-        "primes": [int(p) for p in row.get("primes", [])],
+        "s3_key": row.get("s3_key"),
         "duration_ms": int(row.get("duration_ms", 0)),
         "created_at": str(row.get("created_at", "")),
         "status": row["status"],

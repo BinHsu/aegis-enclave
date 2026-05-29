@@ -65,6 +65,11 @@ def _done_item(
     execution_id: str | None = None,
     primes: list[int] | None = None,
 ) -> dict[str, Any]:
+    """Build a fake DDB done row. Per ADR-0048 the row carries `s3_key`,
+    NOT the primes list. The `primes` kwarg is kept for backward call
+    compatibility but only its length is used (for primes_count); tests
+    that want the primes list returned should also
+    `patch("prime_service.s3_store.get_primes", return_value=primes)`."""
     eid = execution_id or _make_uuid()
     if primes is None:
         primes = [2, 3, 5, 7]
@@ -73,7 +78,7 @@ def _done_item(
         "status": "done",
         "range_start": 2,
         "range_end": 10,
-        "primes": primes,
+        "s3_key": f"done/{eid}.json.gz",
         "primes_count": len(primes),
         "duration_ms": 50,
         "created_at": 1745654400,
@@ -400,9 +405,13 @@ class TestGetPrimesResult:
     async def test_done_status_includes_result(self) -> None:
         eid = _make_uuid()
         item = _done_item(execution_id=eid, primes=[2, 3, 5, 7])
+        # Per ADR-0048 the primes list lives in S3, not the DDB row.
+        # Override conftest's default get_primes stub (which returns []) so
+        # this test sees the actual list it expects.
         with patch("prime_service.main.get_execution", return_value=item):
-            async with await make_client() as ac:
-                r = await ac.get(f"/primes/{eid}")
+            with patch("prime_service.s3_store.get_primes", return_value=[2, 3, 5, 7]):
+                async with await make_client() as ac:
+                    r = await ac.get(f"/primes/{eid}")
 
         assert r.status_code == 200
         body = r.json()
@@ -496,7 +505,7 @@ class TestFetchExecutionEndpoint:
             "range_start": 2,
             "range_end": 10,
             "primes_count": 4,
-            "primes": [2, 3, 5, 7],
+            "s3_key": f"done/{eid}.json.gz",
             "duration_ms": 5,
             "created_at": 1745654400,
         }
@@ -508,7 +517,10 @@ class TestFetchExecutionEndpoint:
         body = r.json()
         assert body["id"] == eid
         assert body["primes_count"] == 4
-        assert body["primes"] == [2, 3, 5, 7]
+        # Per ADR-0048: /executions/{id} is the audit endpoint — it returns
+        # the s3_key pointer; the primes list is fetched separately via
+        # GET /primes/{id} (which handles cache + S3 + lag/lifecycle codes).
+        assert body["s3_key"] == f"done/{eid}.json.gz"
         assert body["status"] == "done"
 
     @pytest.mark.asyncio
@@ -521,7 +533,10 @@ class TestFetchExecutionEndpoint:
         assert r.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_empty_primes_returned_as_empty_list(self) -> None:
+    async def test_empty_primes_count_is_zero(self) -> None:
+        """A `done` row with zero primes (e.g. range [14,16]) reports 0 in
+        the audit endpoint. Per ADR-0048 the primes list is no longer
+        carried by /executions/{id} — only the count + s3_key."""
         eid = _make_uuid()
         item = {
             "execution_id": eid,
@@ -529,6 +544,7 @@ class TestFetchExecutionEndpoint:
             "range_start": 14,
             "range_end": 16,
             "primes_count": 0,
+            "s3_key": f"done/{eid}.json.gz",
             "duration_ms": 5,
             "created_at": 1745654400,
         }
@@ -538,7 +554,8 @@ class TestFetchExecutionEndpoint:
 
         assert r.status_code == 200
         body = r.json()
-        assert body["primes"] == []
+        assert body["primes_count"] == 0
+        assert body["s3_key"] == f"done/{eid}.json.gz"
 
 
 # ───────────────────────────────────────────────────────────────────────────
