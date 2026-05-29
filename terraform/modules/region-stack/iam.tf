@@ -68,6 +68,33 @@ data "aws_iam_policy_document" "worker_policy" {
       "${local.dynamodb_region_arn}/index/*",
     ]
   }
+
+  # ADR-0048: result store. ECS tasks need Get + Put on objects under
+  # this region's results bucket; replica reads from peer-replicated keys
+  # use the SAME bucket name (CRR puts the object in the local bucket).
+  # Scoped to bucket-relative keys only — no DeleteObject (lifecycle policy
+  # handles deletion); no PutBucket* (terraform owns those).
+  # tfsec false positive: '<bucket>/*' is the canonical and minimum scope
+  # for "all objects in this one bucket"; same idiom as the DDB statement
+  # above and as recommended by AWS S3 IAM examples.
+  #tfsec:ignore:aws-iam-no-policy-wildcards
+  statement {
+    sid = "S3ResultsRW"
+    actions = [
+      "s3:GetObject",
+      "s3:PutObject",
+    ]
+    resources = ["${aws_s3_bucket.results.arn}/*"]
+  }
+
+  # ADR-0048: explicit bucket-level ListBucket is needed when the SDK
+  # checks for existence (HeadObject paths sometimes synthesise a ListBucket
+  # under the hood, and Get/PutObject's 403 vs 404 disambiguation needs it).
+  statement {
+    sid       = "S3ResultsList"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.results.arn]
+  }
 }
 
 resource "aws_iam_role_policy" "worker_inline" {

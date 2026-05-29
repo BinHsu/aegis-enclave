@@ -198,6 +198,13 @@ module "region_platform" {
   valkey_max_storage_gb         = var.valkey_max_storage_gb
   valkey_max_ecpu_per_sec       = var.valkey_max_ecpu_per_sec
   alarm_email                   = var.alarm_email
+
+  # ADR-0048: result store. Peer ARN wired only when has_peer; the module's
+  # replication IAM policy gates the peer-side statement on this being non-null.
+  # The CRR config itself lives at root (below) to avoid a module-level cycle
+  # (module A would need module B's bucket ARN as an input and vice versa).
+  result_bucket_prefix    = var.result_bucket_prefix
+  peer_results_bucket_arn = local.has_peer ? module.region_peer[0].results_bucket_arn : null
 }
 
 module "region_peer" {
@@ -230,6 +237,59 @@ module "region_peer" {
   valkey_max_storage_gb         = var.valkey_max_storage_gb
   valkey_max_ecpu_per_sec       = var.valkey_max_ecpu_per_sec
   alarm_email                   = var.alarm_email
+
+  # ADR-0048: result store. Peer's "peer" is the platform region; always non-null
+  # when peer module exists (the peer module only exists when has_peer is true).
+  result_bucket_prefix    = var.result_bucket_prefix
+  peer_results_bucket_arn = module.region_platform.results_bucket_arn
+}
+
+# ─── CRR config — bidirectional, rooted (ADR-0048 § 2) ──────────────────────
+# Lives at root rather than inside the region-stack module to avoid the
+# module-level circular dependency the bidirectional wiring would otherwise
+# create (each module would need the other's bucket ARN as an input).
+# Both replication_configuration resources only exist when has_peer is true.
+resource "aws_s3_bucket_replication_configuration" "platform_to_peer" {
+  count = local.has_peer ? 1 : 0
+
+  bucket = module.region_platform.results_bucket_id
+  role   = module.region_platform.s3_replication_role_arn
+
+  rule {
+    id     = "platform-to-peer"
+    status = "Enabled"
+    filter {}
+    delete_marker_replication {
+      status = "Enabled"
+    }
+    destination {
+      bucket        = module.region_peer[0].results_bucket_arn
+      storage_class = "STANDARD"
+    }
+  }
+}
+
+resource "aws_s3_bucket_replication_configuration" "peer_to_platform" {
+  count = local.has_peer ? 1 : 0
+
+  # This resource manages the peer-region bucket, so it must use the peer provider.
+  provider = aws.peer
+
+  bucket = module.region_peer[0].results_bucket_id
+  role   = module.region_peer[0].s3_replication_role_arn
+
+  rule {
+    id     = "peer-to-platform"
+    status = "Enabled"
+    filter {}
+    delete_marker_replication {
+      status = "Enabled"
+    }
+    destination {
+      bucket        = module.region_platform.results_bucket_arn
+      storage_class = "STANDARD"
+    }
+  }
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
