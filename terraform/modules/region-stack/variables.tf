@@ -122,6 +122,20 @@ variable "valkey_max_storage_gb" {
   default     = 1
 }
 
+# ─── Result store (ADR-0048) ────────────────────────────────────────────────
+
+variable "result_bucket_prefix" {
+  description = "Prefix for the per-region result bucket name. Final name is '<prefix>-<region>'. See ADR-0048 § 2."
+  type        = string
+  default     = "aegis-enclave-results"
+}
+
+variable "peer_results_bucket_arn" {
+  description = "ARN of the peer region's result bucket — used by the replication IAM policy to grant ReplicateObject on the peer's '/<key>'. Null in single-region applies; the policy then omits the peer-side statement."
+  type        = string
+  default     = null
+}
+
 variable "valkey_max_ecpu_per_sec" {
   description = "ElastiCache Serverless Valkey maximum eCPU per second."
   type        = number

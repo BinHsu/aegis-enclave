@@ -82,6 +82,13 @@ module "ecs" {
           environment = [
             { name = "DYNAMODB_TABLE_NAME", value = var.dynamodb_table_name },
             { name = "AWS_DEFAULT_REGION", value = var.region },
+            # ADR-0048: s3_store derives the bucket name as
+            # "${prefix}-${AWS_REGION}" at runtime so each task reads/writes
+            # its own local CRR replica. Explicit AWS_REGION (not just
+            # AWS_DEFAULT_REGION) because boto3.client("s3", ...) inspects
+            # AWS_REGION first.
+            { name = "AWS_REGION", value = var.region },
+            { name = "S3_RESULTS_BUCKET_PREFIX", value = var.result_bucket_prefix },
           ]
           # No secrets — DDB authn is IAM, not Secrets Manager.
 

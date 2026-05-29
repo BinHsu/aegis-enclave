@@ -200,3 +200,16 @@ variable "budget_notification_email" {
     error_message = "budget_notification_email must be empty or a valid email address."
   }
 }
+
+# ─── Result store (ADR-0048) ────────────────────────────────────────────────
+
+variable "result_bucket_prefix" {
+  description = "Prefix for the per-region S3 result bucket name (ADR-0048). Final bucket is '<prefix>-<region>' (e.g. 'aegis-enclave-results-eu-central-1'). The region is appended at module-eval time, and `s3_store.py` reconstructs the same name at runtime via AWS_REGION — so the DDB row carries only the bucket-relative s3_key and each region reads its local CRR replica."
+  type        = string
+  default     = "aegis-enclave-results"
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9-]*[a-z0-9]$", var.result_bucket_prefix)) && length(var.result_bucket_prefix) >= 3 && length(var.result_bucket_prefix) <= 50
+    error_message = "result_bucket_prefix must be a DNS-compliant S3 bucket-name prefix (3-50 chars, lowercase + digits + hyphens, must start and end with alphanumeric)."
+  }
+}
