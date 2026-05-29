@@ -4,13 +4,16 @@
 # Runs INSIDE the test-client container (which sits on the internal Docker
 # network). Exits 0 on full pass; non-zero otherwise.
 #
-# Six steps:
-#   1. POST /primes → 202 + execution_id
-#   2. Poll GET /primes/{id} until status=done (30s timeout)
-#   3. Verify primes list correctness vs sympy oracle
-#   4. Repeat POST same range → cache hit (reaches done faster)
-#   5. Negative: out-of-bounds range → 422
-#   6. Backpressure: 20 concurrent POSTs → at least one 503 + Retry-After
+# Six steps + 4a/4b compute-path coverage (per #9 item 1 — without them,
+# the demo only exercises the cache path and never the prime compute kernel):
+#   1.  POST /primes → 202 + execution_id
+#   2.  Poll GET /primes/{id} until status=done (30s timeout)
+#   3.  Verify primes list correctness vs sympy oracle
+#   4.  Repeat POST same range → cache hit (reaches done faster)
+#   4a. Compute path: segmented sieve   — [200000,300000]  (end ≤ 10^6)
+#   4b. Compute path: trial division    — [1500000,1500100] (end > 10^6)
+#   5.  Negative: out-of-bounds range → 422
+#   6.  Backpressure: 20 concurrent POSTs → at least one 503 + Retry-After
 
 set -eu
 
@@ -174,6 +177,47 @@ else
     printf 'NOTE: cache-hit took %ds vs first call %ds (worker load may vary)\n' "$SECOND_DURATION" "$FIRST_DURATION"
     ok "cache-hit execution succeeded (latency comparison noted above)"
 fi
+
+# ─── Step 4a: Compute coverage — segmented sieve (end ≤ 10^6) ──────────────
+# Steps 1-4 only exercise the cache path; without 4a/4b the prime compute
+# kernel (_segmented_sieve / _trial_division_with_known) is never executed
+# end-to-end by the smoke test. Mid-range queries selected so neither hits a
+# bootstrap cache range. Per #9 item 1.
+step "4a   Compute path: segmented sieve [200000,300000]"
+
+_run_compute_step() {
+    # $1 = start, $2 = end, $3 = label-fragment for failure messages.
+    # No `local` here — POSIX `sh` does not guarantee it (Alpine ash does, but
+    # we keep this script portable). The vars below are intentionally global
+    # for this self-contained helper; each call overwrites cleanly.
+    _cs_s="$1"; _cs_e="$2"; _cs_tag="$3"
+    _cs_resp=$(curl --silent --max-time 30 \
+        -w '\n%{http_code}' \
+        -X POST "$API_BASE/primes" \
+        -H 'Content-Type: application/json' \
+        -d "{\"start\":$_cs_s,\"end\":$_cs_e}")
+    _cs_code=$(printf '%s' "$_cs_resp" | tail -1)
+    _cs_body=$(printf '%s' "$_cs_resp" | head -n -1)
+    [ "$_cs_code" = "202" ] || fail "$_cs_tag: expected 202, got $_cs_code"
+    _cs_eid=$(printf '%s' "$_cs_body" | python3 -c "import sys,json; print(json.load(sys.stdin)['execution_id'])")
+    _cs_t0=$(date +%s)
+    while true; do
+        _cs_elapsed=$(( $(date +%s) - _cs_t0 ))
+        [ "$_cs_elapsed" -ge "$POLL_TIMEOUT" ] && fail "$_cs_tag: timed out after ${POLL_TIMEOUT}s"
+        _cs_poll=$(curl --silent --max-time 5 "$API_BASE/primes/$_cs_eid" || true)
+        _cs_status=$(printf '%s' "$_cs_poll" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+        [ "$_cs_status" = "done" ] && break
+        [ "$_cs_status" = "failed" ] && fail "$_cs_tag: status=failed"
+        sleep "$POLL_INTERVAL"
+    done
+    ok "$_cs_tag: reached status=done in ${_cs_elapsed}s"
+}
+
+_run_compute_step 200000 300000 "segmented-sieve [200000,300000]"
+
+# ─── Step 4b: Compute coverage — trial division (end > 10^6) ───────────────
+step "4b   Compute path: trial division [1500000,1500100]"
+_run_compute_step 1500000 1500100 "trial-division [1500000,1500100]"
 
 # ─── Step 5: Negative — out-of-bounds range → 422 ──────────────────────────
 step "5/6  Negative: out-of-bounds range → 422"

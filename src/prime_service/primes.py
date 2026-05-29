@@ -79,7 +79,12 @@ _table_lock = threading.Lock()
 
 # ─── SIGALRM timeout wrapper ──────────────────────────────────────────────────
 
-_SIGALRM_SECONDS = 60  # hard compute budget for the worker path
+# Hard compute budget for the worker path. **Cross-language coupling**: this
+# value MUST match `compute_budget_seconds` in `terraform/variables.tf` (Fargate
+# task timeout + the 1.5x = 90s SQS visibility timeout are both derived from
+# it). There is no build-time enforcement of the match — drift is caught by
+# `make smoke`'s step 6 (backpressure) misbehaving. Tracked as #9 item 3.
+_SIGALRM_SECONDS = 60
 
 
 def _sigalrm_handler(signum: int, frame: object) -> None:

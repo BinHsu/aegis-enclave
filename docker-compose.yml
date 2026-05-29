@@ -33,9 +33,10 @@ services:
     healthcheck:
       # DynamoDB Local has no /health endpoint; root path returns HTTP 400 with
       # a JSON error body when the JVM is up — that's enough to prove liveness.
-      # Use wget (curl is not in the image) and accept any HTTP response code
-      # (--server-response + grep) as healthy; only a connection refusal fails.
-      test: ["CMD-SHELL", "wget -qO- --tries=1 --timeout=2 http://localhost:8000/ >/dev/null 2>&1 || wget -S --tries=1 --timeout=2 -O /dev/null http://localhost:8000/ 2>&1 | grep -q 'HTTP/'"]
+      # The 2.5.2 image dropped wget and now ships only curl; use curl without
+      # --fail so any HTTP response (incl. 400) counts as alive — only a connection
+      # refusal or timeout fails.
+      test: ["CMD-SHELL", "curl -s -o /dev/null --connect-timeout 2 http://localhost:8000/"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -57,7 +58,7 @@ services:
       dynamodb-local:
         condition: service_healthy
     environment:
-      AWS_ENDPOINT_URL: http://dynamodb-local:8000
+      AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb-local:8000
       AWS_DEFAULT_REGION: eu-central-1
       AWS_ACCESS_KEY_ID: local
       AWS_SECRET_ACCESS_KEY: local
@@ -127,7 +128,7 @@ services:
         condition: service_healthy
     environment:
       DYNAMODB_TABLE_NAME: aegis-enclave-executions
-      AWS_ENDPOINT_URL: http://dynamodb-local:8000
+      AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb-local:8000
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # SQS / Valkey endpoints — overridden to local containers in dev.
       AWS_SQS_ENDPOINT_URL: http://elasticmq:9324
@@ -164,7 +165,7 @@ services:
         condition: service_healthy
     environment:
       DYNAMODB_TABLE_NAME: aegis-enclave-executions
-      AWS_ENDPOINT_URL: http://dynamodb-local:8000
+      AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb-local:8000
       AWS_SQS_ENDPOINT_URL: http://elasticmq:9324
       AWS_DEFAULT_REGION: eu-central-1
       AWS_ACCESS_KEY_ID: local
@@ -202,7 +203,7 @@ services:
         condition: service_healthy
     environment:
       DYNAMODB_TABLE_NAME: aegis-enclave-executions
-      AWS_ENDPOINT_URL: http://dynamodb-local:8000
+      AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb-local:8000
       AWS_SQS_ENDPOINT_URL: http://elasticmq:9324
       AWS_DEFAULT_REGION: eu-central-1
       AWS_ACCESS_KEY_ID: local
