@@ -4,7 +4,7 @@ Design:
     - boto3 sync client (not aiobotocore) — the worker is a simple consumer
       loop, not an async event loop.
     - Queue name: `aegis-enclave-primes` (configurable via env).
-    - `AWS_SQS_ENDPOINT_URL` overrides the endpoint for local dev (ElasticMQ).
+    - `AWS_ENDPOINT_URL_SQS` overrides the endpoint for local dev (ElasticMQ).
     - Visibility timeout = 90s (1.5× the 60s compute budget) so the message
       re-delivers if the worker crashes mid-compute without explicit ack.
 
@@ -67,7 +67,7 @@ def _get_client() -> Any:
     if _client is None:
         _client = boto3.client(
             "sqs",
-            endpoint_url=os.environ.get("AWS_SQS_ENDPOINT_URL"),
+            endpoint_url=os.environ.get("AWS_ENDPOINT_URL_SQS"),
             region_name=os.environ.get("AWS_DEFAULT_REGION", "eu-central-1"),
         )
     return _client
