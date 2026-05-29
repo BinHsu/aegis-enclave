@@ -42,6 +42,7 @@ from prime_service.db import (
     get_execution,
     health_check,
     insert_queued_execution,
+    mark_failed,
 )
 from prime_service.metrics import emit_count, emit_latency_ms
 from prime_service.queue import PrimeQueue
@@ -178,9 +179,13 @@ async def backpressure_middleware(
                     media_type="application/json",
                     headers={"Retry-After": "60"},
                 )
-        except Exception:  # noqa: BLE001, S110
-            # If SQS is unreachable, don't block the request.
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # Backpressure preflight failed (queue unreachable, throttled, etc).
+            # We fall through to the handler — which now returns a real 503 +
+            # rolls the audit row to `failed` if its enqueue also fails (per
+            # issue #10). Logging the warning preserves the signal so SRE
+            # alerts can tell "depth check broken" from "depth below threshold".
+            log.warning("backpressure_check_failed", error=str(exc))
     return await call_next(request)
 
 
@@ -230,8 +235,23 @@ async def compute_primes(
         queue = PrimeQueue()
         queue.enqueue(execution_id=execution_id, start=req.start, end=req.end)
     except Exception as exc:  # noqa: BLE001
+        # The previous design swallowed enqueue failures and returned 202 —
+        # which produced "orphan" rows: the audit row says `queued` but no
+        # worker will ever pick it up, so the client polls forever. Per
+        # issue #10, roll the row back to `failed` and return 503. The
+        # client retries; on recovery the next request goes through cleanly.
         log.error("enqueue_failed", error=str(exc))
-        # Queue is unavailable — still return 202 so the client can poll.
+        try:
+            mark_failed(execution_id, error_message=f"queue unavailable: {exc}")
+        except Exception as roll_exc:  # noqa: BLE001
+            # Roll back itself failed — log and still return 503; the orphan
+            # row will TTL out per the audit-retention policy.
+            log.error("rollback_after_enqueue_fail_failed", error=str(roll_exc))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="queue unavailable",
+            headers={"Retry-After": "60"},
+        ) from exc
 
     log.info("job_queued", start=req.start, end=req.end)
     return PrimeRangeResponse(execution_id=execution_id, status=Status.queued)

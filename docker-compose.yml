@@ -33,9 +33,10 @@ services:
     healthcheck:
       # DynamoDB Local has no /health endpoint; root path returns HTTP 400 with
       # a JSON error body when the JVM is up — that's enough to prove liveness.
-      # Use wget (curl is not in the image) and accept any HTTP response code
-      # (--server-response + grep) as healthy; only a connection refusal fails.
-      test: ["CMD-SHELL", "wget -qO- --tries=1 --timeout=2 http://localhost:8000/ >/dev/null 2>&1 || wget -S --tries=1 --timeout=2 -O /dev/null http://localhost:8000/ 2>&1 | grep -q 'HTTP/'"]
+      # The 2.5.2 image dropped wget and now ships only curl; use curl without
+      # --fail so any HTTP response (incl. 400) counts as alive — only a connection
+      # refusal or timeout fails.
+      test: ["CMD-SHELL", "curl -s -o /dev/null --connect-timeout 2 http://localhost:8000/"]
       interval: 5s
       timeout: 3s
       retries: 10

@@ -251,19 +251,31 @@ class TestComputePrimesEndpoint:
         assert "audit" in r.json()["detail"].lower()
 
     @pytest.mark.asyncio
-    async def test_enqueue_failure_still_returns_202(self) -> None:
-        """Queue failure does not prevent 202 — audit row exists as the record."""
+    async def test_enqueue_failure_returns_503(self) -> None:
+        """Queue failure now returns 503 + Retry-After (per issue #10).
+
+        The previous design swallowed enqueue errors and returned 202, which
+        produced orphan rows (queued in DDB but nothing will pick them up — the
+        client polls forever). The fix: roll the row back to `failed` and
+        return 503 so the client retries. Honesty beats false-202.
+        """
         fixed_uuid = _make_uuid()
         with patch("prime_service.main.uuid.uuid4", return_value=uuid.UUID(fixed_uuid)):
             with patch("prime_service.main.insert_queued_execution", return_value=fixed_uuid):
-                with patch("prime_service.main.PrimeQueue") as MockQueue:
-                    MockQueue.return_value.queue_depth.return_value = 0
-                    MockQueue.return_value.enqueue.side_effect = Exception("SQS down")
-                    async with await make_client() as ac:
-                        r = await ac.post("/primes", json={"start": 2, "end": 10})
+                with patch("prime_service.main.mark_failed") as mock_mark_failed:
+                    with patch("prime_service.main.PrimeQueue") as MockQueue:
+                        MockQueue.return_value.queue_depth.return_value = 0
+                        MockQueue.return_value.enqueue.side_effect = Exception("SQS down")
+                        async with await make_client() as ac:
+                            r = await ac.post("/primes", json={"start": 2, "end": 10})
 
-        # Still 202 — audit row was written; operator can re-enqueue
-        assert r.status_code == 202
+        assert r.status_code == 503
+        assert "queue" in r.json()["detail"].lower()
+        assert r.headers.get("retry-after") == "60"
+        # Audit row was rolled back to `failed` so the client doesn't see an
+        # orphan `queued` row if it ever guessed the execution_id.
+        mock_mark_failed.assert_called_once()
+        assert mock_mark_failed.call_args.args[0] == fixed_uuid
 
 
 # ───────────────────────────────────────────────────────────────────────────
