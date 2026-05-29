@@ -313,7 +313,7 @@ class TestMarkRunning:
         with mock_aws():
             db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
             db.mark_running(eid)
-            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            db.mark_done(eid, s3_key="done/test.json.gz", primes_count=3, duration_ms=10)
             # Should not raise
             db.mark_running(eid)
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
@@ -334,20 +334,22 @@ class TestMarkDone:
         with mock_aws():
             db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
             db.mark_running(eid)
-            db.mark_done(eid, primes=[2, 3, 5, 7], duration_ms=50)
+            db.mark_done(eid, s3_key="done/test.json.gz", primes_count=4, duration_ms=50)
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
         assert item["status"] == "done"
 
-    def test_primes_stored_as_list(self, ddb_table: Any) -> None:
+    def test_s3_key_stored_not_primes_list(self, ddb_table: Any) -> None:
+        """Per ADR-0048: the DDB row holds the s3_key pointer, NOT the primes list."""
         db = _import_db()
         eid = _make_uuid()
         with mock_aws():
             db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
             db.mark_running(eid)
-            db.mark_done(eid, primes=[2, 3, 5, 7], duration_ms=50)
+            db.mark_done(eid, s3_key="done/abc-123.json.gz", primes_count=4, duration_ms=50)
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
-        stored = [int(p) for p in item["primes"]]
-        assert stored == [2, 3, 5, 7]
+        assert item["s3_key"] == "done/abc-123.json.gz"
+        # The primes list itself must NOT be in the DDB item (400 KB cap).
+        assert "primes" not in item
 
     def test_primes_count_matches(self, ddb_table: Any) -> None:
         db = _import_db()
@@ -355,7 +357,7 @@ class TestMarkDone:
         with mock_aws():
             db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
             db.mark_running(eid)
-            db.mark_done(eid, primes=[2, 3, 5, 7], duration_ms=50)
+            db.mark_done(eid, s3_key="done/test.json.gz", primes_count=4, duration_ms=50)
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
         assert int(item["primes_count"]) == 4
 
@@ -365,7 +367,7 @@ class TestMarkDone:
         with mock_aws():
             db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
             db.mark_running(eid)
-            db.mark_done(eid, primes=[2, 3, 5, 7], duration_ms=123)
+            db.mark_done(eid, s3_key="done/test.json.gz", primes_count=4, duration_ms=123)
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
         assert int(item["duration_ms"]) == 123
 
@@ -376,7 +378,7 @@ class TestMarkDone:
         with mock_aws():
             db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
             db.mark_running(eid)
-            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            db.mark_done(eid, s3_key="done/test.json.gz", primes_count=3, duration_ms=10)
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
         after = int(time.time())
         assert before <= int(item["completed_at"]) <= after
@@ -390,7 +392,7 @@ class TestMarkDone:
         with mock_aws():
             db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
             db.mark_running(eid)
-            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            db.mark_done(eid, s3_key="done/test.json.gz", primes_count=3, duration_ms=10)
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
         after = int(time.time())
         ttl_at = int(item["ttl_at"])
@@ -407,7 +409,7 @@ class TestMarkDone:
         with mock_aws():
             db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
             db.mark_running(eid)
-            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            db.mark_done(eid, s3_key="done/test.json.gz", primes_count=3, duration_ms=10)
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
         ttl_at = int(item["ttl_at"])
         # ttl_at must be strictly more than 29 days from now
@@ -421,7 +423,7 @@ class TestMarkDone:
         with mock_aws():
             db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
             db.mark_running(eid)
-            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            db.mark_done(eid, s3_key="done/test.json.gz", primes_count=3, duration_ms=10)
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
         ttl_at = int(item["ttl_at"])
         # ttl_at must be strictly less than 31 days from now
@@ -434,9 +436,9 @@ class TestMarkDone:
         with mock_aws():
             db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
             db.mark_running(eid)
-            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            db.mark_done(eid, s3_key="done/test.json.gz", primes_count=3, duration_ms=10)
             # Should not raise
-            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            db.mark_done(eid, s3_key="done/test.json.gz", primes_count=3, duration_ms=10)
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
         assert item["status"] == "done"
 
@@ -447,7 +449,7 @@ class TestMarkDone:
         with mock_aws():
             db.insert_queued_execution(execution_id=eid, range_start=14, range_end=16)
             db.mark_running(eid)
-            db.mark_done(eid, primes=[], duration_ms=5)
+            db.mark_done(eid, s3_key="done/test.json.gz", primes_count=0, duration_ms=5)
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
         assert int(item["primes_count"]) == 0
 
@@ -552,7 +554,7 @@ class TestMarkFailed:
         with mock_aws():
             db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
             db.mark_running(eid)
-            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            db.mark_done(eid, s3_key="done/test.json.gz", primes_count=3, duration_ms=10)
             # Should not raise; just silently ignored
             db.mark_failed(eid, error_message="should be ignored")
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
@@ -586,7 +588,7 @@ class TestStatusTransitions:
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
             assert item["status"] == "running"
 
-            db.mark_done(eid, primes=[2, 3, 5, 7], duration_ms=50)
+            db.mark_done(eid, s3_key="done/test.json.gz", primes_count=4, duration_ms=50)
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
             assert item["status"] == "done"
 
@@ -627,7 +629,7 @@ class TestStatusTransitions:
         with mock_aws():
             db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
             db.mark_running(eid)
-            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            db.mark_done(eid, s3_key="done/test.json.gz", primes_count=3, duration_ms=10)
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
         assert "ttl_at" in item
 
@@ -715,7 +717,9 @@ class TestConditionalWriteIdempotency:
         with mock_aws():
             db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
             db.mark_running(eid)
-            db.mark_done(eid, primes=[2, 3, 5], duration_ms=50)  # should not raise
+            db.mark_done(
+                eid, s3_key="done/test.json.gz", primes_count=3, duration_ms=50
+            )  # should not raise
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
         assert item["status"] == "done"
 
@@ -736,7 +740,7 @@ class TestConditionalWriteIdempotency:
         with mock_aws():
             db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
             db.mark_running(eid)
-            db.mark_done(eid, primes=[2, 3, 5], duration_ms=10)
+            db.mark_done(eid, s3_key="done/test.json.gz", primes_count=3, duration_ms=10)
             db.mark_failed(eid, error_message="should not apply")
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
         assert item["status"] == "done"
@@ -758,7 +762,7 @@ class TestTTLDifference:
         with mock_aws():
             db.insert_queued_execution(execution_id=eid_done, range_start=2, range_end=10)
             db.mark_running(eid_done)
-            db.mark_done(eid_done, primes=[2, 3], duration_ms=5)
+            db.mark_done(eid_done, s3_key="done/test.json.gz", primes_count=2, duration_ms=5)
 
             db.insert_queued_execution(execution_id=eid_failed, range_start=2, range_end=10)
             db.mark_running(eid_failed)
@@ -781,7 +785,7 @@ class TestTTLDifference:
         with mock_aws():
             db.insert_queued_execution(execution_id=eid, range_start=2, range_end=10)
             db.mark_running(eid)
-            db.mark_done(eid, primes=[], duration_ms=1)
+            db.mark_done(eid, s3_key="done/test.json.gz", primes_count=0, duration_ms=1)
             item = ddb_table.get_item(Key={"execution_id": eid}, ConsistentRead=True)["Item"]
         ttl_at = int(item["ttl_at"])
         # Delta from now should be approximately 30*86400 (within 2 seconds clock drift)

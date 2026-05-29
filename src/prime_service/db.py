@@ -152,13 +152,20 @@ def mark_running(execution_id: str) -> None:
 def mark_done(
     execution_id: str,
     *,
-    primes: list[int],
+    s3_key: str,
+    primes_count: int,
     duration_ms: int,
 ) -> None:
     """Transition status running → done.
 
-    Sets primes list, primes_count, duration_ms, completed_at, and ttl_at
+    Sets s3_key (pointer to the gzipped primes list in S3 per ADR-0048),
+    primes_count, duration_ms, completed_at, and ttl_at
     (completed_at + 30 days per TTL policy).
+
+    The primes list itself is **NOT** written to DynamoDB — DDB items have
+    a hard 400 KB limit (for end=10^7 the serialised list is ~6 MB). The
+    list lives in a regional S3 bucket replicated via CRR; the GET handler
+    fetches it from S3 using this `s3_key`. See ADR-0048 § 1-§ 5.
 
     ConditionExpression: status must equal 'running'.
     Swallows ConditionalCheckFailedException.
@@ -166,21 +173,18 @@ def mark_done(
     now_epoch = int(time.time())
     ttl_at = now_epoch + _TTL_DONE_DAYS * _SECONDS_PER_DAY
 
-    # DynamoDB only accepts Decimal for numeric types.
-    primes_decimal = [Decimal(p) for p in primes]
-
     table = _table()
     try:
         table.update_item(
             Key={"execution_id": execution_id},
-            UpdateExpression="SET #s = :done, primes = :primes, primes_count = :count,"
+            UpdateExpression="SET #s = :done, s3_key = :s3_key, primes_count = :count,"
             " duration_ms = :dur, completed_at = :now, ttl_at = :ttl",
             ConditionExpression=Attr("status").eq(Status.running.value),
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":done": Status.done.value,
-                ":primes": primes_decimal,
-                ":count": Decimal(len(primes)),
+                ":s3_key": s3_key,
+                ":count": Decimal(primes_count),
                 ":dur": Decimal(duration_ms),
                 ":now": Decimal(now_epoch),
                 ":ttl": Decimal(ttl_at),

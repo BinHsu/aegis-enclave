@@ -37,6 +37,7 @@ from typing import Any
 
 import structlog
 
+from prime_service import s3_store
 from prime_service.cache import PrimeCache
 from prime_service.db import get_execution, mark_done, mark_failed, mark_running
 from prime_service.metrics import emit_count, emit_latency_ms
@@ -142,7 +143,19 @@ def handle_message(
             cached = cache.get_covering_slice(start, end)
             if cached is not None:
                 duration_ms = int((time.perf_counter() - started) * 1000)
-                mark_done(execution_id, primes=cached, duration_ms=duration_ms)
+                # Cache hit still has to land the payload in S3 so the GET
+                # handler can find it via the row's s3_key — the cache is a
+                # single-region hot-path optimisation (ADR-0048 § 4), not the
+                # durable store. Without this, a cache-hit job would have an
+                # s3_key in DDB pointing at no object (the worker bypassed
+                # the S3 write).
+                s3_key = s3_store.put_primes(execution_id, cached)
+                mark_done(
+                    execution_id,
+                    s3_key=s3_key,
+                    primes_count=len(cached),
+                    duration_ms=duration_ms,
+                )
                 queue.ack(message)
                 log.info("cache_hit", count=len(cached), duration_ms=duration_ms)
                 emit_count("cache_hit_count")
@@ -180,16 +193,35 @@ def handle_message(
 
         duration_ms = int((time.perf_counter() - started) * 1000)
 
-        # ── Write to cache (range-coalescing via Lua) ──
+        # ── Persist to S3 (the durable result store per ADR-0048) ──
+        # S3 write MUST succeed before mark_done — without an s3_key the GET
+        # handler can't serve the result; better to mark_failed and let the
+        # client re-POST than to land an unservable `done` row.
+        try:
+            s3_key = s3_store.put_primes(execution_id, primes)
+        except Exception as exc:  # noqa: BLE001
+            err = f"s3 write failed: {type(exc).__name__}: {exc}"
+            log.error("s3_write_error", error=err)
+            emit_count("s3_write_errors")
+            mark_failed(execution_id, error_message=err)
+            queue.ack(message)
+            return
+
+        # ── Write to cache (range-coalescing via Lua) — hot-path optimisation ──
         try:
             cache.merge_or_put(start, end, primes)
         except Exception as exc:  # noqa: BLE001
             log.warning("cache_write_error", error=str(exc))
             emit_count("cache_write_errors")
-            # Cache write errors are non-fatal; result is still persisted to DB.
+            # Cache write errors are non-fatal; result is durable in S3.
 
-        # ── Update audit record ──
-        mark_done(execution_id, primes=primes, duration_ms=duration_ms)
+        # ── Update audit record (metadata + s3_key pointer; no primes list) ──
+        mark_done(
+            execution_id,
+            s3_key=s3_key,
+            primes_count=len(primes),
+            duration_ms=duration_ms,
+        )
         queue.ack(message)
         log.info("compute_done", count=len(primes), duration_ms=duration_ms)
         emit_count("cache_miss_count")
