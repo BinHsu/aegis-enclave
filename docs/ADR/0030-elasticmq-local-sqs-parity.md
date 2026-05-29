@@ -7,7 +7,7 @@ Accepted (2026-04-26)
 
 ADR-0029 introduces SQS as the queue between the API and worker. The smoke test must remain self-contained — a reviewer runs `docker compose up && ./smoke.sh` without any AWS credentials. The test must exercise the full path: POST → queue enqueue → worker dequeue → compute → audit write → GET returns `done`. This means the Docker Compose stack needs a local SQS-compatible server.
 
-The worker and API use the `boto3` SQS client with `AWS_SQS_ENDPOINT_URL` overriding the endpoint (standard boto3 pattern for local SQS testing). The local server must implement:
+The worker and API use the `boto3` SQS client with `AWS_ENDPOINT_URL_SQS` overriding the endpoint (standard boto3 pattern for local SQS testing). The local server must implement:
 
 - `CreateQueue` (on startup / first use)
 - `SendMessage` (from API enqueue path)
@@ -21,7 +21,7 @@ Use **ElasticMQ** (`softwaremill/elasticmq-native:1.6.x`) as the local SQS emula
 
 Configuration (`elasticmq.conf`) declares the `aegis-enclave-primes` queue with matching visibility timeout (90 s), so the queue exists before the API or worker starts — no runtime `CreateQueue` call is required.
 
-The `boto3` client receives `endpoint_url=os.environ["AWS_SQS_ENDPOINT_URL"]` (set to `http://elasticmq:9324` in Docker Compose, absent in cloud) and uses dummy credentials (`AWS_ACCESS_KEY_ID=test`, `AWS_SECRET_ACCESS_KEY=test`) — ElasticMQ accepts any non-empty credentials. The `queue.py` abstraction layer handles the endpoint-url injection so neither `main.py` nor `worker.py` needs to be aware of the local-vs-cloud distinction.
+The `boto3` client receives `endpoint_url=os.environ["AWS_ENDPOINT_URL_SQS"]` (set to `http://elasticmq:9324` in Docker Compose, absent in cloud) and uses dummy credentials (`AWS_ACCESS_KEY_ID=test`, `AWS_SECRET_ACCESS_KEY=test`) — ElasticMQ accepts any non-empty credentials. The `queue.py` abstraction layer handles the endpoint-url injection so neither `main.py` nor `worker.py` needs to be aware of the local-vs-cloud distinction.
 
 The `softwaremill/elasticmq-native` image is used (native binary, not JVM) to avoid a ~400 MB JVM overhead in the compose stack.
 

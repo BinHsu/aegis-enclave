@@ -366,7 +366,7 @@ class TestParseBody:
 
 
 class TestQueueEnvironmentConfig:
-    """Verify AWS_SQS_ENDPOINT_URL override is passed to boto3 client.
+    """Verify AWS_ENDPOINT_URL_SQS override is passed to boto3 client.
 
     Per issue #10, the boto3 SQS client is now a module-level singleton
     constructed lazily inside ``_get_client()`` — not in ``PrimeQueue.__init__``.
@@ -381,11 +381,11 @@ class TestQueueEnvironmentConfig:
         reset_for_testing()
         with patch("prime_service.queue.boto3.client") as mock_client_factory:
             mock_client_factory.return_value = MagicMock()
-            os.environ["AWS_SQS_ENDPOINT_URL"] = "http://localhost:9324"
+            os.environ["AWS_ENDPOINT_URL_SQS"] = "http://localhost:9324"
             try:
                 _get_client()  # triggers the lazy construction
             finally:
-                del os.environ["AWS_SQS_ENDPOINT_URL"]
+                del os.environ["AWS_ENDPOINT_URL_SQS"]
                 reset_for_testing()
             mock_client_factory.assert_called_once()
             call_kwargs = mock_client_factory.call_args
@@ -397,7 +397,7 @@ class TestQueueEnvironmentConfig:
         from prime_service.queue import _get_client, reset_for_testing
 
         reset_for_testing()
-        os.environ.pop("AWS_SQS_ENDPOINT_URL", None)
+        os.environ.pop("AWS_ENDPOINT_URL_SQS", None)
         with patch("prime_service.queue.boto3.client") as mock_client_factory:
             mock_client_factory.return_value = MagicMock()
             try:
