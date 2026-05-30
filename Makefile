@@ -178,6 +178,10 @@ cloud-smoke: ## Cloud-side 6-step smoke (POST + poll + cache hit + 422 + backpre
 cross-region-check: ## ADR-0049 — POST in platform region, poll in peer, prove recompute-on-miss (needs both VPNs)
 	@./scripts/cross_region_poll_check.sh
 
+.PHONY: dr-acceptance
+dr-acceptance: ## End-to-end dual-region DR: cloud-up → verify cross-region → kill a region → verify survivor → cloud-down
+	@./scripts/dr-acceptance.sh
+
 .PHONY: dr-drill
 dr-drill: ## Disaster-recovery drill — destroy + rebuild peer region, measure RTO, prove survivor serves
 	@./scripts/dr-drill.sh
