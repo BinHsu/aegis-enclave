@@ -277,7 +277,7 @@ fi
 # Two reasons for the staged -target apply:
 #   1. ECR must exist before docker push (chicken-and-egg).
 #   2. ECS module's container_definitions for_each fails at plan time when
-#      aws_dynamodb_table.executions + module.vpc outputs are unknown —
+#      aws_dynamodb_table.executions + the region-stack VPC outputs are unknown —
 #      terraform infers the whole map as 'unknown' and bails ("for_each map
 #      includes keys derived from resource attributes that cannot be determined
 #      until apply"). Pre-applying VPC + DynamoDB table + ECR makes those refs
@@ -286,11 +286,21 @@ section "5/6 — Pre-deps apply + image push"
 warn "🚨 Cost timer starts NOW — provisioning VPC + DynamoDB table + ECR (~1-2 min first time)"
 info "terraform init"
 (cd "$TF_DIR" && terraform init -backend=false -input=false >/dev/null)
-info "terraform apply -target=module.vpc -target=aws_dynamodb_table.executions -target=module.ecr -auto-approve"
+# VPC + ECR live INSIDE the region-stack module (module.region_platform /
+# module.region_peer[0]) after the ADR-0044 refactor — target them there, not
+# at the root. For multi-region, pre-create the PEER ECR too so the image can
+# be replicated to it before the full apply (the peer ECS pulls from it).
+PREDEP_TARGETS=(
+    -target=module.region_platform.module.vpc
+    -target=module.region_platform.module.ecr
+    -target=aws_dynamodb_table.executions
+)
+if [[ -n "$SECONDARY_REGION" ]]; then
+    PREDEP_TARGETS+=(-target='module.region_peer[0].module.vpc' -target='module.region_peer[0].module.ecr')
+fi
+info "terraform apply ${PREDEP_TARGETS[*]} -auto-approve"
 info "(VPC ~1 min, ECR ~10 sec, DynamoDB on-demand table ~10s — no AZ provisioning latency)"
-(cd "$TF_DIR" && terraform apply \
-    -target=module.vpc -target=aws_dynamodb_table.executions -target=module.ecr \
-    -auto-approve -input=false)
+(cd "$TF_DIR" && terraform apply "${PREDEP_TARGETS[@]}" -auto-approve -input=false)
 ECR_URL=$(cd "$TF_DIR" && terraform output -raw ecr_repository_url)
 ok "Pre-deps applied. ECR repository: $ECR_URL"
 
