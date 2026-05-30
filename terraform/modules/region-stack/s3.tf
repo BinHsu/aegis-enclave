@@ -94,75 +94,13 @@ resource "aws_s3_bucket_public_access_block" "results" {
 }
 
 
-# ─── Replication IAM role (consumed by the root-level CRR config) ───────────
-
-# Note: the actual `aws_s3_bucket_replication_configuration` resources live
-# in the ROOT module (`terraform/main.tf`) — putting them here would create
-# a module-level dependency cycle (each module would need the other's
-# bucket ARN as an input). The role we create here is what the root-level
-# CRR config will reference via the `s3_replication_role_arn` output.
-resource "aws_iam_role" "s3_replication" {
-  name = "${var.name_prefix}-s3-replication"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Action    = "sts:AssumeRole"
-      Principal = { Service = "s3.amazonaws.com" }
-    }]
-  })
-
-  tags = {
-    Component = "s3-replication"
-  }
-}
-
-# The policy is split: read-side on the local bucket, replicate-side on
-# the peer bucket. `peer_results_bucket_arn` is null in single-region
-# applies; we gate the statement so the policy is still valid.
-# tfsec false positive: '<bucket>/*' is the canonical scope for "all
-# versioned objects in this bucket" required by S3 CRR. AWS's own CRR
-# IAM examples use the exact same pattern.
-#tfsec:ignore:aws-iam-no-policy-wildcards
-resource "aws_iam_role_policy" "s3_replication" {
-  role = aws_iam_role.s3_replication.id
-  name = "s3-replication"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = concat(
-      [
-        {
-          Effect = "Allow"
-          Action = [
-            "s3:GetReplicationConfiguration",
-            "s3:ListBucket",
-          ]
-          Resource = aws_s3_bucket.results.arn
-        },
-        {
-          Effect = "Allow"
-          Action = [
-            "s3:GetObjectVersionForReplication",
-            "s3:GetObjectVersionAcl",
-            "s3:GetObjectVersionTagging",
-          ]
-          Resource = "${aws_s3_bucket.results.arn}/*"
-        },
-      ],
-      var.peer_results_bucket_arn != null ? [{
-        Effect = "Allow"
-        Action = [
-          "s3:ReplicateObject",
-          "s3:ReplicateDelete",
-          "s3:ReplicateTags",
-        ]
-        Resource = "${var.peer_results_bucket_arn}/*"
-      }] : [],
-    )
-  })
-}
+# ─── Cross-region replication: removed (ADR-0049) ───────────────────────────
+# The bidirectional CRR IAM role + policy that lived here were removed per
+# ADR-0049. Each region's bucket is now independent (no replication source or
+# destination); cross-region result availability is provided by recompute-on-
+# miss in the GET handler, not by replicating objects. No replication role is
+# needed. Bucket versioning above is retained for the lifecycle policy's
+# noncurrent-version expiration, not for CRR.
 
 
 # ─── S3 Gateway Endpoint ─────────────────────────────────────────────────────

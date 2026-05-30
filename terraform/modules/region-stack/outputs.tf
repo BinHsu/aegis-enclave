@@ -130,16 +130,11 @@ output "valkey_cache_name" {
 # ─── Result store (ADR-0048) ────────────────────────────────────────────────
 
 output "results_bucket_arn" {
-  description = "ARN of the per-region result bucket — passed to the PEER region's module as `peer_results_bucket_arn` so the peer's CRR IAM policy can grant ReplicateObject on this bucket's keys."
+  description = "ARN of the per-region result bucket (ADR-0048). Independent per region after ADR-0049 — no longer a CRR source/destination."
   value       = aws_s3_bucket.results.arn
 }
 
 output "results_bucket_id" {
   description = "Name of the per-region result bucket (e.g. 'aegis-enclave-results-eu-central-1')."
   value       = aws_s3_bucket.results.id
-}
-
-output "s3_replication_role_arn" {
-  description = "ARN of the IAM role that the root-level `aws_s3_bucket_replication_configuration` resource assumes to replicate this bucket's objects to the peer."
-  value       = aws_iam_role.s3_replication.arn
 }
