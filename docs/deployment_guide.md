@@ -303,6 +303,7 @@ Single-region → multi-region scaling lives in [`docs/scaling_runbook.md`](scal
 `make cloud-up` provisions the multi-region active-active stack against the operator's AWS account. After the stack is live, capture evidence before tearing down:
 
 - **`make cloud-smoke`** runs the 6-step smoke against the live VPN-connected endpoint (POST → poll → done → cache hit → schema rejection → backpressure). Pass criteria documented in [`README.md` § Initial Acceptance](../README.md#initial-acceptance-smoke-test).
+- **`make cross-region-check`** (multi-region only) POSTs a compute range in the platform region, polls the **peer** region for the same `execution_id`, and proves the peer regenerates the result locally — the 503 recompute-on-miss signature then a 200 with the correct primes list, all within the retry budget (per [ADR-0049](ADR/0049-cross-region-result-recompute-on-miss.md)). Requires **both** region VPN tunnels connected. This is the only check the single-region local stack cannot exercise.
 - **`make cloud-evidence`** captures CloudWatch metric widget PNGs via `aws cloudwatch get-metric-widget-image` (per ADR-0041 — the API path is canonical for evidence pipelines: scriptable, region-explicit, reproducible). Output lands in `evidence/<UTC-timestamp>/`.
 - **Worker + bootstrap CloudWatch logs** captured via `aws logs filter-log-events`. Evidence shows: `cache_miss → sieve_done → cache_write → db_update → sqs_ack` for first request; `cache_hit → db_update → sqs_ack` for subsequent overlapping requests.
 
