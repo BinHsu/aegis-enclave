@@ -391,7 +391,10 @@ fi
 section "6/6 — Full terraform apply (remaining resources)"
 info "Pre-deps already applied above. ts_apply.sh will plan + prompt for the rest"
 info "(Client VPN, ALB, ECS service, Valkey, SQS, IAM, autoscaling, VPC endpoints)"
-"$SCRIPT_DIR/ts_apply.sh"
+# Abort the whole flow if the apply fails — otherwise cloud-up would fall
+# through to the .ovpn generation + "Cloud is UP" next-steps on a half-applied
+# stack (the VPN endpoint output would be missing, .ovpn generation skipped).
+"$SCRIPT_DIR/ts_apply.sh" || fail "full terraform apply failed — inspect the ts_apply output above; 'make cloud-down' can clean a partial stack"
 
 # ─── Auto-generate ready-to-connect .ovpn files (one per region) ───────────
 # AWS-exported .ovpn does NOT include the client cert + key; openvpn refuses

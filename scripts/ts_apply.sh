@@ -127,6 +127,12 @@ ok "AWS caller:  $ARN"
 # avoids silent set -e + pipefail exit when grep finds no match.
 section "5/6 — ACM certificates reachable"
 
+# The region we apply against (the default-provider / platform region). Used in
+# the confirm-apply summary below. ADR-0042: it is `platform_region`, not a
+# top-level `region`.
+REGION=$( ( grep -E '^platform_region[[:space:]]*=' "$TF_DIR"/terraform.tfvars 2>/dev/null || true ) | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/' )
+[[ -n "$REGION" ]] || fail "could not parse platform_region from $TF_DIR/terraform.tfvars"
+
 # Verify every ACM certificate referenced in the tfvars is reachable before
 # the apply (fail-fast). ADR-0042: the server/client cert ARNs are nested
 # inside the per-region `regions` map (indented; one pair per region), and
