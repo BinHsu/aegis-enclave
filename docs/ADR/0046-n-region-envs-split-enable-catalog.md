@@ -282,6 +282,10 @@ redundant** — it is logically entailed by check 2.
   regional-layer instantiation decision while preserving its layering.
 - **ADR-0042** — DynamoDB Global Tables active-active; source of the
   single-state constraint that pins the table to the platform layer.
+- **ADR-0049** — recompute-on-miss removes the bidirectional S3 CRR, so the
+  result layer adds no second cross-region resource under this split; issue
+  #12's "where does the CRR config live" sub-decision is closed in design.
+  DynamoDB remains the single cross-region resource the platform layer owns.
 - **ADR-0040** — multi-region Frankfurt/Ireland + Route53 topology.
 - **ADR-0008** — reliability targets; the Tier-2 scope check above.
 - **ADR-0015** — plan-only deliverable (no committed state); why the repo itself

@@ -1,6 +1,6 @@
 # ADR Index — read by goal, not by number
 
-41 ADRs is overwhelming for first-time onboarding. This index groups them by reader goal so you can pick the load-bearing ones for *your* purpose and skip the rest.
+42 ADRs is overwhelming for first-time onboarding. This index groups them by reader goal so you can pick the load-bearing ones for *your* purpose and skip the rest.
 
 Numbering has gaps (ADR-0002 / 0009 / 0021 / 0022 / 0028 / 0032 / 0035 are deleted; numbers are not reused per the monotonic numbering convention).
 
@@ -107,7 +107,8 @@ These four set the scope, calibration framework, methodology, and target-shape t
 | [0045](0045-ionos-data-layer-scylladb-alternator.md) | IONOS-side migration target: self-hosted ScyllaDB Alternator (DynamoDB-wire-compatible); closes the destination-cloud parity gap left by ADR-0042 |
 | [0046](0046-n-region-envs-split-enable-catalog.md) | N-region scaling — `envs/` split + enable-catalog (Pattern X); accepted refinement of ADR-0044's regional-layer instantiation, lifts the N=2 cap (implementation deferred, issue #12) |
 | [0047](0047-local-stack-network-segmentation-routed-vpn.md) | Local Docker stack network segmentation — `internal: true` + edge + routed-VPN tunnel traversal in smoke.sh; mirrors AWS Client VPN -> private VPC -> internal ALB |
-| [0048](0048-large-result-store-s3-cross-region-replication.md) | Large-result store — S3 with bidirectional CRR + DDB `s3_key` pointer (region derived at runtime, not stored); closes the result-layer regional-affinity gap left by ADR-0042 (implementation deferred, issue #14) |
+| [0048](0048-large-result-store-s3-cross-region-replication.md) | Large-result store — S3 with bidirectional CRR + DDB `s3_key` pointer (region derived at runtime, not stored); closes the result-layer regional-affinity gap left by ADR-0042 (implementation deferred, issue #14). **CRR half superseded by ADR-0049.** |
+| [0049](0049-cross-region-result-recompute-on-miss.md) | Cross-region result availability via **recompute-on-miss** — supersedes ADR-0048's bidirectional CRR; the per-region S3 bucket becomes independent (no replication), a cross-region GET-miss re-enqueues a local compute from the DDB-replicated range. Keeps the client dumb, dissolves issue #12's CRR-placement sub-decision. S3 (size) + DDB Global Table (metadata) remain. |
 
 ---
 
