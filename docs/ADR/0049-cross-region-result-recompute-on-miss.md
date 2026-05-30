@@ -27,17 +27,21 @@ The reframe that resolves it: cross-region availability does not require the *re
 
 **Replace bidirectional S3 CRR with recompute-on-cross-region-miss.** Each region's S3 bucket is independent — no replication between buckets. The DynamoDB Global Table continues to replicate metadata (status, range, `s3_key`).
 
-GET `/primes/{id}` three-tier read:
+GET `/primes/{id}` read path:
 
 ```
-1. cache.get_covering_slice(...)      ← hot, single-region (ADR-0031)
-2. local S3 get_object(row.s3_key)    ← warm, THIS region's bucket only
-3. on local miss while DDB says done:
+1. local S3 get_object(row.s3_key)    ← THIS region's bucket
+2. on NoSuchKey while DDB says done:
      re-enqueue a compute for (range_start, range_end) on THIS region's queue;
      return 503 + Retry-After.
-   The client's existing dumb retry loop polls again; by then the local worker
-   has written the result to this region's S3 + cache → served.
+   The client's existing dumb retry loop polls again; by then the local
+   worker has written the result to this region's S3 → served.
 ```
+
+The Valkey cache (ADR-0031) is the **worker's** compute-avoidance layer — the
+worker checks `get_covering_slice` before sieving and writes back on a miss —
+**not** a GET read tier. The GET handler reads S3 directly by `s3_key`; the
+recompute path re-runs the worker, which consults the cache as usual.
 
 - **S3 stays — per region, local-only.** It solves the *size* gap (lists > 400 KB) and gives durability so an expensive range is computed once, not re-recomputed on every cache eviction. CRR is removed; the bucket is neither a replication source nor destination.
 - **DynamoDB Global Table stays.** Metadata (status + range + `s3_key`) replicates so any region knows a job exists and what range to regenerate. It becomes the *only* cross-region resource.
@@ -76,7 +80,7 @@ This dissolves issue #12's "where does the bidirectional CRR config live after t
 - **ADR-0048** — large-result store; this ADR supersedes its *cross-region replication* decision (bidirectional CRR → recompute-on-miss); its *size* decision (list in per-region S3, `s3_key` pointer) remains in force.
 - **ADR-0042** — DynamoDB Global Tables active-active; after this ADR the Global Table is the *sole* cross-region resource. The future-trajectory note above would reconsider it.
 - **ADR-0046** — N-region `envs/` split; this ADR removes the bidirectional-CRR resource that issue #12's CRR-placement sub-decision was about, closing that sub-decision in design.
-- **ADR-0031** — Valkey range-coalescing cache; remains the single-region hot path; the warm tier is now local S3, then local recompute.
+- **ADR-0031** — Valkey range-coalescing cache; remains the worker's single-region compute-avoidance layer (checked before sieving), not a GET read tier. The GET read path is local S3, then local recompute on a miss.
 - **ADR-0019** — private-only VPC; preserved (no MRAP / PrivateLink; the free S3 Gateway Endpoint stays).
 - **ADR-0033** — SIGALRM compute budget; the recompute path inherits the same 60 s bound.
 - **ADR-0008** — Tier-2 reliability targets; recompute-on-rare-cross-region-miss sits within the RTO 1–4 h envelope.
