@@ -386,6 +386,7 @@ sequenceDiagram
     participant WK as Worker
     participant VK as Valkey
     participant DB as DynamoDB Local
+    participant S3 as MinIO (S3)
 
     Note over TC,DB: Pre-condition: WG keypair pre-exchanged via .env
 
@@ -409,20 +410,25 @@ sequenceDiagram
     VK-->>WK: miss
     WK->>WK: sieve [2,100]
     WK->>VK: Lua merge_or_put
-    WK->>DB: UpdateItem status=done, result=...
+    WK->>S3: PutObject done/{id}.json.gz (gzipped, ADR-0048)
+    WK->>DB: UpdateItem status=done, s3_key=...
     WK->>SQS: DeleteMessage
     TC->>API: GET /primes/{id}
     API->>DB: GetItem PK=execution_id
-    DB-->>API: done, primes=[2..97]
+    DB-->>API: done, s3_key
+    API->>S3: GetObject(s3_key)
+    S3-->>API: gzipped primes
     API-->>TC: 200 {status:"done", result:[2,3,5,...,97]}
 
     Note over TC: Step 4: repeat same range — cache hit
     TC->>API: POST /primes {start:2, end:100}
     API->>SQS: enqueue
     WK->>VK: ZRANGEBYSCORE → HIT
-    WK->>DB: UpdateItem status=done (no recompute)
+    WK->>S3: PutObject (cache hit still persists to S3)
+    WK->>DB: UpdateItem status=done, s3_key=...
     TC->>API: GET /primes/{id}
-    API-->>TC: 200 {status:"done"} — faster (cache hit)
+    API->>S3: GetObject(s3_key)
+    API-->>TC: 200 {status:"done"} — faster (worker skipped sieve)
 
     Note over Op,API: Negative test (security boundary)
     Op->>API: GET /health (without WG, from outside Docker network)
