@@ -420,6 +420,58 @@ class TestGetPrimesResult:
         assert body["error_message"] is None
 
     @pytest.mark.asyncio
+    async def test_done_local_s3_miss_reenqueues_and_503(self) -> None:
+        """Done row, but THIS region's S3 lacks the object → re-enqueue a
+        local recompute from the row's range + 503 + Retry-After: 20 (ADR-0049).
+
+        The cross-region case: computed in another region, the DDB row
+        replicated here, but the S3 object did not (independent per-region
+        buckets, no CRR). The server stays stateless; the client retries.
+        """
+        from botocore.exceptions import ClientError
+
+        eid = _make_uuid()
+        item = _done_item(execution_id=eid)  # range_start=2, range_end=10
+        no_such_key = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "not in this region"}},
+            "GetObject",
+        )
+        with (
+            patch("prime_service.main.get_execution", return_value=item),
+            patch("prime_service.s3_store.get_primes", side_effect=no_such_key),
+            patch("prime_service.main.PrimeQueue") as mock_queue_cls,
+        ):
+            mock_q = mock_queue_cls.return_value
+            async with await make_client() as ac:
+                r = await ac.get(f"/primes/{eid}")
+
+        assert r.status_code == 503
+        assert r.headers.get("Retry-After") == "20"
+        mock_q.enqueue.assert_called_once_with(execution_id=eid, start=2, end=10)
+
+    @pytest.mark.asyncio
+    async def test_done_s3_miss_without_range_returns_410(self) -> None:
+        """Done row whose object is gone AND no range to regenerate from →
+        410 (genuine, unrecoverable loss). Defensive branch (ADR-0049)."""
+        from botocore.exceptions import ClientError
+
+        eid = _make_uuid()
+        item = _done_item(execution_id=eid)
+        del item["range_start"]  # no range → cannot recompute
+        no_such_key = ClientError({"Error": {"Code": "NoSuchKey", "Message": "gone"}}, "GetObject")
+        with (
+            patch("prime_service.main.get_execution", return_value=item),
+            patch("prime_service.s3_store.get_primes", side_effect=no_such_key),
+            patch("prime_service.main.PrimeQueue") as mock_queue_cls,
+        ):
+            mock_q = mock_queue_cls.return_value
+            async with await make_client() as ac:
+                r = await ac.get(f"/primes/{eid}")
+
+        assert r.status_code == 410
+        mock_q.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_failed_status_includes_error_message(self) -> None:
         eid = _make_uuid()
         item = _failed_item(execution_id=eid, error="compute exceeded 60s SIGALRM budget")

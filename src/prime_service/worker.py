@@ -6,7 +6,9 @@ Invocation:
 Design:
     - Single-threaded synchronous consumer loop (boto3 sync, not async).
     - Idempotency-aware retry:
-        status='done'    → ack + skip (already computed)
+        status='done' + result present in this region's S3 → ack + skip
+        status='done' + result ABSENT (cross-region miss) → recompute into
+            this region's S3 from the row's range, do not mutate the row (ADR-0049)
         status='running' and started_at > 90s ago → mark failed, proceed fresh
         status='queued'  → proceed with compute
     - Cache-first: check for a covering Valkey range before computing.
@@ -83,6 +85,34 @@ signal.signal(signal.SIGTERM, _handle_sigterm)
 # ─── Message handler ──────────────────────────────────────────────────────────
 
 
+def _recompute_into_local_store(execution_id: str, start: int, end: int, cache: PrimeCache) -> None:
+    """Regenerate a `done` job's result into THIS region's S3 + cache (ADR-0049).
+
+    Does NOT mutate the DDB row — it is already `done` with correct metadata;
+    only the local-region S3 object was missing (the job was computed in
+    another region and not replicated here). On compute or S3-write failure,
+    log and return: the caller acks anyway, and the client's next poll
+    re-enqueues, giving a bounded retry without poisoning the queue.
+    """
+    try:
+        primes = sieve_with_timeout(start, end)
+    except Exception as exc:  # noqa: BLE001
+        log.error("recompute_failed", error=f"{type(exc).__name__}: {exc}")
+        emit_count("recompute_errors")
+        return
+    try:
+        s3_store.put_primes(execution_id, primes)
+    except Exception as exc:  # noqa: BLE001
+        log.error("recompute_s3_write_error", error=f"{type(exc).__name__}: {exc}")
+        emit_count("recompute_errors")
+        return
+    try:
+        cache.merge_or_put(start, end, primes)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("recompute_cache_write_error", error=str(exc))
+    log.info("recompute_stored", count=len(primes))
+
+
 def handle_message(
     message: dict[str, Any],
     queue: PrimeQueue,
@@ -115,8 +145,23 @@ def handle_message(
         row_status: str = row["status"]
 
         if row_status == Status.done.value:
-            log.info("already_done")
+            # ADR-0049 recompute-on-miss. A `done` row whose result is present
+            # in THIS region's bucket is a genuine duplicate delivery — ack +
+            # skip. A `done` row whose object is ABSENT here is the cross-region
+            # case: the job was computed in another region and the DDB row
+            # replicated, but the S3 object did not (independent per-region
+            # buckets, no CRR). Regenerate it locally from the range; do NOT
+            # touch the row (status stays done, completed_at preserved) — only
+            # restore the missing object + warm the cache, then ack.
+            s3_key = row.get("s3_key")
+            if s3_key and s3_store.exists(str(s3_key)):
+                log.info("already_done")
+                queue.ack(message)
+                return
+            log.info("recompute_on_miss")
+            _recompute_into_local_store(execution_id, start, end, cache)
             queue.ack(message)
+            emit_count("recompute_on_miss_count")
             return
 
         if row_status == Status.running.value:

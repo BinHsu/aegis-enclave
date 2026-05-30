@@ -90,6 +90,13 @@ def _make_item(
         "range_end": end,
         "created_at": 1745654400,
     }
+    if status == "done":
+        # A real `done` row carries the S3 pointer (ADR-0048). The worker's
+        # done-branch (ADR-0049) checks `s3_store.exists(s3_key)` to tell a
+        # genuine duplicate (present → skip) from a cross-region miss
+        # (absent → recompute). conftest stubs exists() -> True by default.
+        item["s3_key"] = f"done/{eid}.json.gz"
+        item["completed_at"] = 1745654460
     if started_at is not None:
         item["started_at"] = started_at
     return item
@@ -129,8 +136,13 @@ class TestHandleMessageIdempotency:
 
         queue.ack.assert_called_once()
 
-    def test_already_done_acks_and_skips(self) -> None:
-        """status='done' → ack + skip without compute."""
+    def test_already_done_present_acks_and_skips(self) -> None:
+        """status='done' + result present in THIS region's S3 → ack + skip.
+
+        conftest stubs s3_store.exists() -> True, so the done row's object
+        is present locally — a genuine duplicate delivery, not a cross-region
+        miss. No recompute (ADR-0049).
+        """
         queue = _mock_queue()
         cache = _mock_cache()
         eid = _make_uuid()
@@ -143,6 +155,67 @@ class TestHandleMessageIdempotency:
 
         queue.ack.assert_called_once()
         mock_sieve.assert_not_called()
+
+    def test_done_but_local_s3_miss_recomputes(self) -> None:
+        """status='done' but object ABSENT in this region → recompute (ADR-0049).
+
+        The cross-region case: computed elsewhere, DDB row replicated here,
+        S3 object did not (independent per-region buckets, no CRR). The worker
+        regenerates the result into THIS region's S3 from the row's range and
+        acks — WITHOUT mutating the row (status stays done; no mark_running /
+        mark_done so completed_at is preserved).
+        """
+        queue = _mock_queue()
+        cache = _mock_cache()
+        eid = _make_uuid()
+        msg = _make_message(execution_id=eid, start=2, end=100)
+        item = _make_item(execution_id=eid, status="done")
+
+        with (
+            patch("prime_service.worker.get_execution", return_value=item),
+            patch("prime_service.s3_store.exists", return_value=False),
+            patch(
+                "prime_service.worker.sieve_with_timeout", return_value=[2, 3, 5, 7]
+            ) as mock_sieve,
+            patch("prime_service.s3_store.put_primes", return_value="done/x.json.gz") as mock_put,
+            patch("prime_service.worker.mark_running") as mock_running,
+            patch("prime_service.worker.mark_done") as mock_done,
+        ):
+            handle_message(msg, queue, cache)
+
+        mock_sieve.assert_called_once_with(2, 100)
+        mock_put.assert_called_once()
+        queue.ack.assert_called_once()
+        # Row is NOT mutated — it is already `done`; only the S3 object was
+        # restored. completed_at must be preserved (no re-mark_done).
+        mock_running.assert_not_called()
+        mock_done.assert_not_called()
+
+    def test_done_recompute_failure_still_acks(self) -> None:
+        """A failed recompute (compute error) still acks — no poison loop.
+
+        The client's next poll re-enqueues; the row stays `done` (untouched),
+        so failure here is a bounded retry, not a stuck message.
+        """
+        queue = _mock_queue()
+        cache = _mock_cache()
+        eid = _make_uuid()
+        msg = _make_message(execution_id=eid, start=2, end=100)
+        item = _make_item(execution_id=eid, status="done")
+
+        with (
+            patch("prime_service.worker.get_execution", return_value=item),
+            patch("prime_service.s3_store.exists", return_value=False),
+            patch(
+                "prime_service.worker.sieve_with_timeout",
+                side_effect=TimeoutError("budget exceeded"),
+            ),
+            patch("prime_service.s3_store.put_primes") as mock_put,
+        ):
+            handle_message(msg, queue, cache)
+
+        queue.ack.assert_called_once()
+        mock_put.assert_not_called()
 
     def test_queued_proceeds_to_compute(self) -> None:
         """status='queued' → proceeds with compute."""
