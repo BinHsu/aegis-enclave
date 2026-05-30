@@ -1,7 +1,7 @@
 # ADR-0048: Large-result store — S3 with cross-region replication + DDB result-pointer
 
 ## Status
-Accepted (2026-05-29)
+Accepted (2026-05-29). **Cross-region replication decision (bidirectional S3 CRR) superseded by ADR-0049** — replaced by recompute-on-cross-region-miss. The *size* decision (large result list in a per-region S3 bucket, `s3_key` pointer in the DynamoDB row) **remains in force**; the S3 bucket stays, it just stops being a replication source/destination.
 
 > Decision adopted; implementation deferred to GitHub issue #14. Until that
 > lands, the code continues to dual-write the primes list to DynamoDB
