@@ -84,7 +84,7 @@ module "ecs" {
             { name = "AWS_DEFAULT_REGION", value = var.region },
             # ADR-0048: s3_store derives the bucket name as
             # "${prefix}-${AWS_REGION}" at runtime so each task reads/writes
-            # its own local CRR replica. Explicit AWS_REGION (not just
+            # its own independent regional bucket. Explicit AWS_REGION (not just
             # AWS_DEFAULT_REGION) because boto3.client("s3", ...) inspects
             # AWS_REGION first.
             { name = "AWS_REGION", value = var.region },

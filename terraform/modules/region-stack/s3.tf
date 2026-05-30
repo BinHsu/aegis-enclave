@@ -4,8 +4,9 @@
 #
 # Per ADR-0048 the gzipped primes-list payload lives in S3 (not in the DDB
 # row, which would breach the 400 KB item cap for end=10^7). Each region
-# owns its own bucket; bidirectional CRR between regions is configured at
-# the root module to avoid a per-module dependency cycle (see main.tf).
+# owns its own independent bucket; there is no cross-region replication
+# (ADR-0049 replaced bidirectional CRR with recompute-on-miss — a cross-
+# region read regenerates the object locally from the DDB-replicated range).
 #
 # Naming: "${result_bucket_prefix}-${region}" — bucket name carries the
 # region so `s3_store.py` can resolve it at runtime from AWS_REGION alone.
@@ -34,9 +35,9 @@ resource "aws_s3_bucket" "results" {
   }
 }
 
-# Versioning is mandatory for CRR (both source and destination must have
-# versioning enabled). It also gives the lifecycle policy a clean
-# `noncurrent_version_expiration` knob.
+# Versioning is retained for the lifecycle policy's clean
+# `noncurrent_version_expiration` knob. (It was originally mandatory for the
+# bidirectional CRR removed by ADR-0049; the lifecycle use is why it stays.)
 resource "aws_s3_bucket_versioning" "results" {
   bucket = aws_s3_bucket.results.id
   versioning_configuration {

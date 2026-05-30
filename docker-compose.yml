@@ -108,9 +108,10 @@ services:
       - internal
 
   minio:
-    # S3-compatible local object store. Cloud parity: real S3 buckets per
-    # region with bidirectional CRR (ADR-0048). Holds the gzipped primes-
-    # list payloads; the DDB row carries only the s3_key pointer.
+    # S3-compatible local object store. Cloud parity: an independent S3
+    # bucket per region (ADR-0048; no cross-region replication — ADR-0049).
+    # Holds the gzipped primes-list payloads; the DDB row carries only the
+    # s3_key pointer.
     # No host port published — reachable only inside the internal Docker
     # network (alongside app / worker / data tier).
     image: minio/minio:latest

@@ -70,8 +70,8 @@ data "aws_iam_policy_document" "worker_policy" {
   }
 
   # ADR-0048: result store. ECS tasks need Get + Put on objects under
-  # this region's results bucket; replica reads from peer-replicated keys
-  # use the SAME bucket name (CRR puts the object in the local bucket).
+  # this region's independent results bucket. A cross-region miss is
+  # regenerated locally (recompute-on-miss, ADR-0049) — Put covers that too.
   # Scoped to bucket-relative keys only — no DeleteObject (lifecycle policy
   # handles deletion); no PutBucket* (terraform owns those).
   # tfsec false positive: '<bucket>/*' is the canonical and minimum scope

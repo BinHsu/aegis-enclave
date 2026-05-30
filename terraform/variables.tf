@@ -204,7 +204,7 @@ variable "budget_notification_email" {
 # ─── Result store (ADR-0048) ────────────────────────────────────────────────
 
 variable "result_bucket_prefix" {
-  description = "Prefix for the per-region S3 result bucket name (ADR-0048). Final bucket is '<prefix>-<region>' (e.g. 'aegis-enclave-results-eu-central-1'). The region is appended at module-eval time, and `s3_store.py` reconstructs the same name at runtime via AWS_REGION — so the DDB row carries only the bucket-relative s3_key and each region reads its local CRR replica."
+  description = "Prefix for the per-region S3 result bucket name (ADR-0048). Final bucket is '<prefix>-<region>' (e.g. 'aegis-enclave-results-eu-central-1'). The region is appended at module-eval time, and `s3_store.py` reconstructs the same name at runtime via AWS_REGION — so the DDB row carries only the bucket-relative s3_key and each region reads from its own independent bucket (no CRR; a cross-region miss is regenerated locally per ADR-0049)."
   type        = string
   default     = "aegis-enclave-results"
 

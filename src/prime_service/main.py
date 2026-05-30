@@ -355,8 +355,8 @@ async def fetch_execution(
 
     Per ADR-0048 the primes list lives in S3, not DDB; this audit endpoint
     returns the metadata + s3_key pointer only. Use GET /primes/{id} to
-    fetch the actual primes list (it handles cache + S3 + replication-lag
-    response codes properly).
+    fetch the actual primes list (it reads S3 and handles the
+    recompute-on-miss 503 path per ADR-0049).
     """
     structlog.contextvars.bind_contextvars(execution_id=execution_id)
     row = get_execution(execution_id)
