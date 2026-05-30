@@ -174,6 +174,10 @@ cloud-down: ## Cloud-acceptance one-shot teardown — drain ECR + destroy + ACM 
 cloud-smoke: ## Cloud-side 6-step smoke (POST + poll + cache hit + 422 + backpressure)
 	@./scripts/cloud-smoke.sh
 
+.PHONY: cross-region-check
+cross-region-check: ## ADR-0049 — POST in platform region, poll in peer, prove recompute-on-miss (needs both VPNs)
+	@./scripts/cross_region_poll_check.sh
+
 .PHONY: dr-drill
 dr-drill: ## Disaster-recovery drill — destroy + rebuild peer region, measure RTO, prove survivor serves
 	@./scripts/dr-drill.sh
