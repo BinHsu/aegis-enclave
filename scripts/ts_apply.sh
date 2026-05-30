@@ -127,40 +127,41 @@ ok "AWS caller:  $ARN"
 # avoids silent set -e + pipefail exit when grep finds no match.
 section "5/6 — ACM certificates reachable"
 
-# Helper: grep a var across all tfvars + auto.tfvars files in $TF_DIR
-parse_tfvar() {
-    local name="$1"
-    local match=""
+# Verify every ACM certificate referenced in the tfvars is reachable before
+# the apply (fail-fast). ADR-0042: the server/client cert ARNs are nested
+# inside the per-region `regions` map (indented; one pair per region), and
+# each ARN encodes its own region — so collect them all and check each in the
+# region from its ARN, rather than parsing a single top-level `region`.
+CERT_ARNS=$(
     for f in "$TF_DIR"/terraform.tfvars "$TF_DIR"/*.auto.tfvars; do
         [[ -f "$f" ]] || continue
-        match=$(grep -E "^${name}[[:space:]]*=" "$f" 2>/dev/null | tail -1 | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/' || true)
-        [[ -n "$match" ]] && { echo "$match"; return 0; }
-    done
-    return 1
-}
+        ( grep -E "^[[:space:]]*(server|client)_cert_arn[[:space:]]*=" "$f" 2>/dev/null || true ) \
+            | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/'
+    done | sort -u
+)
+[[ -n "$CERT_ARNS" ]] \
+    || fail "no server_cert_arn / client_cert_arn found in $TF_DIR/{terraform,*.auto}.tfvars (run 'make cloud-up' to bootstrap certs)"
 
-REGION=$(parse_tfvar "region" || echo "")
-SERVER_CERT=$(parse_tfvar "server_cert_arn" || echo "")
-CLIENT_CERT=$(parse_tfvar "client_cert_arn" || echo "")
-
-[[ -n "$REGION" ]] || fail "could not parse region from $TF_DIR/{terraform,*.auto}.tfvars"
-[[ -n "$SERVER_CERT" ]] || fail "could not parse server_cert_arn from $TF_DIR/{terraform,*.auto}.tfvars (run 'make cloud-up' to bootstrap certs)"
-[[ -n "$CLIENT_CERT" ]] || fail "could not parse client_cert_arn from $TF_DIR/{terraform,*.auto}.tfvars (run 'make cloud-up' to bootstrap certs)"
-
-info "server_cert_arn=$SERVER_CERT"
-info "client_cert_arn=$CLIENT_CERT"
-
-ACM_RAW=$(aws acm describe-certificate --region "$REGION" --certificate-arn "$SERVER_CERT" 2>&1) || {
-    printf "\n--- aws acm describe-certificate (server) failed ---\n%s\n--- end ---\n" "$ACM_RAW" >&2
-    fail "server_cert_arn not reachable in region $REGION. Check IAM perm acm:DescribeCertificate or ARN validity."
-}
-ok "server_cert_arn reachable"
-
-ACM_RAW=$(aws acm describe-certificate --region "$REGION" --certificate-arn "$CLIENT_CERT" 2>&1) || {
-    printf "\n--- aws acm describe-certificate (client) failed ---\n%s\n--- end ---\n" "$ACM_RAW" >&2
-    fail "client_cert_arn not reachable in region $REGION."
-}
-ok "client_cert_arn reachable"
+CERT_COUNT=0
+while IFS= read -r arn; do
+    [[ -z "$arn" ]] && continue
+    case "$arn" in
+        PENDING:*) fail "cert ARN still a sentinel ($arn) — VPN PKI bootstrap incomplete; run 'make cloud-up'" ;;
+        arn:aws:acm:*) : ;;
+        *) fail "unrecognised cert ARN format: $arn" ;;
+    esac
+    cert_region=$(printf '%s' "$arn" | cut -d: -f4)
+    [[ -n "$cert_region" ]] || fail "could not derive region from cert ARN: $arn"
+    ACM_RAW=$(aws acm describe-certificate --region "$cert_region" --certificate-arn "$arn" 2>&1) || {
+        printf "\n--- aws acm describe-certificate failed (%s) ---\n%s\n--- end ---\n" "$arn" "$ACM_RAW" >&2
+        fail "cert not reachable: $arn (region $cert_region). Check acm:DescribeCertificate perm or ARN validity."
+    }
+    ok "cert reachable: ${arn##*/} ($cert_region)"
+    CERT_COUNT=$((CERT_COUNT + 1))
+done <<EOF
+$CERT_ARNS
+EOF
+ok "$CERT_COUNT ACM certificate(s) reachable across regions"
 
 # ─── Terraform initialised ─────────────────────────────────────────────────
 section "6/6 — Terraform initialised"
