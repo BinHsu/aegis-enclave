@@ -265,9 +265,9 @@ async def get_primes_result(
 
     For status=done, the primes list is fetched from the local-region S3
     bucket via the row's `s3_key` (ADR-0048). The server is **stateless**
-    on retries: on S3 NoSuchKey it distinguishes replication lag (transient
-    → 503 + Retry-After: 20) from lifecycle expiry (genuine loss → 410)
-    by comparing the row's `completed_at` against `s3_store._LIFECYCLE_TTL_S`.
+    on retries: on S3 NoSuchKey (the result was computed in another region
+    and this region's bucket is independent — no CRR, ADR-0049) it re-enqueues
+    a local recompute from the row's range and returns 503 + Retry-After: 20.
     The client owns its retry budget (reference: 3 × 20 s = 60 s).
     """
     structlog.contextvars.bind_contextvars(execution_id=execution_id)
@@ -304,34 +304,38 @@ async def get_primes_result(
                     detail="result store unreachable",
                     headers={"Retry-After": "20"},
                 ) from exc
-            # NoSuchKey — either replication has not yet arrived or the
-            # lifecycle policy has removed the object. Distinguish by the
-            # audit row's `completed_at` age (per ADR-0048 § 5).
-            completed_at_raw = row.get("completed_at")
-            now_epoch = int(time.time())
-            if completed_at_raw is None:
-                # `done` row without completed_at is anomalous; treat as 503.
-                log.warning("done_row_missing_completed_at")
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="result not yet replicated to this region; retry",
-                    headers={"Retry-After": "20"},
-                ) from exc
-            age_s = now_epoch - int(completed_at_raw)
-            if age_s > s3_store._LIFECYCLE_TTL_S:
-                # The S3 lifecycle policy has deleted the payload; the row
-                # outlived it. Genuine, permanent loss — client re-POSTs.
-                log.info("s3_lifecycle_expired", age_s=age_s)
+            # NoSuchKey: the DDB row says done but THIS region's bucket lacks
+            # the object. Per ADR-0049 each region's bucket is independent (no
+            # CRR), so the result was computed in another region (or the local
+            # lifecycle removed it). Re-enqueue a local recompute from the row's
+            # replicated range and tell the client to retry; the worker restores
+            # the object in this region's bucket and the next poll serves it.
+            # The server stays stateless — the client owns its retry budget.
+            range_start = row.get("range_start")
+            range_end = row.get("range_end")
+            if range_start is None or range_end is None:
+                # No range to regenerate from — genuine, unrecoverable loss.
+                log.warning("done_row_missing_range")
                 raise HTTPException(
                     status_code=status.HTTP_410_GONE,
-                    detail="result expired per retention policy",
+                    detail="result unavailable and cannot be regenerated",
                 ) from exc
-            # Replication has not yet caught up. Retry-After is advisory;
-            # the client owns its retry budget (ADR-0048 § 5).
-            log.info("s3_replication_lag", age_s=age_s)
+            try:
+                PrimeQueue().enqueue(
+                    execution_id=execution_id,
+                    start=int(range_start),
+                    end=int(range_end),
+                )
+                log.info(
+                    "recompute_enqueued",
+                    range_start=int(range_start),
+                    range_end=int(range_end),
+                )
+            except Exception as enq_exc:  # noqa: BLE001
+                log.error("recompute_enqueue_failed", error=str(enq_exc))
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="result not yet replicated to this region; retry",
+                detail="result being regenerated in this region; retry",
                 headers={"Retry-After": "20"},
             ) from exc
 

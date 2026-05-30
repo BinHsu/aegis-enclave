@@ -3,9 +3,9 @@
 The autouse fixtures here stub out the **S3 result store** introduced by
 ADR-0048 + issue #14 so that the bulk of the suite (worker, main HTTP)
 does not have to know S3 exists. Tests that want to *exercise* S3
-behaviour (replication-lag 503, lifecycle-expiry 410, write-failure
-mark_failed) opt in by patching `s3_store.put_primes` / `s3_store.get_primes`
-themselves within the test body.
+behaviour (recompute-on-miss 503 per ADR-0049, write-failure mark_failed)
+opt in by patching `s3_store.put_primes` / `s3_store.get_primes` /
+`s3_store.exists` themselves within the test body.
 
 The fixture intentionally lives in `tests/conftest.py` rather than a
 per-module fixture: every handler that mark_done's a job goes through
@@ -33,6 +33,10 @@ def _stub_s3_store() -> Iterator[None]:
         get_primes(s3_key) -> returns an empty list. Tests that need the
             real list back should patch `s3_store.get_primes` themselves
             (the patch from this fixture is shadowable per-test).
+        exists(s3_key) -> returns True (object present in this region).
+            The worker's done-branch (ADR-0049) treats present as a genuine
+            duplicate (ack + skip); a recompute-on-miss test patches this to
+            False to exercise the local-regenerate path.
 
     This stub does NOT cover `s3_store._get_client()` etc. — those are
     only reached when put/get themselves are NOT patched. By patching the
@@ -46,6 +50,10 @@ def _stub_s3_store() -> Iterator[None]:
         patch(
             "prime_service.s3_store.get_primes",
             return_value=[],
+        ),
+        patch(
+            "prime_service.s3_store.exists",
+            return_value=True,
         ),
     ):
         yield

@@ -164,8 +164,9 @@ def mark_done(
 
     The primes list itself is **NOT** written to DynamoDB — DDB items have
     a hard 400 KB limit (for end=10^7 the serialised list is ~6 MB). The
-    list lives in a regional S3 bucket replicated via CRR; the GET handler
-    fetches it from S3 using this `s3_key`. See ADR-0048 § 1-§ 5.
+    list lives in a per-region S3 bucket (independent; no CRR — ADR-0049);
+    the GET handler fetches it from S3 using this `s3_key`, regenerating it
+    locally on a cross-region miss. See ADR-0048 + ADR-0049.
 
     ConditionExpression: status must equal 'running'.
     Swallows ConditionalCheckFailedException.
