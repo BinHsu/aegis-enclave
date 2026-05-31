@@ -125,9 +125,19 @@ ARN=$( ( printf '%s' "$AUTH_RAW" | grep -oE '"Arn":[[:space:]]*"[^"]+"' | sed -E
 ok "AWS account: $ACCOUNT_ID"
 ok "AWS caller:  $ARN"
 
-REGION=$( (grep -E '^region[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
+# ADR-0042: tfvars carries `platform_region` + a `regions` map, NOT the old flat
+# `region` / `secondary_region`. Parse the platform region, then derive the peer
+# region from the OTHER key in the regions map (the quoted "xx-xxxx-N" = { lines).
+# The stale flat grep silently left SECONDARY_REGION empty, so every peer-region
+# cleanup below (ECR drain, ACM certs, collateral verify) was skipped.
+REGION=$( (grep -E '^platform_region[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
 REGION="${REGION:-eu-central-1}"
-SECONDARY_REGION=$( (grep -E '^secondary_region[[:space:]]*=' "$TFVARS" 2>/dev/null || true) | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
+SECONDARY_REGION=$(
+    ( grep -oE '"[a-z]{2}-[a-z]+-[0-9]+"[[:space:]]*=[[:space:]]*\{' "$TFVARS" 2>/dev/null || true ) \
+        | ( grep -oE '[a-z]{2}-[a-z]+-[0-9]+' || true ) \
+        | ( grep -vx "$REGION" || true ) \
+        | head -1
+)
 
 if [[ ! -d "$TF_DIR/.terraform" ]]; then
     info ".terraform/ missing — running terraform init"
@@ -145,18 +155,13 @@ ok "$RESOURCE_COUNT resource(s) currently in tfstate"
 # ─── Step 2: Drain ECR images (primary + secondary regions) ────────────────
 section "2/6 — Drain ECR images (otherwise terraform destroy fails on ECR)"
 
-# Drain by terraform output URL, not by state-path grep — multi-region has
-# both `module.ecr` (primary) and `aws_ecr_repository.secondary` (secondary)
-# which the old `^module\.ecr\.` filter missed. Output-based detection works
-# regardless of resource path / module nesting.
+# Drain by (region, repo_name). The repo name comes from the terraform output
+# when the stack is intact, else from the name_prefix naming convention — so a
+# PARTIAL stack (outputs absent after a failed apply) still drains and lets
+# `terraform destroy` proceed, the failure this fixes. A missing repo is a no-op.
 drain_ecr_region() {
     local region="$1"
-    local repo_url="$2"
-    if [[ -z "$repo_url" ]] || [[ "$repo_url" == "null" ]]; then
-        return 0  # output absent or null = no ECR in this region
-    fi
-    local repo_name
-    repo_name=$(echo "$repo_url" | sed -E 's|.*/([^/]+)$|\1|')
+    local repo_name="$2"
     [[ -z "$repo_name" ]] && return 0
 
     local image_ids
@@ -172,12 +177,24 @@ drain_ecr_region() {
     fi
 }
 
+# Prefer the terraform output's repo name; fall back to the name_prefix
+# convention (aegis-enclave / aegis-enclave-<peer>) when outputs are absent.
 PRIMARY_ECR_URL=$(cd "$TF_DIR" && terraform output -raw ecr_repository_url 2>/dev/null || echo "")
-drain_ecr_region "$REGION" "$PRIMARY_ECR_URL"
+if [[ -n "$PRIMARY_ECR_URL" && "$PRIMARY_ECR_URL" != "null" ]]; then
+    PRIMARY_ECR_NAME=$(echo "$PRIMARY_ECR_URL" | sed -E 's|.*/([^/]+)$|\1|')
+else
+    PRIMARY_ECR_NAME="aegis-enclave"
+fi
+drain_ecr_region "$REGION" "$PRIMARY_ECR_NAME"
 
 if [[ -n "$SECONDARY_REGION" ]]; then
     SECONDARY_ECR_URL=$(cd "$TF_DIR" && terraform output -raw secondary_ecr_repository_url 2>/dev/null || echo "")
-    drain_ecr_region "$SECONDARY_REGION" "$SECONDARY_ECR_URL"
+    if [[ -n "$SECONDARY_ECR_URL" && "$SECONDARY_ECR_URL" != "null" ]]; then
+        SECONDARY_ECR_NAME=$(echo "$SECONDARY_ECR_URL" | sed -E 's|.*/([^/]+)$|\1|')
+    else
+        SECONDARY_ECR_NAME="aegis-enclave-${SECONDARY_REGION}"
+    fi
+    drain_ecr_region "$SECONDARY_REGION" "$SECONDARY_ECR_NAME"
 fi
 
 # ─── Step 3: terraform destroy (via ts_teardown.sh strict-confirm wrapper) ─
