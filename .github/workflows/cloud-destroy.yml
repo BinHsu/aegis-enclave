@@ -81,6 +81,28 @@ jobs:
         working-directory: terraform
         run: terraform init -input=false
 
+      # terraform DeleteRepository fails on a non-empty ECR repo, so drain the
+      # images first (the CI analogue of cloud-down.sh's drain). Repo names follow
+      # the name_prefix convention (aegis-enclave / aegis-enclave-<peer>); the peer
+      # region comes from the regions map in deploy.auto.tfvars (ADR-0042).
+      - name: Drain ECR images
+        run: |
+          set -uo pipefail
+          REGION="${{ vars.AWS_REGION || 'eu-central-1' }}"
+          SECONDARY=$( ( grep -oE '"[a-z]{2}-[a-z]+-[0-9]+"[[:space:]]*=[[:space:]]*\{' terraform/deploy.auto.tfvars 2>/dev/null || true ) | ( grep -oE '[a-z]{2}-[a-z]+-[0-9]+' || true ) | ( grep -vx "$REGION" || true ) | head -1 )
+          drain() {
+            local region="$1" repo="$2" ids
+            ids=$(aws ecr list-images --repository-name "$repo" --region "$region" --query 'imageIds[*]' --output json 2>/dev/null || echo '[]')
+            if [ "$ids" != "[]" ] && [ -n "$ids" ]; then
+              aws ecr batch-delete-image --repository-name "$repo" --region "$region" --image-ids "$ids" --output text >/dev/null 2>&1 || true
+              echo "drained $region/$repo"
+            else
+              echo "$region/$repo already empty or gone"
+            fi
+          }
+          drain "$REGION" "aegis-enclave"
+          [ -n "$SECONDARY" ] && drain "$SECONDARY" "aegis-enclave-${SECONDARY}"
+
       - name: Terraform destroy
         working-directory: terraform
         # -refresh=false: a re-run after a partially-failed destroy would
