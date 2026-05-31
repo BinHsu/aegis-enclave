@@ -83,4 +83,9 @@ jobs:
 
       - name: Terraform destroy
         working-directory: terraform
-        run: terraform destroy -auto-approve -input=false -no-color -lock-timeout=5m
+        # -refresh=false: a re-run after a partially-failed destroy would
+        # otherwise re-evaluate now-dead module outputs and crash with "Invalid
+        # for_each argument" (the ECS module's for_each over container
+        # definitions). Compute the destroy purely from cached state — matches
+        # the same fix already in scripts/ts_teardown.sh.
+        run: terraform destroy -auto-approve -input=false -no-color -lock-timeout=5m -refresh=false
