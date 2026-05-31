@@ -109,6 +109,7 @@ These four set the scope, calibration framework, methodology, and target-shape t
 | [0047](0047-local-stack-network-segmentation-routed-vpn.md) | Local Docker stack network segmentation — `internal: true` + edge + routed-VPN tunnel traversal in smoke.sh; mirrors AWS Client VPN -> private VPC -> internal ALB |
 | [0048](0048-large-result-store-s3-cross-region-replication.md) | Large-result store — S3 with bidirectional CRR + DDB `s3_key` pointer (region derived at runtime, not stored); closes the result-layer regional-affinity gap left by ADR-0042 (implementation deferred, issue #14). **CRR half superseded by ADR-0049.** |
 | [0049](0049-cross-region-result-recompute-on-miss.md) | Cross-region result availability via **recompute-on-miss** — supersedes ADR-0048's bidirectional CRR; the per-region S3 bucket becomes independent (no replication), a cross-region GET-miss re-enqueues a local compute from the DDB-replicated range. Keeps the client dumb, dissolves issue #12's CRR-placement sub-decision. S3 (size) + DDB Global Table (metadata) remain. |
+| [0050](0050-ipam-aware-vpc-cidr-allocation.md) | IPAM-aware VPC CIDR — per-region opt-in: set `vpc_cidr` (static, forker default) XOR `ipv4_ipam_pool_id` (allocate from the landing-zone's RAM-shared AWS IPAM, machine-enforced non-overlap). `use_ipam_pool` + plan-time `aws_vpc_ipam_preview_next_cidr` for the subnet/SG/VPN derivation. Extends ADR-0011/0019. |
 
 ---
 

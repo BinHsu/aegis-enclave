@@ -47,6 +47,12 @@ regions = {
     # VPC CIDR — must NOT overlap any other region's VPC CIDR, nor any VPC the
     # operator might peer via Transit Gateway. Three /24 private subnets are
     # derived automatically (x.x.1.0/24, x.x.2.0/24, x.x.3.0/24).
+    #
+    # ADR-0050: set EITHER vpc_cidr (static, the forker default below) OR
+    # ipv4_ipam_pool_id (allocate from AWS IPAM — IPAM enforces non-overlap, no
+    # hand-managed ranges). Exactly one per region. See the IPAM example block at
+    # the bottom of this file. In our org the CI deploy supplies the IPAM pool id
+    # via an *.auto.tfvars; a forker without IPAM just keeps vpc_cidr.
     vpc_cidr = "10.0.0.0/16"
 
     # Client VPN client address pool — must not overlap any region's VPC CIDR
@@ -113,6 +119,24 @@ owner = "bin.hsu"
 #     vpn_client_cidr = "10.20.0.0/16"
 #     server_cert_arn = "arn:aws:acm:eu-central-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
 #     client_cert_arn = "arn:aws:acm:eu-central-1:000000000000:certificate/11111111-1111-1111-1111-111111111111"
+#   }
+# }
+# ════════════════════════════════════════════════════════════════════════════
+#
+# ════════════════════════════════════════════════════════════════════════════
+# IPAM-ALLOCATED EXAMPLE (ADR-0050) — drop `vpc_cidr` and supply an IPAM pool id
+# instead. IPAM hands out a non-overlapping CIDR at the requested netmask and
+# tracks it, so you never hand-manage ranges across regions. Exactly one of
+# vpc_cidr / ipv4_ipam_pool_id per region (a tfvars setting both fails validation).
+# The pool must be shared to this account (e.g. via AWS RAM from a central IPAM).
+#
+# regions = {
+#   "eu-central-1" = {
+#     ipv4_ipam_pool_id   = "ipam-pool-0abc123def4567890"  # region-scoped pool
+#     ipv4_netmask_length = 16                              # /16 -> 3x /24 subnets
+#     vpn_client_cidr     = "10.20.0.0/16"
+#     server_cert_arn     = "arn:aws:acm:eu-central-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
+#     client_cert_arn     = "arn:aws:acm:eu-central-1:000000000000:certificate/11111111-1111-1111-1111-111111111111"
 #   }
 # }
 # ════════════════════════════════════════════════════════════════════════════

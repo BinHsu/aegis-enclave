@@ -177,12 +177,14 @@ module "region_platform" {
     tls = tls
   }
 
-  region          = var.platform_region
-  name_prefix     = local.platform_name_prefix
-  vpc_cidr        = var.regions[var.platform_region].vpc_cidr
-  vpn_client_cidr = var.regions[var.platform_region].vpn_client_cidr
-  server_cert_arn = var.regions[var.platform_region].server_cert_arn
-  client_cert_arn = var.regions[var.platform_region].client_cert_arn
+  region              = var.platform_region
+  name_prefix         = local.platform_name_prefix
+  vpc_cidr            = var.regions[var.platform_region].vpc_cidr
+  ipv4_ipam_pool_id   = var.regions[var.platform_region].ipv4_ipam_pool_id
+  ipv4_netmask_length = var.regions[var.platform_region].ipv4_netmask_length
+  vpn_client_cidr     = var.regions[var.platform_region].vpn_client_cidr
+  server_cert_arn     = var.regions[var.platform_region].server_cert_arn
+  client_cert_arn     = var.regions[var.platform_region].client_cert_arn
 
   alb_internal_hostname = var.alb_internal_hostname
 
@@ -214,12 +216,14 @@ module "region_peer" {
     tls = tls
   }
 
-  region          = local.peer_region
-  name_prefix     = local.peer_name_prefix
-  vpc_cidr        = var.regions[local.peer_region].vpc_cidr
-  vpn_client_cidr = var.regions[local.peer_region].vpn_client_cidr
-  server_cert_arn = var.regions[local.peer_region].server_cert_arn
-  client_cert_arn = var.regions[local.peer_region].client_cert_arn
+  region              = local.peer_region
+  name_prefix         = local.peer_name_prefix
+  vpc_cidr            = var.regions[local.peer_region].vpc_cidr
+  ipv4_ipam_pool_id   = var.regions[local.peer_region].ipv4_ipam_pool_id
+  ipv4_netmask_length = var.regions[local.peer_region].ipv4_netmask_length
+  vpn_client_cidr     = var.regions[local.peer_region].vpn_client_cidr
+  server_cert_arn     = var.regions[local.peer_region].server_cert_arn
+  client_cert_arn     = var.regions[local.peer_region].client_cert_arn
 
   alb_internal_hostname = var.alb_internal_hostname
 

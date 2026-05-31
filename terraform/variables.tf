@@ -32,12 +32,18 @@ variable "regions" {
     entries (the DynamoDB replica + Route53 weighted records switch on
     automatically once a second region is present).
 
-    Each value carries the per-region scalars:
-      - vpc_cidr        : region VPC CIDR (peers must not overlap)
-      - vpn_client_cidr : Client VPN client pool (must not overlap any VPC or
-                          any other region's VPN pool)
-      - server_cert_arn : ACM ARN for the Client VPN server cert in that region
-      - client_cert_arn : ACM ARN for the Client VPN root CA in that region
+    Each value carries the per-region scalars. Set the VPC address space EITHER
+    statically OR from AWS IPAM (ADR-0050) — exactly one per region:
+      - vpc_cidr            : static region VPC CIDR (peers must not overlap).
+                              Mutually exclusive with ipv4_ipam_pool_id.
+      - ipv4_ipam_pool_id   : IPAM pool to allocate the VPC CIDR from. When set,
+                              IPAM guarantees non-overlap and vpc_cidr is omitted.
+      - ipv4_netmask_length : netmask to request from IPAM (default /16, matching
+                              the static-CIDR size so the /24 subnet math is kept).
+      - vpn_client_cidr     : Client VPN client pool (must not overlap any VPC or
+                              any other region's VPN pool)
+      - server_cert_arn     : ACM ARN for the Client VPN server cert in that region
+      - client_cert_arn     : ACM ARN for the Client VPN root CA in that region
 
     Terraform cannot pass a per-instance provider to a for_each module, so the
     root instantiates `region-stack` with explicit module calls — currently
@@ -45,10 +51,12 @@ variable "regions" {
     requires adding a third explicit module call + provider alias in main.tf.
   EOT
   type = map(object({
-    vpc_cidr        = string
-    vpn_client_cidr = optional(string, "10.20.0.0/16")
-    server_cert_arn = string
-    client_cert_arn = string
+    vpc_cidr            = optional(string)
+    ipv4_ipam_pool_id   = optional(string)
+    ipv4_netmask_length = optional(number, 16)
+    vpn_client_cidr     = optional(string, "10.20.0.0/16")
+    server_cert_arn     = string
+    client_cert_arn     = string
   }))
 
   validation {
@@ -64,6 +72,28 @@ variable "regions" {
   validation {
     condition     = alltrue([for r in keys(var.regions) : can(regex("^[a-z]{2}-[a-z]+-[0-9]+$", r))])
     error_message = "every regions key must be a valid AWS region pattern (e.g. eu-central-1)."
+  }
+
+  # ADR-0050: a region addresses its VPC EITHER statically (vpc_cidr) OR from
+  # IPAM (ipv4_ipam_pool_id) — never both, never neither. `(a) != (b)` on two
+  # booleans is XOR.
+  validation {
+    condition = alltrue([
+      for r in values(var.regions) :
+      (r.vpc_cidr != null) != (r.ipv4_ipam_pool_id != null)
+    ])
+    error_message = "each region must set EXACTLY ONE of vpc_cidr (static) or ipv4_ipam_pool_id (IPAM-allocated) — not both, not neither (ADR-0050)."
+  }
+
+  # ADR-0050: the VPC is carved into three /(n+8) private subnets
+  # (cidrsubnet newbits=8). n>20 would push a subnet below the AWS /28 minimum;
+  # n<16 exceeds the AWS /16 maximum VPC size. Only meaningful in IPAM mode.
+  validation {
+    condition = alltrue([
+      for r in values(var.regions) :
+      r.ipv4_ipam_pool_id == null || (r.ipv4_netmask_length >= 16 && r.ipv4_netmask_length <= 20)
+    ])
+    error_message = "ipv4_netmask_length must be 16-20 when allocating from IPAM (three /(n+8) subnets must stay within the AWS /16-/28 VPC/subnet limits)."
   }
 }
 

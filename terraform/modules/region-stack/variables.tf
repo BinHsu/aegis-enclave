@@ -31,8 +31,21 @@ variable "name_prefix" {
 }
 
 variable "vpc_cidr" {
-  description = "VPC CIDR for this region. Peers must not overlap each other (no inter-region CIDR collision if later peered via Transit Gateway)."
+  description = "Static VPC CIDR for this region (mutually exclusive with ipv4_ipam_pool_id; null when allocating from IPAM). Peers must not overlap each other (no inter-region CIDR collision if later peered via Transit Gateway)."
   type        = string
+  default     = null
+}
+
+variable "ipv4_ipam_pool_id" {
+  description = "IPAM pool ID to allocate the VPC CIDR from (ADR-0050). Null = use the static vpc_cidr. When set, the VPC allocates from IPAM (one tracked allocation) and the effective CIDR is previewed at plan time for the subnet / SG / VPN derivations."
+  type        = string
+  default     = null
+}
+
+variable "ipv4_netmask_length" {
+  description = "Netmask length to request from the IPAM pool (ADR-0050; only consulted when ipv4_ipam_pool_id is set). Default /16 matches the legacy static-CIDR size, so the three /24 private-subnet derivation is unchanged."
+  type        = number
+  default     = 16
 }
 
 variable "vpn_client_cidr" {

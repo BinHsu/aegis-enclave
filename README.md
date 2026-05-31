@@ -64,7 +64,7 @@ Full implementation rationale: [`docs/design_doc.md`](docs/design_doc.md).
 | **Cache** | ElastiCache Serverless Valkey; ZSET schema + Lua range-coalescing; bootstrap one-shot ECS task |
 | **Database** | DynamoDB Global Tables (active-active multi-region) for production; `amazon/dynamodb-local` for local dev parity |
 | **Local Development PoC** | Docker Compose stack with in-container test-client; WireGuard gateway here is a self-contained local fixture for the security-boundary test, not part of the deployment architecture |
-| **Cloud target (AWS)** | Terraform with community modules — per-region VPC, ECS Fargate behind internal ALB, DynamoDB Global Tables, SQS, ElastiCache Serverless, **AWS Client VPN endpoint**, ECR + cross-region replication, Route53 weighted routing |
+| **Cloud target (AWS)** | Terraform with community modules — per-region VPC (static or IPAM-allocated CIDR, ADR-0050), ECS Fargate behind internal ALB, DynamoDB Global Tables, SQS, ElastiCache Serverless, **AWS Client VPN endpoint**, ECR + cross-region replication, Route53 weighted routing |
 | **Cloud migration (e.g., IONOS / sovereign)** | Agent-executable runbook with service-mapping table; recommends self-hosted **NetBird** where managed VPN doesn't exist |
 | **Operations** | Mermaid smoke-test sequence, capability-gated agent execution, workload-tier-driven reliability targets |
 
