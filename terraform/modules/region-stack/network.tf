@@ -4,16 +4,17 @@
 # egress goes through VPC Endpoints; the VPC has no public-internet egress.
 # ADR-0007 reconsidered (04/28): 3-AZ private posture.
 
-# ADR-0050 — IPAM-aware VPC addressing. When the region opts into IPAM
-# (ipv4_ipam_pool_id set), preview the next CIDR IPAM would allocate at the
-# requested netmask, so the subnet / SG / VPN derivations have a concrete value
-# at PLAN time (the VPC's own use_ipam_pool allocation is known only after
-# apply, and feeding it back into the subnets would be circular). The VPC still
-# allocates via use_ipam_pool — one tracked allocation. preview == actual under
-# our serial, one-VPC-per-pool apply; a concurrent grab from the same pool would
-# make them diverge, which fails LOUD at apply (a subnet falls outside the VPC
-# CIDR), never silently. See ADR-0050 § Consequences.
-data "aws_vpc_ipam_preview_next_cidr" "vpc" {
+# ADR-0050 — IPAM-aware VPC addressing (explicit allocation). When the region
+# opts into IPAM (ipv4_ipam_pool_id set), RESERVE a CIDR from the pool with a
+# stateful aws_vpc_ipam_pool_cidr_allocation. The earlier preview-data-source
+# approach returned the pool's next-free CIDR, which DRIFTS once a VPC takes one
+# — so the subnet/SG/VPN derivations moved between the pre-deps and full apply,
+# and the subnets fell outside the VPC's actual CIDR (proven on the first cloud
+# deploy: "InvalidSubnet.Range"). An allocation's .cidr is fixed at first apply
+# and stable across the apply split + re-runs. The VPC consumes it as a plain
+# cidr_block. Trade-off (accepted): IPAM resource-discovery double-counts the
+# VPC's CIDR next to the manual allocation — cosmetic, bought for idempotency.
+resource "aws_vpc_ipam_pool_cidr_allocation" "vpc" {
   count          = var.ipv4_ipam_pool_id != null ? 1 : 0
   ipam_pool_id   = var.ipv4_ipam_pool_id
   netmask_length = var.ipv4_netmask_length
@@ -23,8 +24,9 @@ locals {
   use_ipam = var.ipv4_ipam_pool_id != null
 
   # The address space every per-region derivation reads: the static CIDR when
-  # set, else the IPAM-previewed CIDR (both known at plan time).
-  effective_cidr = local.use_ipam ? data.aws_vpc_ipam_preview_next_cidr.vpc[0].cidr : var.vpc_cidr
+  # set, else the IPAM-allocated CIDR (a stateful allocation — stable across the
+  # pre-deps/full apply split and re-runs; known after the first apply).
+  effective_cidr = local.use_ipam ? aws_vpc_ipam_pool_cidr_allocation.vpc[0].cidr : var.vpc_cidr
 
   # Three /24 private subnets derived from the region's /16 effective CIDR.
   # cidrsubnet(cidr, 8, 1|2|3) -> x.x.1.0/24, x.x.2.0/24, x.x.3.0/24 —
@@ -57,14 +59,12 @@ module "vpc" {
   version = "5.21.0" # exact pin (case-study reproducibility); was ~> 5.8
 
   name = "${var.name_prefix}-vpc"
-  cidr = local.use_ipam ? null : var.vpc_cidr
+  cidr = local.effective_cidr
 
-  # ADR-0050: allocate the VPC CIDR from IPAM when a pool is provided; otherwise
-  # use the static cidr above. The module sets aws_vpc.cidr_block = null and
-  # populates ipv4_ipam_pool_id + ipv4_netmask_length under use_ipam_pool.
-  use_ipam_pool       = local.use_ipam
-  ipv4_ipam_pool_id   = var.ipv4_ipam_pool_id
-  ipv4_netmask_length = local.use_ipam ? var.ipv4_netmask_length : null
+  # ADR-0050: cidr is the static var.vpc_cidr OR the IPAM-allocated CIDR
+  # (aws_vpc_ipam_pool_cidr_allocation above), passed as a plain cidr_block. We
+  # deliberately do NOT use the module's use_ipam_pool — its allocation is known
+  # only after apply, which drifted the subnet derivation across the apply split.
 
   # ADR-0007 reconsidered (04/28): 3 AZs. ECS spreads tasks across 3 fault
   # domains; AZ loss leaves 2/3 capacity. database_subnets removed (no RDS).

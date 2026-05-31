@@ -3,6 +3,11 @@
 ## Status
 Accepted (2026-05-31). Extends ADR-0011 (network topology) and ADR-0019 (private-only VPC); does not supersede them. Touches the `regions`-map schema introduced by ADR-0042 / ADR-0046.
 
+## Update (2026-05-31) — preview superseded by explicit allocation
+The **implementation below (Decision) is revised.** The first real IPAM cloud deploy proved the `aws_vpc_ipam_preview_next_cidr` **data-source** approach is **not idempotent**: a preview returns the pool's *next-free* CIDR, which shifts the moment a VPC takes one. Across our two-phase apply (pre-deps `-target` then full apply) the preview drifted between phases, so the derived subnets no longer fell inside the VPC's already-allocated CIDR and the apply failed with `InvalidSubnet.Range` (it also showed the VPC's `cidr_block` "forces replacement"). This breaks on any apply after the first allocation, not only a concurrent grab.
+
+The fix **reverses the "Explicit `aws_vpc_ipam_pool_cidr_allocation`" rejection** in *Alternatives* below: the VPC CIDR is now a stateful `aws_vpc_ipam_pool_cidr_allocation` **resource** whose `.cidr` is fixed at first apply and stable across the apply split + re-runs; the VPC consumes it as a plain `cidr_block` (no `use_ipam_pool`). The accepted caveat changes from the "preview predict-vs-actual race" (Consequences) to the "double-counted CIDR in IPAM resource-discovery" (cosmetic) — idempotency was worth that ledger noise. Static-CIDR path unchanged.
+
 ## Context
 
 Each region's VPC CIDR is a hand-written string in the `regions` map (`terraform.tfvars`): `eu-central-1 = 10.0.0.0/16`, `eu-west-1 = 10.10.0.0/16`. Non-overlap across regions — required so the VPCs can later be peered via Transit Gateway without collision — is an operator promise enforced only by a comment. At N=2 that is fine; as regions are added (ADR-0046's enable-catalog) it becomes a manual bookkeeping surface where an overlap is a silent setup error until two ranges actually need to route to each other.
