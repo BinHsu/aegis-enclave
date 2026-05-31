@@ -23,11 +23,12 @@ name: Cloud Apply (governed-org deploy)
 # After apply, the operator runs VPN + smoke + evidence locally.
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'terraform/**'
-      - '.github/workflows/cloud-apply.yml'
+  # Deliberate manual deploy ONLY. The enclave stack carries real hourly cost
+  # (ECS Fargate / Client VPN / ElastiCache Serverless), so it is NOT
+  # auto-applied on every push — unlike the always-cheap landing-zone fabric
+  # that the sibling aegis-platform-aws push-applies. This refines ADR-0051's
+  # "apply on push to main" for the case-study apply-then-destroy cost posture;
+  # switch to a `push:` trigger if you want GitOps auto-apply in a sustained fork.
   workflow_dispatch:
 
 permissions:
@@ -71,6 +72,26 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
+
+      # Generate the S3 remote-state backend at init time (gitignored), so
+      # main.tf stays backend-less and a forker's local `make cloud-up`
+      # (-backend=false) is unaffected. State bucket from the AWS_TF_STATE_BUCKET
+      # repo variable; lock table is the fixed aegis-enclave-tflock (ADR-0025/0051).
+      - name: Configure remote state backend
+        working-directory: terraform
+        run: |
+          test -n "${{ vars.AWS_TF_STATE_BUCKET }}" || { echo "::error::repo variable AWS_TF_STATE_BUCKET is not set"; exit 1; }
+          cat > backend.tf <<'EOF'
+          terraform {
+            backend "s3" {
+              bucket         = "${{ vars.AWS_TF_STATE_BUCKET }}"
+              key            = "main/terraform.tfstate"
+              region         = "${{ vars.AWS_REGION || 'eu-central-1' }}"
+              dynamodb_table = "aegis-enclave-tflock"
+              encrypt        = true
+            }
+          }
+          EOF
 
       - name: Terraform init
         working-directory: terraform

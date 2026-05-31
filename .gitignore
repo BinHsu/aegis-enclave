@@ -76,6 +76,10 @@ terraform/**/*.tfvars
 !terraform/**/*.tfvars.example
 terraform/crash.log
 terraform/**/crash.log
+# CI-generated S3 backend config (governed-CI deploy, ADR-0051). Written by
+# cloud-apply.yml / cloud-destroy.yml at init time so main.tf stays backend-less
+# (forker default = local state). Never committed — keeps the template generic.
+terraform/backend.tf
 
 # Cloud screenshots (may contain account IDs, IPs, ARNs)
 screenshots/

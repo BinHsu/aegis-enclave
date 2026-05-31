@@ -49,11 +49,13 @@ terraform {
     }
   }
 
-  # ─── Remote state backend (commented out; see ADR-0025) ──────────────
-  # Uncomment and fill in `bucket` + `dynamodb_table` from the outputs of
-  # `terraform/bootstrap/` after running it once. The case-study deliverable
-  # runs `terraform plan -backend=false`, so this stays commented out by
-  # default; forkers adopting the deployment for production should enable it.
+  # ─── Remote state backend (intentionally NOT defined here; see ADR-0025) ──
+  # This block stays COMMENTED so the default + forker path is backend-less
+  # local state (`make cloud-up` / `make tf-init` run -backend=false). The
+  # governed-CI deploy (ADR-0051) instead writes a gitignored `backend.tf` at
+  # init time from the AWS_TF_STATE_BUCKET repo variable — see
+  # `.github/workflows/cloud-apply.yml`. So main.tf is never edited to switch
+  # state modes; the path is chosen by who runs init. Reference shape:
   #
   # backend "s3" {
   #   bucket         = "aegis-enclave-tfstate-xxxxxxxx"   # bootstrap output

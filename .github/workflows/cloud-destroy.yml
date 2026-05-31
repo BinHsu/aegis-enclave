@@ -59,6 +59,23 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
+      # Same S3 backend as cloud-apply (destroy must read the SAME state).
+      - name: Configure remote state backend
+        working-directory: terraform
+        run: |
+          test -n "${{ vars.AWS_TF_STATE_BUCKET }}" || { echo "::error::repo variable AWS_TF_STATE_BUCKET is not set"; exit 1; }
+          cat > backend.tf <<'EOF'
+          terraform {
+            backend "s3" {
+              bucket         = "${{ vars.AWS_TF_STATE_BUCKET }}"
+              key            = "main/terraform.tfstate"
+              region         = "${{ vars.AWS_REGION || 'eu-central-1' }}"
+              dynamodb_table = "aegis-enclave-tflock"
+              encrypt        = true
+            }
+          }
+          EOF
+
       - name: Terraform init
         working-directory: terraform
         run: terraform init -input=false
