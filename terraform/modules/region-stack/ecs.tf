@@ -71,6 +71,16 @@ module "ecs" {
       # ADR-0007 reconsidered (04/28): app starts at one task per AZ.
       desired_count = var.app_desired_count
 
+      # ADR-0051: name the module-created task + exec IAM roles (and the exec
+      # managed policy) with the aegis-enclave-* prefix so the gh-tf-apply-enclave
+      # deploy role's scoped iam:CreateRole/CreatePolicy (on .../aegis-enclave-*)
+      # covers them. use_name_prefix keeps the random suffix -> unique across the
+      # platform + peer regions in one account.
+      tasks_iam_role_name                = "${var.name_prefix}-app-tasks"
+      tasks_iam_role_use_name_prefix     = true
+      task_exec_iam_role_name            = "${var.name_prefix}-app-exec"
+      task_exec_iam_role_use_name_prefix = true
+
       container_definitions = {
         app = {
           image = "${module.ecr.repository_url}:${var.image_tag}"

@@ -163,4 +163,11 @@ resource "aws_ec2_client_vpn_authorization_rule" "vpc_access" {
   target_network_cidr    = local.effective_cidr
   authorize_all_groups   = true
   description            = "Authorize VPN clients to reach VPC services"
+
+  # The rule sits in 'authorizing' until the endpoint's network associations
+  # settle; the provider's 10m default timed out on the first cloud deploy.
+  timeouts {
+    create = "20m"
+    delete = "20m"
+  }
 }

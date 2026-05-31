@@ -159,6 +159,24 @@ data "aws_iam_policy_document" "gha_apply_iam" {
     resources = ["arn:aws:iam::*:instance-profile/aegis-enclave-*"]
   }
 
+  # Customer-managed policies the community modules create for the enclave (e.g.
+  # the ECS service's task-exec managed policy). Scoped to aegis-enclave-* — the
+  # module role/policy names are prefixed there (ecs.tf, ADR-0051). iam:GetPolicy
+  # / GetPolicyVersion / ListPolicyVersions are already covered read-only above.
+  statement {
+    sid    = "EnclaveManagedPolicies"
+    effect = "Allow"
+    actions = [
+      "iam:CreatePolicy",
+      "iam:DeletePolicy",
+      "iam:CreatePolicyVersion",
+      "iam:DeletePolicyVersion",
+      "iam:TagPolicy",
+      "iam:UntagPolicy",
+    ]
+    resources = ["arn:aws:iam::*:policy/aegis-enclave-*"]
+  }
+
   # Service-linked roles for the workload's services, constrained by the AWS
   # service name (these trust policies are AWS-controlled, not an escalation
   # path). No-op when the SLRs already exist in the account.
