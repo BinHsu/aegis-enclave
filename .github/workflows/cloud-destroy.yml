@@ -27,7 +27,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TF_VERSION: "1.5.0"
+  # 1.14.8 — see cloud-apply.yml (regions-map cross-variable validation needs >= 1.9).
+  TF_VERSION: "1.14.8"
 
 jobs:
   destroy:
