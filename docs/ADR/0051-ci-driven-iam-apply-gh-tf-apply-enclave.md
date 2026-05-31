@@ -1,7 +1,7 @@
 # ADR-0051: CI-driven IAM-creating apply/destroy via `gh-tf-apply-enclave` (governed-org path)
 
 ## Status
-**Proposed** (2026-05-31). Supersedes — **for the governed-org deploy path only** — the operator-only-deploy stance of ADR-0015 and the "no CI/CD deploy" calibration of CLAUDE.md § 4. The forker / local path is unchanged. Awaiting sign-off before any workflow YAML or bootstrap role is scaffolded.
+**Accepted** (2026-05-31). Supersedes — **for the governed-org deploy path only** — the operator-only-deploy stance of ADR-0015 and the "no CI/CD deploy" calibration of CLAUDE.md § 4. The forker / local path is unchanged.
 
 ## Context
 

@@ -76,6 +76,8 @@ The deliverable demonstrates **production-quality engineering at a PoC feature s
 
 **Do not silently upgrade to "production grade" in operations layers.** If the user explicitly asks, write a new ADR superseding the calibration.
 
+> **Carve-out (ADR-0051):** the "CI/CD pipelines" out-of-scope entry is superseded **for the governed-org deploy path only**. When the enclave deploys into the aegis org, the org SCP blocks human IAM create/teardown, so a `gh-tf-apply-enclave` OIDC role + `cloud-apply` / `cloud-destroy` workflows do the IAM-touching apply/destroy. The default + forker path stays operator-driven `make cloud-up` / `make cloud-down` (no CI). This is the superseding-ADR mechanism above, not a silent upgrade.
+
 ---
 
 ## 5. Company-specific content rule

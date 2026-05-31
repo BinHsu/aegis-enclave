@@ -238,6 +238,30 @@ Notes on the plan-only posture (see [`terraform/README.md`](../terraform/README.
 - **`server_cert_arn` and `client_cert_arn` are placeholder values** in the example tfvars. They satisfy the type constraint so `terraform plan` succeeds; a real `terraform apply` would require ACM-provisioned certificates, which is treated as an out-of-band prerequisite. The candidate is testing infrastructure composition, not certificate authority operations.
 - **`make tf-init` runs `terraform init -backend=false`** — no remote state for the case-study cycle.
 
+## Deploy paths — local (forker) vs governed-org CI (ADR-0051)
+
+There are two ways to apply this composition, and they differ by whether an AWS Organizations SCP governs the target account.
+
+**Forker / ungoverned account — local, end-to-end (the default).** Run `make cloud-up` and `make cloud-down`. The operator's identity creates and destroys everything, including the enclave's IAM roles. No CI, no OIDC role, no IPAM assumption. This is the path the rest of this guide assumes.
+
+**Governed aegis org — CI does the IAM-touching apply/destroy.** In the aegis org, the SCP `deny-iam-privilege-escalation` denies IAM create **and** teardown (`DetachRolePolicy` / `DeleteRolePolicy` included) to every principal except a `gh-tf-*` allow-list. A human `make cloud-up` / `make cloud-down` therefore cannot create or remove the enclave's IAM. The governed path moves the IAM-touching steps to CI:
+
+| Step | Who | How |
+|---|---|---|
+| VPN cert PKI -> ACM | operator (local) | private keys never touch CI |
+| Build + push image -> ECR | operator (local) | `image_tag` pinned |
+| `terraform apply` (creates IAM) | **CI** | `.github/workflows/cloud-apply.yml` assumes the `gh-tf-apply-enclave` OIDC role on push to main |
+| `terraform destroy` (removes IAM) | **CI** | `.github/workflows/cloud-destroy.yml`, `workflow_dispatch` + typed `destroy` confirmation |
+| VPN + smoke + evidence | operator (local) | `make cloud-smoke` / `cross-region-check` / `cloud-evidence` |
+
+Bring-up for the governed path:
+
+1. Apply `terraform/bootstrap` and **enable the S3 backend** in `terraform/main.tf` (ADR-0025) — CI apply needs durable remote state.
+2. Seed `gh-tf-apply-enclave` once via the `aegis-emergency-break-glass` role (its first `iam:CreateRole` is itself SCP-gated for a human — chicken-and-egg). The role is named in the `gh-tf-*` family so the existing org SCP glob covers its IAM mutations; **no landing-zone SCP change is needed.**
+3. Publish the bootstrap output `gha_terraform_apply_role_arn` as the repo **variable** `AWS_TF_APPLY_ROLE_ARN`, and the deploy tfvars (cert ARNs, `image_tag`, IPAM pool ids per ADR-0050, route53 zone, alarm email) as the **secret** `AWS_DEPLOY_TFVARS`. Until `AWS_TF_APPLY_ROLE_ARN` is set, both workflows skip — so a fork sees no behaviour change.
+
+The role's permission policy is `PowerUserAccess` (all resource CRUD, **no** `iam:*`) plus a tightly-scoped IAM-write statement on `aegis-enclave-*` only. The scoping is load-bearing: the SCP carve-out for `gh-tf-*` removes the SCP as a backstop for this role, so its own policy is the guardrail against escalation (see [`docs/iam-permissions.md`](iam-permissions.md) and ADR-0051).
+
 ## Cost shape
 
 ### Hourly rate — per region (eu-central-1 list price, April 2026 — 3-AZ posture per ADR-0007)

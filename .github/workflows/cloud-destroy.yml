@@ -1,0 +1,68 @@
+name: Cloud Destroy (governed-org teardown)
+
+# ADR-0051 — teardown is gated by the SAME SCP as apply: iam:DetachRolePolicy /
+# DeleteRolePolicy are denied for non-gh-tf principals, so the human `make
+# cloud-down` cannot fully tear down the enclave's IAM in the governed org. This
+# workflow runs `terraform destroy` as gh-tf-apply-enclave.
+#
+# Manual dispatch ONLY — destroying real infrastructure is a deliberate act, not
+# a side effect of a push. Requires typing "destroy" to confirm. A forker runs
+# the end-to-end local `make cloud-down` instead.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to confirm tearing down the cloud stack'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+# Share the apply lock group — never destroy while an apply is in flight.
+concurrency:
+  group: cloud-apply
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.5.0"
+
+jobs:
+  destroy:
+    name: Terraform destroy (gh-tf-apply-enclave)
+    runs-on: ubuntu-latest
+    # Gate on the role var (skip on forks) AND the typed confirmation.
+    if: ${{ vars.AWS_TF_APPLY_ROLE_ARN != '' && inputs.confirm == 'destroy' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble deploy tfvars from secret
+        working-directory: terraform
+        run: |
+          umask 077
+          cat > deploy.auto.tfvars <<'EOFVARS'
+          ${{ secrets.AWS_DEPLOY_TFVARS }}
+          EOFVARS
+          test -s deploy.auto.tfvars || { echo "::error::AWS_DEPLOY_TFVARS secret is empty or unset"; exit 1; }
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_TF_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'eu-central-1' }}
+          role-session-name: aegis-enclave-destroy-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: terraform
+        run: terraform init -input=false
+
+      - name: Terraform destroy
+        working-directory: terraform
+        run: terraform destroy -auto-approve -input=false -no-color -lock-timeout=5m

@@ -56,6 +56,10 @@ resource "random_id" "tfstate_suffix" {
   byte_length = 4
 }
 
+# tfsec PoC-scope (ADR-0003 calibration): the state bucket uses SSE-S3 (below)
+# and full public-access-block; access logging + a customer-managed KMS key are
+# production-hardening upgrades, not PoC scope.
+#tfsec:ignore:aws-s3-enable-bucket-logging
 resource "aws_s3_bucket" "tfstate" {
   bucket = "aegis-enclave-tfstate-${random_id.tfstate_suffix.hex}"
 }
@@ -68,6 +72,7 @@ resource "aws_s3_bucket_versioning" "tfstate" {
   }
 }
 
+#tfsec:ignore:aws-s3-encryption-customer-key
 resource "aws_s3_bucket_server_side_encryption_configuration" "tfstate" {
   bucket = aws_s3_bucket.tfstate.id
 
@@ -87,6 +92,11 @@ resource "aws_s3_bucket_public_access_block" "tfstate" {
 }
 
 # ─── DynamoDB lock table ───────────────────────────────────────────────────
+# DynamoDB encrypts every table at rest by default (AWS-owned key) — the lock
+# table holds only lock IDs, so an explicit SSE block + customer-managed KMS key
+# is a production-hardening upgrade, not PoC scope (ADR-0003).
+#tfsec:ignore:aws-dynamodb-enable-at-rest-encryption
+#tfsec:ignore:aws-dynamodb-table-customer-key
 resource "aws_dynamodb_table" "tflock" {
   name         = "aegis-enclave-tflock"
   billing_mode = "PAY_PER_REQUEST"
@@ -166,6 +176,10 @@ resource "aws_iam_role_policy_attachment" "gha_readonly" {
 # Plan acquires the state lock (DynamoDB) and may write a refreshed state
 # back to S3 on drift. Both writes are tightly scoped to the state bucket
 # + lock table only — outside those, the role is strictly read-only.
+# tfsec:ignore -- the "/*" is object-level scope WITHIN the single named state
+# bucket (not a cross-resource wildcard); s3:GetObject/PutObject on a bucket's
+# own objects is exactly what terraform state read/write requires.
+#tfsec:ignore:aws-iam-no-policy-wildcards
 data "aws_iam_policy_document" "gha_state_access" {
   statement {
     sid    = "StateBucketReadWrite"

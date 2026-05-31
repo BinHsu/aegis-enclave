@@ -25,7 +25,13 @@ variable "github_org" {
 }
 
 variable "github_repo" {
-  description = "GitHub repository name (for OIDC trust scope)"
+  description = "GitHub repository name (for OIDC trust scope of the read-only plan role)"
   type        = string
   default     = "aegis-enclave"
+}
+
+variable "github_repo_id" {
+  description = "Immutable GitHub repository ID (numeric, as a string) for the APPLY role's rename-proof OIDC trust (ADR-0051). Find it with: gh api repos/<org>/<repo> --jq .id"
+  type        = string
+  default     = "1220640710" # BinHsu/aegis-enclave
 }

@@ -1,0 +1,81 @@
+name: Cloud Apply (governed-org deploy)
+
+# ADR-0051 — governed-org deploy path. In the aegis org the SCP denies IAM
+# create/teardown to every principal except gh-tf-*, so the human `make
+# cloud-up` cannot create the enclave's IAM. This workflow runs the
+# IAM-creating `terraform apply` as the gh-tf-apply-enclave OIDC role (which the
+# SCP glob permits). A forker in an ungoverned account ignores this workflow and
+# runs the end-to-end local `make cloud-up` instead.
+#
+# GATED on the AWS_TF_APPLY_ROLE_ARN repo VARIABLE. Unset (fork / pre-bootstrap)
+# => the job skips. Set it from `terraform/bootstrap` output
+# gha_terraform_apply_role_arn once the role is seeded (one break-glass).
+#
+# OPERATOR PREREQUISITES (the human-in-the-loop split, ADR-0051 — CI does the
+# IAM-creating apply, the operator does the human/secret-bearing steps):
+#   1. terraform/bootstrap applied + the S3 backend in terraform/main.tf enabled
+#      (ADR-0025) — CI apply needs durable remote state, not local state.
+#   2. VPN cert PKI generated + imported into ACM (private keys never touch CI).
+#   3. Container image built + pushed to ECR (image_tag pinned).
+#   4. The deploy tfvars (cert ARNs, image_tag, IPAM pool ids per ADR-0050,
+#      route53 zone, alarm email) supplied via the AWS_DEPLOY_TFVARS secret —
+#      never committed (CLAUDE.md section 5).
+# After apply, the operator runs VPN + smoke + evidence locally.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/cloud-apply.yml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+# Never let two applies (or an apply + a destroy) race the S3 state lock.
+concurrency:
+  group: cloud-apply
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.5.0"
+
+jobs:
+  apply:
+    name: Terraform apply (gh-tf-apply-enclave)
+    runs-on: ubuntu-latest
+    # Skip for forks / pre-bootstrap: the governed-org role isn't provisioned.
+    if: ${{ vars.AWS_TF_APPLY_ROLE_ARN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble deploy tfvars from secret
+        working-directory: terraform
+        run: |
+          umask 077
+          cat > deploy.auto.tfvars <<'EOFVARS'
+          ${{ secrets.AWS_DEPLOY_TFVARS }}
+          EOFVARS
+          test -s deploy.auto.tfvars || { echo "::error::AWS_DEPLOY_TFVARS secret is empty or unset"; exit 1; }
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_TF_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'eu-central-1' }}
+          role-session-name: aegis-enclave-apply-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: terraform
+        run: terraform init -input=false
+
+      - name: Terraform apply
+        working-directory: terraform
+        run: terraform apply -auto-approve -input=false -no-color -lock-timeout=5m
