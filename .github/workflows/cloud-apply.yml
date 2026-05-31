@@ -97,6 +97,59 @@ jobs:
         working-directory: terraform
         run: terraform init -input=false
 
-      - name: Terraform apply
-        working-directory: terraform
-        run: terraform apply -auto-approve -input=false -no-color -lock-timeout=5m
+      # Replicates cloud-up.sh phases 5+6 in CI (the operator does phase 4 cert
+      # PKI locally; this runs as gh-tf-apply-enclave). A pre-deps -target apply
+      # breaks the ECR<->image chicken-and-egg, then build+push the image (tag =
+      # the deployed commit's short SHA), then the full apply.
+      - name: Pre-deps apply + image build/push + full apply
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION || 'eu-central-1' }}
+        run: |
+          set -euo pipefail
+          TF="terraform -chdir=terraform"
+          REGION="$AWS_REGION"
+
+          # Peer region from the regions map (ADR-0042); empty if single-region.
+          SECONDARY_REGION=$( ( grep -oE '"[a-z]{2}-[a-z]+-[0-9]+"[[:space:]]*=[[:space:]]*\{' terraform/deploy.auto.tfvars 2>/dev/null || true ) | ( grep -oE '[a-z]{2}-[a-z]+-[0-9]+' || true ) | ( grep -vx "$REGION" || true ) | head -1 )
+          echo "platform=$REGION peer=${SECONDARY_REGION:-<none>}"
+
+          # Phase 5a: pre-deps (VPC + ECR + DynamoDB) so docker push + the ECS
+          # task defs in the full apply have something to reference.
+          PRE=(-target=module.region_platform.module.vpc -target=module.region_platform.module.ecr -target=aws_dynamodb_table.executions)
+          [ -n "$SECONDARY_REGION" ] && PRE+=(-target='module.region_peer[0].module.vpc' -target='module.region_peer[0].module.ecr')
+          $TF apply "${PRE[@]}" -auto-approve -input=false -no-color -lock-timeout=5m
+
+          ECR_URL=$($TF output -raw ecr_repository_url)
+          ECR_REPO=$(printf '%s' "$ECR_URL" | sed -E 's|.*/([^/]+)$|\1|')
+          IMAGE_TAG=$(git rev-parse --short=8 HEAD)
+          printf 'image_tag = "%s"\n' "$IMAGE_TAG" > terraform/image-tag.auto.tfvars
+          echo "ECR=$ECR_URL repo=$ECR_REPO tag=$IMAGE_TAG"
+
+          # Phase 5b: build + push to primary ECR (skip if the tag already
+          # exists = identical content, avoids the ECR IMMUTABLE conflict).
+          aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$ECR_URL" >/dev/null
+          if aws ecr describe-images --region "$REGION" --repository-name "$ECR_REPO" --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "primary ECR already has $IMAGE_TAG - skip build/push"
+          else
+            docker build --platform linux/amd64 --provenance=false --sbom=false -t "$ECR_URL:$IMAGE_TAG" .
+            docker push "$ECR_URL:$IMAGE_TAG"
+          fi
+
+          # Phase 5c: replicate the image to the peer ECR (peer ECS pulls it).
+          if [ -n "$SECONDARY_REGION" ]; then
+            SEC_ECR=$($TF output -raw secondary_ecr_repository_url 2>/dev/null || echo "")
+            if [ -n "$SEC_ECR" ]; then
+              SEC_REPO=$(printf '%s' "$SEC_ECR" | sed -E 's|.*/([^/]+)$|\1|')
+              if aws ecr describe-images --region "$SECONDARY_REGION" --repository-name "$SEC_REPO" --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+                echo "peer ECR already has $IMAGE_TAG - skip"
+              else
+                aws ecr get-login-password --region "$SECONDARY_REGION" | docker login --username AWS --password-stdin "$SEC_ECR" >/dev/null
+                docker tag "$ECR_URL:$IMAGE_TAG" "$SEC_ECR:$IMAGE_TAG"
+                docker push "$SEC_ECR:$IMAGE_TAG"
+              fi
+            fi
+          fi
+
+          # Phase 6: full apply (the remaining ~70 resources: Client VPN, ALB,
+          # ECS services, Valkey, SQS, IAM, autoscaling, VPC endpoints).
+          $TF apply -auto-approve -input=false -no-color -lock-timeout=5m
