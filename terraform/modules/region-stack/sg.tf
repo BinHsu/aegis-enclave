@@ -11,8 +11,8 @@ module "alb_sg" {
   description = "Internal ALB - reachable only from VPC (Client VPN clients arrive via VPC routes)"
   vpc_id      = module.vpc.vpc_id
 
-  ingress_cidr_blocks = [var.vpc_cidr]
-  ingress_rules       = ["https-443-tcp"] # ADR-0027 — HTTPS-only listener.
+  ingress_cidr_blocks = [local.effective_cidr] # ADR-0050: IPAM-aware (var.vpc_cidr is null in IPAM mode)
+  ingress_rules       = ["https-443-tcp"]      # ADR-0027 — HTTPS-only listener.
   egress_rules        = ["all-all"]
 }
 
