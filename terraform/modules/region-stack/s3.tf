@@ -28,6 +28,13 @@
 resource "aws_s3_bucket" "results" {
   bucket = "${var.result_bucket_prefix}-${var.region}"
 
+  # Apply-then-destroy case-study posture: results are ephemeral, and the bucket
+  # is VERSIONED (below), so terraform destroy fails on a non-empty bucket
+  # ("BucketNotEmpty: delete all versions") without this. force_destroy empties
+  # all object versions first. A production fork keeping results long-term should
+  # set this false (ADR-0003 calibration).
+  force_destroy = true
+
   tags = {
     Name      = "${var.name_prefix}-results"
     Component = "result-store"
