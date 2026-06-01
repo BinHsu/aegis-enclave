@@ -10,10 +10,9 @@ output "tflock_table" {
   value       = aws_dynamodb_table.tflock.name
 }
 
-output "gha_terraform_plan_role_arn" {
-  description = "Set this as a GitHub repository VARIABLE named AWS_TF_PLAN_ROLE_ARN so the .github/workflows/terraform-plan.yml job can assume it"
-  value       = aws_iam_role.gha_terraform_plan.arn
-}
+# NOTE: gha_terraform_plan_role_arn output removed in ADR-0052 — the read-only
+# PR-plan role is de-instantiated in the governed-staging reconcile (see main.tf).
+# Re-add it alongside the role if/when AWS_TF_PLAN_ROLE_ARN is wired.
 
 output "gha_terraform_apply_role_arn" {
   description = "Set this as a GitHub repository VARIABLE named AWS_TF_APPLY_ROLE_ARN so .github/workflows/cloud-apply.yml + cloud-destroy.yml can assume it (ADR-0051). gh-tf-apply-enclave is the SCP-carved-out apply identity for the governed-org path."
@@ -21,6 +20,6 @@ output "gha_terraform_apply_role_arn" {
 }
 
 output "github_oidc_provider_arn" {
-  description = "GitHub Actions OIDC provider ARN (informational; reused by any other role you add later)"
-  value       = aws_iam_openid_connect_provider.github.arn
+  description = "GitHub Actions OIDC provider ARN (informational; SHARED landing-zone-owned singleton, looked up via data source — ADR-0052)"
+  value       = data.aws_iam_openid_connect_provider.github.arn
 }

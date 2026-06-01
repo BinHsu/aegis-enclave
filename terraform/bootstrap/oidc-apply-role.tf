@@ -8,8 +8,12 @@
 # is named in the `gh-tf-*` family, which the SCP glob already permits — so the
 # landing-zone needs NO SCP change to let this role apply/destroy IAM.
 #
-# This is the APPLY sibling of the read-only plan role in main.tf (ADR-0026);
-# both federate the same aws_iam_openid_connect_provider.github.
+# It federates the shared, landing-zone-owned OIDC provider, which the bootstrap
+# references via data.aws_iam_openid_connect_provider.github (ADR-0052 — the
+# enclave does not manage the per-account singleton). It is the APPLY counterpart
+# to the read-only PR-plan role that ADR-0026 designed; that plan role is
+# de-instantiated in the governed-staging reconcile (ADR-0052) and lives in
+# main.tf's git history, not in this composition.
 #
 # Forker note: a forker in an ungoverned account never assumes this role — they
 # run the end-to-end local `make cloud-up` / `make cloud-down`. The role + the
@@ -30,7 +34,7 @@ data "aws_iam_policy_document" "gha_apply_trust" {
 
     principals {
       type        = "Federated"
-      identifiers = [aws_iam_openid_connect_provider.github.arn]
+      identifiers = [data.aws_iam_openid_connect_provider.github.arn]
     }
 
     condition {

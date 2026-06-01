@@ -1,7 +1,7 @@
 # ADR-0025: Terraform state backend — S3 + DynamoDB lock, separately bootstrapped
 
 ## Status
-Accepted (2026-04-25)
+Accepted (2026-04-25). State-bucket **naming** superseded by [ADR-0052](0052-reconcile-bootstrap-to-live-governed-staging.md) (deterministic `aegis-enclave-tfstate-<env>-<account_id>` replaces the `random_id` suffix); the S3 + DynamoDB-lock backend decision itself stands.
 
 ## Context
 Phase 1 of the deliverable runs `terraform plan -backend=false` only (per ADR-0015) — no state is ever written. The Phase-2 ambition (apply from the operator's AWS account, reach the service through Client VPN) requires a real state backend, and the choice cannot be deferred without re-doing the topology later.

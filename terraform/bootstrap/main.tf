@@ -1,25 +1,26 @@
 # terraform/bootstrap/main.tf — One-time provisioning of the deployment prerequisites.
 #
-# What lives here:
-#   1. S3 bucket  + DynamoDB lock table  → state backend for `terraform/main.tf`
-#                                          (ADR-0025)
-#   2. GitHub Actions OIDC provider + read-only IAM role
-#                                        → `terraform plan` on PR (ADR-0026)
+# What lives here (reconciled to the live governed-staging account by ADR-0052):
+#   1. S3 bucket + DynamoDB lock table → state backend for `terraform/main.tf`
+#                                        (ADR-0025; deterministic bucket name)
+#   2. GitHub Actions OIDC provider    → federation root (ADR-0026)
+#   3. gh-tf-apply-enclave APPLY role  → governed-org deploy identity, in the
+#                                        SCP `gh-tf-*` carve-out (oidc-apply-role.tf, ADR-0051)
+# The read-only PR-plan role (ADR-0026) is intentionally NOT here — de-instantiated
+# in the ADR-0052 reconcile (see the note where it used to live, below).
 #
-# How to use (one-time, run from this directory):
-#   terraform init              # uses LOCAL backend — bootstrap holds its own state
-#   terraform apply
-#   terraform output            # capture bucket name + lock table + role ARN
+# State: this composition uses a LOCAL backend by design (chicken-and-egg — the
+# main composition's backend cannot reference the bucket holding its own state;
+# ADR-0025 § "Why a separate bootstrap module"). The local terraform.tfstate is
+# gitignored and lives on the operator's machine.
 #
-# Then:
-#   - Paste `tfstate_bucket` + `tflock_table` into `terraform/main.tf`'s
-#     `backend "s3"` block (currently committed-out — uncomment after bootstrap).
-#   - Set the `gha_terraform_plan_role_arn` GitHub repository VARIABLE so the
-#     `.github/workflows/terraform-plan.yml` workflow can assume it on PR.
+# How it was reconciled (one-time, ADR-0052): the live resources were
+# break-glass-seeded, then `terraform import`-ed into this composition's state so
+# `plan` is a no-op. To re-derive on a fresh machine, re-run the imports listed
+# in ADR-0052, or break-glass `terraform apply` into a clean account.
 #
-# This module is intentionally separate from the main composition. The main
-# composition's state backend cannot reference the bucket holding its own
-# state — chicken-and-egg. See ADR-0025 § "Why a separate bootstrap module".
+# Outputs feed: `tfstate_bucket` + `tflock_table` → the CI-generated backend.tf;
+# `gha_terraform_apply_role_arn` → the AWS_TF_APPLY_ROLE_ARN repo variable.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -28,10 +29,6 @@ terraform {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.50"
-    }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.6"
     }
   }
 }
@@ -52,16 +49,19 @@ provider "aws" {
 }
 
 # ─── S3 state bucket ───────────────────────────────────────────────────────
-resource "random_id" "tfstate_suffix" {
-  byte_length = 4
-}
+# Deterministic name: "aegis-enclave-tfstate-<env>-<account_id>" (ADR-0052,
+# reconciling ADR-0025's original random_id naming to the break-glass-seeded
+# live bucket). Deterministic beats random_id here: the name is reproducible
+# from (env, account) alone, so a re-bootstrap or a forker lands the same
+# bucket without first reading a prior terraform output.
+data "aws_caller_identity" "current" {}
 
 # tfsec PoC-scope (ADR-0003 calibration): the state bucket uses SSE-S3 (below)
 # and full public-access-block; access logging + a customer-managed KMS key are
 # production-hardening upgrades, not PoC scope.
 #tfsec:ignore:aws-s3-enable-bucket-logging
 resource "aws_s3_bucket" "tfstate" {
-  bucket = "aegis-enclave-tfstate-${random_id.tfstate_suffix.hex}"
+  bucket = "aegis-enclave-tfstate-${var.environment}-${data.aws_caller_identity.current.account_id}"
 }
 
 resource "aws_s3_bucket_versioning" "tfstate" {
@@ -112,108 +112,35 @@ resource "aws_dynamodb_table" "tflock" {
   }
 }
 
-# ─── GitHub Actions OIDC provider ──────────────────────────────────────────
-# Allows GitHub Actions workflows to assume an AWS role via short-lived
-# tokens, no long-lived access keys. See ADR-0026.
+# ─── GitHub Actions OIDC provider (SHARED — referenced, NOT managed) ────────
+# token.actions.githubusercontent.com is a per-ACCOUNT singleton, created and
+# owned by the aegis landing-zone (live tags: Project=landing-zone-lab), and
+# shared by every repo's CI roles — the enclave apply role, the platform apply
+# role, and any future federated role all trust this one provider.
 #
-# The thumbprint below is GitHub's intermediate CA (DigiCert). AWS used to
-# require this; recent AWS docs say the thumbprint is informational only —
-# AWS validates the token against the OIDC provider's JWKS endpoint. We
-# include a known-good value for backwards-compat and to avoid drift on
-# `terraform plan`.
-resource "aws_iam_openid_connect_provider" "github" {
-  url             = "https://token.actions.githubusercontent.com"
-  client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
+# The enclave bootstrap must NOT manage it. Managing it here would (a) re-tag
+# shared infra as enclave-owned, and (b) let an enclave `terraform destroy`
+# DELETE the provider out from under every other repo's CI. So it is a
+# data-source lookup, owned and lifecycle-managed by the landing-zone.
+# (ADR-0052 reconcile — supersedes the ADR-0026 resource block that wrongly
+# assumed enclave ownership; the live provider predates this composition.)
+data "aws_iam_openid_connect_provider" "github" {
+  url = "https://token.actions.githubusercontent.com"
 }
 
-# ─── IAM role: GitHub Actions PR plan (read-only) ──────────────────────────
-data "aws_iam_policy_document" "gha_trust" {
-  statement {
-    effect  = "Allow"
-    actions = ["sts:AssumeRoleWithWebIdentity"]
-
-    principals {
-      type        = "Federated"
-      identifiers = [aws_iam_openid_connect_provider.github.arn]
-    }
-
-    # Restrict to this repo only — without this, ANY GitHub repo could
-    # assume the role. The `sub` claim binds the trust to a specific
-    # repository, optionally to specific branches / events.
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:aud"
-      values   = ["sts.amazonaws.com"]
-    }
-
-    condition {
-      test     = "StringLike"
-      variable = "token.actions.githubusercontent.com:sub"
-      # Allow PR events (read-only plan) and main-branch pushes (also read-only
-      # since this role doesn't grant apply). Tighten further if needed.
-      values = [
-        "repo:${var.github_org}/${var.github_repo}:pull_request",
-        "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main",
-      ]
-    }
-  }
-}
-
-resource "aws_iam_role" "gha_terraform_plan" {
-  name               = "aegis-enclave-gha-terraform-plan"
-  assume_role_policy = data.aws_iam_policy_document.gha_trust.json
-  description        = "GitHub Actions OIDC — read-only terraform plan on PR (ADR-0026)"
-}
-
-# ReadOnlyAccess covers the Describe/Get/List actions every Terraform plan
-# needs to refresh state (across EC2, ECS, DynamoDB, ALB, ECR, IAM, etc.).
-resource "aws_iam_role_policy_attachment" "gha_readonly" {
-  role       = aws_iam_role.gha_terraform_plan.name
-  policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
-}
-
-# Plan acquires the state lock (DynamoDB) and may write a refreshed state
-# back to S3 on drift. Both writes are tightly scoped to the state bucket
-# + lock table only — outside those, the role is strictly read-only.
-# tfsec:ignore -- the "/*" is object-level scope WITHIN the single named state
-# bucket (not a cross-resource wildcard); s3:GetObject/PutObject on a bucket's
-# own objects is exactly what terraform state read/write requires.
-#tfsec:ignore:aws-iam-no-policy-wildcards
-data "aws_iam_policy_document" "gha_state_access" {
-  statement {
-    sid    = "StateBucketReadWrite"
-    effect = "Allow"
-    actions = [
-      "s3:GetObject",
-      "s3:PutObject",
-      "s3:ListBucket",
-    ]
-    resources = [
-      aws_s3_bucket.tfstate.arn,
-      "${aws_s3_bucket.tfstate.arn}/*",
-    ]
-  }
-
-  statement {
-    sid    = "LockTableReadWrite"
-    effect = "Allow"
-    actions = [
-      "dynamodb:GetItem",
-      "dynamodb:PutItem",
-      "dynamodb:DeleteItem",
-    ]
-    resources = [aws_dynamodb_table.tflock.arn]
-  }
-}
-
-resource "aws_iam_policy" "gha_state_access" {
-  name        = "aegis-enclave-gha-state-access"
-  description = "Tightly-scoped state bucket + lock table access for PR plan job"
-  policy      = data.aws_iam_policy_document.gha_state_access.json
-}
-
-resource "aws_iam_role_policy_attachment" "gha_state_access" {
-  role       = aws_iam_role.gha_terraform_plan.name
-  policy_arn = aws_iam_policy.gha_state_access.arn
-}
+# ─── IAM role: GitHub Actions PR plan (read-only) — DE-INSTANTIATED ─────────
+# The read-only PR-plan role (ADR-0026) was NEVER provisioned in the governed
+# staging account: `.github/workflows/terraform-plan.yml` gates its cloud-plan
+# job on `vars.AWS_TF_PLAN_ROLE_ARN != ''` (Phase-1 dormant default), and that
+# repo variable is intentionally unset — PR-time lint/validate/fmt/tflint run
+# without any AWS role, and the governed deploy path uses the apply role below.
+#
+# ADR-0052 reconciles this bootstrap composition to the live governed-staging
+# state. The plan role + its ReadOnlyAccess attachment + the scoped state-access
+# policy + attachment lived here but had no live counterpart, so a PlatformAdmin
+# `terraform apply` would have tripped the org SCP on iam:CreateRole. They are
+# removed so `plan`/`apply` are a clean no-op against live. The capability is NOT
+# lost: the design is preserved in ADR-0026 + this file's git history, and the
+# workflow gate re-opens the moment AWS_TF_PLAN_ROLE_ARN is set. To re-enable,
+# re-add these resources and break-glass `apply` (iam:CreateRole is SCP-gated for
+# the human path — by design).

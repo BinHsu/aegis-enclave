@@ -1,7 +1,7 @@
 # ADR-0026: PR-time Terraform plan via GitHub Actions OIDC
 
 ## Status
-Accepted (2026-04-28)
+Accepted (2026-04-28). In the governed-staging account, [ADR-0052](0052-reconcile-bootstrap-to-live-governed-staging.md) supersedes two halves of this ADR: the **OIDC provider** is shared landing-zone-owned infra (referenced via data source, not managed here), and the read-only **plan role is de-instantiated** (never wired; retained in git history + the dormant workflow gate). The plan-on-PR **intent** — lint/validate/plan on `terraform/**` PRs, role-gated cloud plan when `AWS_TF_PLAN_ROLE_ARN` is set — stands.
 
 ## Context
 
