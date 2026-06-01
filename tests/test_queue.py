@@ -77,7 +77,26 @@ class TestQueueConstants:
     """Verify pre-decided constants match strategy.md § D."""
 
     def test_queue_name(self) -> None:
+        # Default (no SQS_QUEUE_NAME env) — single-region / local dev.
         assert _QUEUE_NAME == "aegis-enclave-primes"
+
+    def test_queue_name_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Multi-region (ADR-0042): SQS_QUEUE_NAME overrides the default so a
+        # peer-region task targets its own name-prefixed queue rather than the
+        # platform's. Reload the module so the env-read at import time re-runs;
+        # restore the default afterwards so sibling tests are unaffected.
+        import importlib
+
+        from prime_service import queue as q
+
+        monkeypatch.setenv("SQS_QUEUE_NAME", "aegis-enclave-eu-west-1-primes")
+        importlib.reload(q)
+        try:
+            assert q._QUEUE_NAME == "aegis-enclave-eu-west-1-primes"
+        finally:
+            monkeypatch.delenv("SQS_QUEUE_NAME", raising=False)
+            importlib.reload(q)
+        assert q._QUEUE_NAME == "aegis-enclave-primes"
 
     # BVA at _VISIBILITY_TIMEOUT_S = 90 (1.5 × 60s compute budget)
     def test_visibility_timeout_at_90(self) -> None:

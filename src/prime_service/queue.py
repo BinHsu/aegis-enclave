@@ -45,7 +45,10 @@ from typing import Any
 
 import boto3
 
-_QUEUE_NAME = "aegis-enclave-primes"
+# Region-aware: multi-region deploys name the queue `<name_prefix>-primes`
+# (e.g. aegis-enclave-eu-west-1-primes for the peer). ECS sets SQS_QUEUE_NAME
+# per region; the literal default keeps single-region / local dev working.
+_QUEUE_NAME = os.environ.get("SQS_QUEUE_NAME", "aegis-enclave-primes")
 _VISIBILITY_TIMEOUT_S = 90
 _WAIT_TIME_SECONDS = 20  # long-polling: up to 20 s per receive call
 _MAX_MESSAGES = 1  # process one at a time for simplicity

@@ -99,6 +99,10 @@ module "ecs" {
             # AWS_REGION first.
             { name = "AWS_REGION", value = var.region },
             { name = "S3_RESULTS_BUCKET_PREFIX", value = var.result_bucket_prefix },
+            # Region-aware queue name — the app enqueues on POST and on the
+            # ADR-0049 recompute-on-miss re-enqueue; a peer-region app must hit
+            # the peer queue, not the literal default.
+            { name = "SQS_QUEUE_NAME", value = aws_sqs_queue.primes.name },
           ]
           # No secrets — DDB authn is IAM, not Secrets Manager.
 
@@ -156,7 +160,29 @@ module "ecs" {
             "dynamodb:Query",
             "dynamodb:DescribeTable",
           ]
-          resources = [var.dynamodb_table_arn]
+          # Both the home-region ARN AND this region's Global-Table replica ARN
+          # (local.dynamodb_region_arn) — the peer app talks to the eu-west-1
+          # replica, whose ARN differs from the platform table's. Mirrors the
+          # worker role (iam.tf). Without the region-local ARN the peer app gets
+          # AccessDenied on GetItem.
+          resources = [
+            var.dynamodb_table_arn,
+            "${var.dynamodb_table_arn}/index/*",
+            local.dynamodb_region_arn,
+            "${local.dynamodb_region_arn}/index/*",
+          ]
+        }
+        # ADR-0048/0049: the GET handler reads the result list from this region's
+        # S3 bucket by s3_key. GetObject on the objects; ListBucket on the bucket
+        # so a MISS returns 404 NoSuchKey (without it S3 returns 403, and the
+        # recompute-on-miss path can't distinguish a miss from a denial).
+        s3_results_read = {
+          actions   = ["s3:GetObject"]
+          resources = ["arn:aws:s3:::${var.result_bucket_prefix}-${var.region}/*"]
+        }
+        s3_results_list = {
+          actions   = ["s3:ListBucket"]
+          resources = ["arn:aws:s3:::${var.result_bucket_prefix}-${var.region}"]
         }
       }
     }
@@ -187,6 +213,10 @@ resource "aws_ecs_task_definition" "worker" {
     environment = [
       { name = "DYNAMODB_TABLE_NAME", value = var.dynamodb_table_name },
       { name = "AWS_DEFAULT_REGION", value = var.region },
+      # Region-aware queue name (the peer queue is name-prefixed) — without this
+      # the code defaults to "aegis-enclave-primes" and a peer-region task gets
+      # SQS NonExistentQueue (ADR-0042 multi-region).
+      { name = "SQS_QUEUE_NAME", value = aws_sqs_queue.primes.name },
       { name = "VALKEY_ENDPOINT", value = local.valkey_endpoint },
       { name = "VALKEY_TLS", value = "true" },
     ]
@@ -227,6 +257,10 @@ resource "aws_ecs_task_definition" "cache_bootstrap" {
     environment = [
       { name = "DYNAMODB_TABLE_NAME", value = var.dynamodb_table_name },
       { name = "AWS_DEFAULT_REGION", value = var.region },
+      # Region-aware queue name (the peer queue is name-prefixed) — without this
+      # the code defaults to "aegis-enclave-primes" and a peer-region task gets
+      # SQS NonExistentQueue (ADR-0042 multi-region).
+      { name = "SQS_QUEUE_NAME", value = aws_sqs_queue.primes.name },
       { name = "VALKEY_ENDPOINT", value = local.valkey_endpoint },
       { name = "VALKEY_TLS", value = "true" },
     ]

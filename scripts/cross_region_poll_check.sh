@@ -97,7 +97,7 @@ Connect BOTH region VPNs (platform + peer) before running this check."
     _CA_FILES="${_CA_FILES:-} $ca_file"
     (cd "$TF_DIR" && terraform output -raw "$ca_out" > "$ca_file") \
         || fail "$ca_out output missing"
-    info "$label ALB: $dns → $ip"
+    info "$label ALB: $dns → $ip" >&2 # MUST be stderr: stdout is captured by the caller
     printf '%s\n' "$ip" "$ca_file"
 }
 _CA_FILES=""
