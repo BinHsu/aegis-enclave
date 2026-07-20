@@ -35,11 +35,25 @@ resource "aws_cloudwatch_log_group" "bootstrap" {
 # ─── Cluster + app service (community ecs module) ───────────────────────────
 module "ecs" {
   source = "terraform-aws-modules/ecs/aws"
-  # Pinned to 5.11.x explicitly: 5.12.x introduced a regression in
-  # modules/service/main.tf where for_each over container_definitions returns
-  # unknown when an inner value references another module's output.
-  # Exact-pinned to 5.11.4 (case-study reproducibility).
-  version = "5.11.4"
+  # PR #38 follow-up (hashicorp/aws ~> 6.55 bump): 5.11.4's aws_ecs_task_definition
+  # carries a `dynamic "inference_accelerator"` block that AWS provider v6 no
+  # longer accepts (the block type was removed provider-side; Elastic Inference
+  # reached EOL April 2024) - `terraform validate` fails hard on it under the v6
+  # provider. terraform-aws-modules/ecs/aws v6.0.0 dropped that block precisely
+  # to restore v6-provider compatibility, so this pin moves to the first v6.0.x
+  # patch (6.0.6) rather than jumping to the module's latest (7.5.0 as of this
+  # writing) - stays close to 5.11.4's interface/behavior instead of also
+  # absorbing the blue/green-deployment and capacity-option features added in
+  # 6.1+/7.x.
+  # Re-verify before apply: the original 5.11.x pin guarded against a 5.12.x
+  # regression (for_each over container_definitions returning unknown when an
+  # inner value references another module's output - exactly this repo's
+  # pattern: ecr repository_url, cloudwatch log group name, sqs queue name).
+  # 6.0.6 keeps the same for_each shape in modules/service/main.tf; nothing in
+  # the CHANGELOG documents that regression being hit or fixed post-5.12, so
+  # `terraform plan` with real credentials is the only way to confirm it does
+  # not resurface - flagged for the human running the real plan/apply.
+  version = "6.0.6"
 
   cluster_name = var.name_prefix
 
@@ -54,12 +68,14 @@ module "ecs" {
     }
   }
 
-  fargate_capacity_providers = {
+  # v6.0.6 interface change (module major bump alongside the AWS provider v6
+  # bump): the old `fargate_capacity_providers.FARGATE.default_capacity_provider_strategy`
+  # wrapper is gone - `default_capacity_provider_strategy` is now a top-level
+  # map keyed by capacity-provider name.
+  default_capacity_provider_strategy = {
     FARGATE = {
-      default_capacity_provider_strategy = {
-        weight = 100
-        base   = 1
-      }
+      weight = 100
+      base   = 1
     }
   }
 
@@ -143,16 +159,21 @@ module "ecs" {
 
       # App POSTs enqueue jobs + writes `queued` rows to DDB. The community
       # module auto-creates the tasks IAM role; we extend it here.
-      tasks_iam_role_statements = {
-        sqs_enqueue = {
+      # v6.0.6 interface change: tasks_iam_role_statements is now
+      # list(object({sid, actions, resources, ...})) instead of a map keyed by
+      # statement name - each former map key becomes an explicit `sid`.
+      tasks_iam_role_statements = [
+        {
+          sid = "sqs_enqueue"
           actions = [
             "sqs:SendMessage",
             "sqs:GetQueueUrl",
             "sqs:GetQueueAttributes",
           ]
           resources = [aws_sqs_queue.primes.arn]
-        }
-        dynamodb_executions = {
+        },
+        {
+          sid = "dynamodb_executions"
           actions = [
             "dynamodb:GetItem",
             "dynamodb:PutItem",
@@ -171,20 +192,22 @@ module "ecs" {
             local.dynamodb_region_arn,
             "${local.dynamodb_region_arn}/index/*",
           ]
-        }
+        },
         # ADR-0048/0049: the GET handler reads the result list from this region's
         # S3 bucket by s3_key. GetObject on the objects; ListBucket on the bucket
         # so a MISS returns 404 NoSuchKey (without it S3 returns 403, and the
         # recompute-on-miss path can't distinguish a miss from a denial).
-        s3_results_read = {
+        {
+          sid       = "s3_results_read"
           actions   = ["s3:GetObject"]
           resources = ["arn:aws:s3:::${var.result_bucket_prefix}-${var.region}/*"]
-        }
-        s3_results_list = {
+        },
+        {
+          sid       = "s3_results_list"
           actions   = ["s3:ListBucket"]
           resources = ["arn:aws:s3:::${var.result_bucket_prefix}-${var.region}"]
-        }
-      }
+        },
+      ]
     }
   }
 }
