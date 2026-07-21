@@ -39,7 +39,7 @@ module "ecs" {
   # modules/service/main.tf where for_each over container_definitions returns
   # unknown when an inner value references another module's output.
   # Exact-pinned to 5.11.4 (case-study reproducibility).
-  version = "5.11.4"
+  version = "7.5.0"
 
   cluster_name = var.name_prefix
 
