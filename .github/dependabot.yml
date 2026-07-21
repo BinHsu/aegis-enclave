@@ -29,8 +29,14 @@ updates:
       - dependency-name: "sqlalchemy"
         update-types: ["version-update:semver-patch"]
 
+  # Scan the root stack AND the region-stack submodule — each has its own
+  # versions.tf with provider constraints. Missing the submodule left
+  # modules/region-stack pinned at aws ~> 5.50 while root moved to ~> 6.55,
+  # producing an unsatisfiable constraint intersection (fixed 2026-07-21).
   - package-ecosystem: "terraform"
-    directory: "/terraform"
+    directories:
+      - "/terraform"
+      - "/terraform/modules/region-stack"
     schedule:
       interval: "weekly"
       day: "monday"
