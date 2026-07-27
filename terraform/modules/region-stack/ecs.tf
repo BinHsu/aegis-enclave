@@ -53,7 +53,7 @@ module "ecs" {
   # the CHANGELOG documents that regression being hit or fixed post-5.12, so
   # `terraform plan` with real credentials is the only way to confirm it does
   # not resurface - flagged for the human running the real plan/apply.
-  version = "6.0.6"
+  version = "7.5.0"
 
   cluster_name = var.name_prefix
 
@@ -100,7 +100,7 @@ module "ecs" {
       container_definitions = {
         app = {
           image = "${module.ecr.repository_url}:${var.image_tag}"
-          port_mappings = [{
+          portMappings = [{
             containerPort = 8000
             protocol      = "tcp"
           }]
@@ -124,7 +124,7 @@ module "ecs" {
 
           # ADR-0033 — Drain semantics. 60s strictly exceeds uvicorn's
           # --timeout-graceful-shutdown 45 (Dockerfile).
-          stop_timeout = 60
+          stopTimeout = 60
 
           # Explicit log_configuration — avoids the module auto-creating a
           # never-expire log group.
@@ -137,8 +137,8 @@ module "ecs" {
             }
           }
 
-          readonly_root_filesystem = false # FastAPI/uvicorn writes to tmpdir
-          essential                = true
+          readonlyRootFilesystem = false # FastAPI/uvicorn writes to tmpdir
+          essential              = true
         }
       }
 
