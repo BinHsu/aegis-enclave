@@ -71,6 +71,35 @@ jobs:
           tflint --init
           tflint --recursive
 
+      # Credential-free correctness gate. Until this existed, a green run here
+      # proved formatting and lint only — `terraform validate` never ran remotely,
+      # and the plan job below is skipped whenever AWS_TF_PLAN_ROLE_ARN is unset,
+      # which is its default state. A provider-version bump could therefore reach
+      # main having proved nothing about whether the configuration still resolves.
+      #
+      # It runs against terraform/modules/region-stack rather than terraform/,
+      # because the root declares an S3 backend and `terraform init -backend=false`
+      # there still authenticates to STS and fails without credentials. The child
+      # module has no backend and no provider block, so it initialises offline
+      # while still pulling every module and provider the stack actually uses —
+      # which is where version-constraint conflicts surface.
+      #
+      # `-upgrade` is required: the committed lock would otherwise pin the old
+      # provider and report a constraint conflict for a bump that is in fact
+      # satisfiable.
+      #
+      # Known limit, stated so nobody reads more into a green run than it carries:
+      # this catches constraint conflicts and removed or misspelled arguments on
+      # typed variables. It does NOT catch a wrong key passed to an untyped
+      # variable — `container_definitions` accepts unknown keys and silently
+      # ignores them, so validate passes while the value is dropped. That class
+      # needs a real plan or a reading of the module source.
+      - name: Terraform validate (credential-free)
+        working-directory: terraform/modules/region-stack
+        run: |
+          terraform init -backend=false -upgrade -no-color
+          terraform validate -no-color
+
   plan:
     name: Terraform plan (read-only)
     runs-on: ubuntu-latest
