@@ -42,7 +42,7 @@ resource "aws_acm_certificate" "alb" {
 # ─── Internal load balancer (private, behind Client VPN endpoint) ──────────
 module "alb" {
   source  = "terraform-aws-modules/alb/aws"
-  version = "9.17.0" # exact pin (case-study reproducibility); was ~> 9.9
+  version = "10.5.0" # exact pin (case-study reproducibility); was ~> 9.9
 
   name    = "${var.name_prefix}-alb"
   vpc_id  = module.vpc.vpc_id
