@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+# CodeRabbit quality gate. Settings copied verbatim from the sibling repos
+# (aegis-core, aegis-platform-aws, aegis-landing-zone-aws, aegis-statefulset).
+#
+# Why this repository needs it. The ruleset here requires one approving review and
+# declares no required status checks, so the review is the entire gate. GitHub does
+# not let an author approve their own pull request, and it refuses to let Actions
+# approve one. With no reviewer that can act, every merge into main has needed an
+# administrator bypass — #40 and #47 both did.
+#
+# `request_changes_workflow` makes CodeRabbit submit a real review rather than a
+# comment: Changes Requested while findings are open, flipping to Approved once
+# they are resolved. That review satisfies the requirement, and the bypass stops
+# being the only way in.
+#
+# This file is inert until the CodeRabbit app is installed on this repository.
+# Configuration alone does not install it — no CodeRabbit check has ever appeared
+# on a pull request here, which is how the gap was found.
+reviews:
+  request_changes_workflow: true
+  pre_merge_checks:
+    override_requested_reviewers_only: true
+    title:
+      mode: "error"
+    description:
+      mode: "warning"
+    docstrings:
+      mode: "off"
