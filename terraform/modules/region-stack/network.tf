@@ -56,7 +56,7 @@ locals {
 
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
-  version = "5.21.0" # exact pin (case-study reproducibility); was ~> 5.8
+  version = "6.6.1" # exact pin (case-study reproducibility); was ~> 5.8
 
   name = "${var.name_prefix}-vpc"
   cidr = local.effective_cidr
