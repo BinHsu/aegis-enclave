@@ -6,6 +6,35 @@ The repo is a runnable artifact, not a demo session. The smoke test in [§ Initi
 
 ---
 
+## Archived — read this before you run it
+
+This repository is archived. It stays public so it can be read and forked; it is no
+longer maintained, and issues and pull requests are closed.
+
+**How far the Terraform was verified.** In July 2026 the AWS provider moved to
+`~> 6.55` and three community modules to their next major line — vpc `6.6.1`,
+alb `10.5.0`, ecs `7.5.0`. Each was checked with
+`terraform init -backend=false -upgrade`, `terraform validate`, `terraform fmt`
+and `tflint` — all of which run without credentials. **None was checked with
+`terraform plan` against real state**, because this repository never had a plan
+role: the `Terraform plan (read-only)` job is gated on `AWS_TF_PLAN_ROLE_ARN` and
+skipped on every run.
+
+So the configuration is known to parse, to resolve its version constraints, and to
+satisfy the linters. It is not known to produce the plan you want against a live
+account. If you fork this, run your own `plan` first and read it — particularly for
+the ECS service, where the module's `container_definitions` variable is untyped and
+silently ignores keys it does not recognise. A misspelled key passes `validate` and
+then disappears.
+
+One consequence worth stating. The ECS module was originally pinned to an exact
+`5.11.4` for case-study reproducibility, so a reviewer re-running the repository
+would get byte-identical module source. That pin is gone. Reproducibility now means
+the versions recorded in `.terraform.lock.hcl` and the module pins in the source,
+not the exact tree the first reviewer saw.
+
+---
+
 ## Service Specification
 
 ```
@@ -82,7 +111,7 @@ aegis-enclave/
 ├── Makefile                           # declarative ops targets — `make help` to list
 ├── .pre-commit-config.yaml            # gitleaks + ruff + terraform fmt hooks (DevSecOps)
 ├── .github/
-│   └── dependabot.yml                 # automated dependency updates (DevSecOps)
+│   └── workflows/                      # CI, terraform plan, cloud apply/destroy
 ├── docker-compose.yml                 # one-shot demo: app + db + wg-gateway + test-client
 ├── Dockerfile                         # multi-stage, non-root, healthcheck
 ├── pyproject.toml                     # ruff + mypy + pytest config
@@ -130,7 +159,7 @@ Files marked **gitignored** in [CLAUDE.md § 2](CLAUDE.md#2-files-and-their-role
 
 **Three-axis hygiene at a glance:**
 - **GitOps** — `Makefile` declares all ops targets (`make help`); Terraform is the cloud's git-as-truth (community modules in `terraform/`)
-- **DevSecOps** — `SECURITY.md` (disclosure), `.pre-commit-config.yaml` (gitleaks + ruff + terraform fmt at commit-time, full pytest gate at pre-push), `.github/workflows/ci.yml` (lint + pytest on every push and PR), `.github/dependabot.yml` (weekly automated updates), capability gates for AI agents in [`CLAUDE.md` § 6](CLAUDE.md#6-capability-gates-for-ai-agent-driven-work)
+- **DevSecOps** — `SECURITY.md` (disclosure), `.pre-commit-config.yaml` (gitleaks + ruff + terraform fmt at commit-time, full pytest gate at pre-push), `.github/workflows/ci.yml` (lint + pytest on every push and PR), Dependabot for weekly automated updates until the repository was archived, capability gates for AI agents in [`CLAUDE.md` § 6](CLAUDE.md#6-capability-gates-for-ai-agent-driven-work)
 - **FinOps (scope: cost attribution + per-hour estimate + opt-in budget guardrail)** — `terraform/main.tf` provider block declares `default_tags` (Project / Environment / CostCenter / Owner) so every resource is queryable via Cost Explorer. Per-hour cost estimate at eu-central-1 list price is the table below. `terraform/budget.tf` ships an opt-in, forker-tunable `aws_budgets_budget` (monthly cap, default $25, notifications silent until you set an email — tune `monthly_budget_usd` or delete the file). Cost analysis recorded in [ADR-0006](docs/ADR/0006-vpn-three-tier-story.md) and [ADR-0015](docs/ADR/0015-no-k8s-no-real-apply.md); budget-guardrail scope in [ADR-0043](docs/ADR/0043-finops-opt-in-budget-guardrail.md). **NOT included**: AWS Cost Anomaly Detection, automated chargeback — forker-add items (see [`docs/production_adoption.md`](docs/production_adoption.md)).
 
 ### Hourly cost — per-region (eu-central-1 list price, April 2026 — 3-AZ posture per ADR-0007)
